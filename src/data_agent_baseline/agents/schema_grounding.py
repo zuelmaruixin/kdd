@@ -245,7 +245,9 @@ def render_grounding_block(
         return "", []
 
     bindings_payload: list[dict[str, Any]] = []
-    rendered_lines: list[str] = ["Schema Grounding (question concept → real columns):"]
+    rendered_lines: list[str] = [
+        "Schema Grounding (question concept → real column candidates; hypotheses only):"
+    ]
     seen_pairs: set[tuple[str, str]] = set()
 
     for concept in concepts:
@@ -278,11 +280,13 @@ def render_grounding_block(
         return "", []
 
     rendered_lines.append(
-        "Use the matched column EXACTLY as listed (path::column). If a "
-        "concept has multiple plausible matches, prefer the one whose "
-        "sample values look like the concept the question is asking "
-        "about; if still ambiguous, mention the alternatives in a "
-        "comment in the program."
+        "These are real schema candidates, not semantic proof. Use the "
+        "listed path::column names when a candidate is selected, but verify "
+        "whether the column directly represents the requested concept or "
+        "must be transformed. If row-level arithmetic or rule evidence "
+        "contradicts this grounding hint, prefer the data/rule evidence and "
+        "record the override in debug_steps['schema_mapping'] or "
+        "debug_steps['plan_override']."
     )
     return "\n".join(rendered_lines), bindings_payload
 

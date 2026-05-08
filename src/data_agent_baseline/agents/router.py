@@ -297,6 +297,10 @@ def _route_for_compiled_task(
     difficulty_key: str = "",
     visited: set[str] | None = None,
 ) -> tuple[str, str, bool]:
+    profile_route = _route_for_execution_profile(router, compiled, visited=visited)
+    if profile_route is not None:
+        return profile_route
+
     task_type = compiled.task_type.lower()
     if _is_light_table_task(compiled, difficulty_key=difficulty_key):
         candidate = _first_route_named(router, ("easy",), visited=visited)
@@ -338,6 +342,91 @@ def _route_for_compiled_task(
         if name not in (visited or set()):
             return name, "first_available", True
     raise ValueError("No unvisited route is available.")
+
+
+def _route_for_execution_profile(
+    router: RouterConfig,
+    compiled: CompiledTask,
+    *,
+    visited: set[str] | None = None,
+) -> tuple[str, str, bool] | None:
+    profile = compiled.execution_profile or {}
+    if not profile:
+        return None
+    visited = visited or set()
+
+    context_size = str(profile.get("context_size") or "")
+    source_shape = str(profile.get("source_shape") or "")
+    verifiability = str(profile.get("verifiability") or "")
+    op_complexity = str(profile.get("operation_complexity") or "")
+    strategy = str(profile.get("recommended_strategy") or "")
+    semantic_rule_required = bool(profile.get("semantic_rule_required"))
+    low_complexity = op_complexity in {"direct_lookup", "single_filter"}
+
+    if verifiability == "weak" or source_shape == "image":
+        candidate = _first_route_with_kind(router, ("multi_agent", "react"), visited=visited)
+        if candidate is not None:
+            return candidate, "profile_weak_or_image", False
+
+    if strategy == "rag_extract" or source_shape == "long_docs":
+        candidate = _first_route_with_kind(
+            router,
+            ("operator_executor", "tablellm_direct", "react", "multi_agent"),
+            require_rag=True,
+            visited=visited,
+        )
+        if candidate is not None:
+            return candidate, "profile_rag_extract", False
+
+    if semantic_rule_required:
+        # Semantic-rule tasks need rule resolution before codegen/judging.
+        # Prefer the mixed/tool-first route if configured; avoid sending a
+        # small rule task through the weakest easy path first.
+        candidate = _first_route_named(
+            router,
+            ("tool_first_mixed", "hard", "easy"),
+            visited=visited,
+        )
+        if candidate is not None:
+            return candidate, "profile_operator_with_rule_resolution", False
+        candidate = _first_route_with_kind(
+            router,
+            ("operator_executor", "tablellm_direct", "react"),
+            visited=visited,
+        )
+        if candidate is not None:
+            return candidate, "profile_operator_with_rule_resolution", False
+
+    if (
+        context_size == "small"
+        and verifiability == "programmatic"
+        and low_complexity
+    ):
+        candidate = _first_route_named(router, ("easy",), visited=visited)
+        if candidate is not None:
+            return candidate, "profile_direct_candidate_verify_as_easy_operator", False
+        candidate = _first_route_with_kind(
+            router, ("operator_executor", "tablellm_direct"), visited=visited
+        )
+        if candidate is not None:
+            return candidate, "profile_direct_candidate_verify_as_operator", False
+
+    if context_size == "small" and verifiability == "evidence_based" and low_complexity:
+        candidate = _first_route_with_kind(
+            router, ("react", "operator_executor", "multi_agent"), visited=visited
+        )
+        if candidate is not None:
+            return candidate, "profile_direct_candidate_evidence_stub", False
+
+    if op_complexity in {"filter_join", "aggregation", "multi_hop"} or source_shape == "multi_table":
+        candidate = _first_route_with_kind(
+            router, ("operator_executor", "tablellm_direct", "react", "multi_agent"),
+            visited=visited,
+        )
+        if candidate is not None:
+            return candidate, "profile_operator_complex", False
+
+    return None
 
 
 def _pick_route(
@@ -404,43 +493,71 @@ def _next_repair_route(
     compiled: CompiledTask,
     failure_reason: str | None,
 ) -> str | None:
-    """Return a local-repair fallback route, not a simple difficulty upgrade."""
+    """Return a failure-type fallback route, not a difficulty upgrade."""
     if not router.cascade_on_failure:
         return None
     failure_text = str(failure_reason or "")
-    # A zero-row answer is usually a bad filter/schema mapping, not proof
-    # that the task needs a heavier route. The operator already tried local
-    # repair/schema retry; blindly rerunning on hard/extreme just burns time
-    # and often repeats the same semantic mistake.
-    if "invalid_answer" in failure_text and "zero rows" in failure_text.lower():
-        return None
-    current = router.routes.get(current_route_name)
-    current_kind = current.kind.lower() if current is not None else ""
-    failed_empty_or_exec = any(
-        marker in failure_text
-        for marker in ("empty", "exec_error", "request_error", "no_result", "missing_answer")
+    failure_type = _failure_type(failure_text, compiled)
+    profile = compiled.execution_profile or {}
+    small_programmatic = (
+        profile.get("context_size") == "small"
+        and profile.get("verifiability") == "programmatic"
     )
 
-    if current_kind in {"operator_executor", "tablellm_direct"}:
-        if failed_empty_or_exec or compiled.task_type in {
-            "mixed_context",
-            "table_with_semantic_rule",
-            "record_text_with_semantic_rule",
-        }:
-            candidate = _first_route_named(
-                router,
-                ("tool_first_mixed", "extreme", "hard", "easy"),
-                visited=visited,
-            )
-            if candidate is not None:
-                return candidate
-            kind_order = ("operator_executor", "tablellm_direct", "react")
-        elif compiled.task_type in {"document_qa", "image_understanding"}:
-            kind_order = ("operator_executor", "react")
-        else:
-            kind_order = ("operator_executor", "tablellm_direct", "react")
-    elif current_kind == "react":
+    if failure_type == "zero_rows":
+        return None
+
+    current = router.routes.get(current_route_name)
+    current_kind = current.kind.lower() if current is not None else ""
+
+    if failure_type in {"unsupported_file_type", "budget_exhausted"}:
+        candidate = _first_route_named(router, ("fallback_multi_agent",), visited=visited)
+        if candidate is not None:
+            return candidate
+        return _first_route_with_kind(router, ("multi_agent", "react"), visited=visited)
+
+    if failure_type in {"retrieval_empty", "doc_context_miss"}:
+        return _first_route_with_kind(
+            router,
+            ("operator_executor", "tablellm_direct", "react", "multi_agent"),
+            require_rag=True,
+            visited=visited,
+        )
+
+    if failure_type == "semantic_consistency_failed":
+        candidate = _first_route_named(router, ("tool_first_mixed", "hard", "easy"), visited=visited)
+        if candidate is not None:
+            return candidate
+        return _first_route_with_kind(router, ("operator_executor", "tablellm_direct", "react"), visited=visited)
+
+    if failure_type in {"missing_answer", "syntax_error", "static_error", "exec_error"}:
+        if small_programmatic:
+            # Local/schema repair already ran inside the route. Do not jump
+            # straight to extreme for a small programmatic task; try another
+            # tool-first route only if it is not the extreme route.
+            for candidate in ("tool_first_mixed", "hard", "easy", "medium"):
+                if candidate == "extreme":
+                    continue
+                if candidate in router.routes and candidate not in visited:
+                    return candidate
+            return None
+        candidate = _first_route_named(
+            router,
+            ("tool_first_mixed", "hard", "medium", "easy"),
+            visited=visited,
+        )
+        if candidate is not None:
+            return candidate
+        return _first_route_with_kind(
+            router,
+            ("operator_executor", "tablellm_direct", "react"),
+            visited=visited,
+        )
+
+    if current_kind == "react":
         kind_order = ("operator_executor", "tablellm_direct", "multi_agent")
+    elif current_kind in {"operator_executor", "tablellm_direct"}:
+        kind_order = ("operator_executor", "tablellm_direct", "react")
     else:
         kind_order = ()
 
@@ -459,9 +576,36 @@ def _next_repair_route(
     # Back-compat: if no typed repair route exists, use the user's old
     # cascade_order, but skip the current route and already-visited ones.
     for candidate in router.cascade_order or ():
+        if small_programmatic and candidate == "extreme":
+            continue
         if candidate in router.routes and candidate not in visited:
             return candidate
     return None
+
+
+def _failure_type(failure_text: str, compiled: CompiledTask) -> str:
+    text = failure_text.lower()
+    if "unsupported_file_type" in set(compiled.ambiguity_flags):
+        return "unsupported_file_type"
+    if "budget_exhausted" in text:
+        return "budget_exhausted"
+    if "semantic_consistency_failed" in text or "filter_semantics" in text:
+        return "semantic_consistency_failed"
+    if "zero rows" in text or "no_rows" in text or "zero_row" in text:
+        return "zero_rows"
+    if "retrieval_empty" in text or "structured_doc_synth_empty" in text:
+        return "retrieval_empty"
+    if "doc_context_miss" in text or "not found in" in text:
+        return "doc_context_miss"
+    if "missing_answer" in text or "did not define an `answer`" in text:
+        return "missing_answer"
+    if "syntax_error" in text or "python_syntax" in text:
+        return "syntax_error"
+    if "static_error" in text or "static_check" in text or "no_such_column" in text:
+        return "static_error"
+    if "exec_error" in text or "keyerror" in text or "indexerror" in text:
+        return "exec_error"
+    return "unknown"
 
 
 def _payload_indicates_failure(payload: dict[str, Any]) -> bool:
@@ -1473,6 +1617,7 @@ def run_router(
         max_tool_calls=int(decision.compiled_task.get("max_tool_calls", 12)),
         context_bytes=int(decision.compiled_task.get("context_bytes", 0)),
         file_count=int(decision.compiled_task.get("file_count", 0)),
+        execution_profile=dict(decision.compiled_task.get("execution_profile") or {}),
         notes=list(decision.compiled_task.get("notes") or []),
     )
 
@@ -1649,6 +1794,16 @@ def run_router(
         "router_decision": decision.to_dict(),
         "self_consistency_origin": sc_origin,
     })
+    profile = compiled_task.execution_profile or {}
+    if profile.get("direct_llm_candidate_allowed"):
+        payload.setdefault("direct_candidate", {
+            "enabled": False,
+            "role": profile.get("direct_candidate_role", "proposal_only"),
+            "reason": (
+                "stubbed: direct LLM candidate is only allowed after verifier/evidence judge; "
+                "current patch routes to the verifying executor instead of submitting it"
+            ),
+        })
     _attach_budget(payload)
     set_budget_controller(None)
     return payload

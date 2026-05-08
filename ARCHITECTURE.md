@@ -479,7 +479,7 @@ codegen 出错             ──► static_check 拦截     ──► local_rep
 ```
 Profiler: kind={csv, json, doc(knowledge.md)}, task_type=mixed_context,
           tool=pandas + json + rag, budget=medium (≤14 LLM, ≤30 tool)
-Router : task_type → tool_first_mixed → operator_executor (deepseek-v4-flash)
+Router : task_type → tool_first_mixed → operator_executor (qwen3.5-35b-a3b)
 Codegen: pd.read_csv('csv/member.csv') + json.load('json/zip_code.json')
          + merge by zip → filter state='Illinois' → project [first_name, last_name]
 Static : ✓

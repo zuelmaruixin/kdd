@@ -165,6 +165,7 @@ class CompiledTask:
     max_tool_calls: int = 18
     context_bytes: int = 0
     file_count: int = 0
+    execution_profile: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -190,6 +191,7 @@ class CompiledTask:
             "max_tool_calls": self.max_tool_calls,
             "context_bytes": self.context_bytes,
             "file_count": self.file_count,
+            "execution_profile": dict(self.execution_profile),
             "notes": list(self.notes),
         }
 
@@ -1023,6 +1025,22 @@ def compile_task(task: PublicTask) -> CompiledTask:
     )
 
     foreign_key_candidates = _infer_foreign_key_candidates(source_capabilities)
+    execution_profile = _build_execution_profile(
+        context_bytes=context_bytes,
+        file_count=len(files),
+        data_kinds=data_kinds,
+        modalities=modalities,
+        operations=operations,
+        task_type=task_type,
+        flags=flags,
+        uses_semantic_rule=uses_semantic_rule,
+        has_rule_doc=has_rule_doc,
+        has_record_text=has_record_text,
+        has_plain_docs=has_plain_docs,
+        doc_bytes=doc_bytes,
+        table_bytes=table_bytes,
+        source_capabilities=source_capabilities,
+    )
 
     return CompiledTask(
         task_type=task_type,
@@ -1046,8 +1064,171 @@ def compile_task(task: PublicTask) -> CompiledTask:
         max_tool_calls=max_tool_calls,
         context_bytes=context_bytes,
         file_count=len(files),
+        execution_profile=execution_profile,
         notes=notes,
     )
+
+
+def _build_execution_profile(
+    *,
+    context_bytes: int,
+    file_count: int,
+    data_kinds: set[str],
+    modalities: list[str],
+    operations: list[str],
+    task_type: str,
+    flags: list[str],
+    uses_semantic_rule: bool,
+    has_rule_doc: bool,
+    has_record_text: bool,
+    has_plain_docs: bool,
+    doc_bytes: int,
+    table_bytes: int,
+    source_capabilities: list[SourceCapability],
+) -> dict[str, Any]:
+    """Finer execution recommendation used by the router.
+
+    Difficulty labels intentionally do not appear here. They remain budget
+    hints; this profile answers "what kind of executor can verify this?".
+    """
+    flag_set = set(flags)
+    table_source_count = sum(1 for cap in source_capabilities if cap.role == "data" and cap.kind in TABLE_KINDS)
+    doc_source_count = sum(1 for cap in source_capabilities if cap.role == "data" and cap.kind in (DOC_KINDS | RECORD_TEXT_KINDS))
+
+    if context_bytes < 120_000 and file_count <= 4:
+        context_size = "small"
+    elif context_bytes < 1_200_000 and file_count <= 10:
+        context_size = "medium"
+    else:
+        context_size = "large"
+
+    if "needs_vision" in flag_set:
+        source_shape = "image"
+    elif has_record_text or "large_document_context" in flag_set or doc_bytes >= 200_000:
+        source_shape = "long_docs"
+    elif has_plain_docs and table_source_count:
+        source_shape = "mixed_docs"
+    elif table_source_count <= 1 and data_kinds & TABLE_KINDS:
+        source_shape = "single_table"
+    elif table_source_count > 1:
+        source_shape = "multi_table"
+    else:
+        source_shape = "mixed_docs" if doc_source_count else "single_table"
+
+    if "unsupported_file_type" in flag_set or "needs_vision" in flag_set:
+        verifiability = "weak"
+    elif data_kinds & TABLE_KINDS:
+        verifiability = "programmatic"
+    elif has_plain_docs or has_record_text:
+        verifiability = "evidence_based"
+    else:
+        verifiability = "weak"
+
+    op_set = set(operations)
+    if {"aggregate", "compute"} & op_set and any(op in op_set for op in {"aggregate", "compare"}):
+        operation_complexity = "aggregation"
+    elif task_type in {"mixed_context", "record_text_with_semantic_rule"} or "multi_hop" in flag_set:
+        operation_complexity = "multi_hop"
+    elif table_source_count > 1 or "extract" in op_set:
+        operation_complexity = "filter_join"
+    elif "retrieve" in op_set or "filter" in op_set:
+        operation_complexity = "single_filter"
+    else:
+        operation_complexity = "direct_lookup"
+
+    semantic_rule_required = bool(uses_semantic_rule)
+    if not has_rule_doc:
+        semantic_rule_status = "none"
+    elif semantic_rule_required:
+        semantic_rule_status = "unresolved"
+    else:
+        semantic_rule_status = "candidate"
+    semantic_rule_fields = _semantic_rule_fields(source_capabilities)
+
+    low_complexity = operation_complexity in {"direct_lookup", "single_filter"}
+    direct_llm_candidate_allowed = (
+        context_size == "small"
+        and source_shape in {"single_table", "mixed_docs"}
+        and operation_complexity in {"direct_lookup", "single_filter"}
+        and verifiability in {"programmatic", "evidence_based"}
+        and "unsupported_file_type" not in flag_set
+    )
+    if direct_llm_candidate_allowed:
+        direct_candidate_role = "submit_after_verify" if verifiability == "programmatic" else "proposal_only"
+    else:
+        direct_candidate_role = "disabled"
+
+    if verifiability == "weak" or source_shape == "image":
+        recommended_strategy = "multi_agent"
+    elif source_shape == "long_docs":
+        recommended_strategy = "rag_extract"
+    elif semantic_rule_required:
+        recommended_strategy = "operator_with_rule_resolution"
+    elif direct_llm_candidate_allowed and low_complexity:
+        recommended_strategy = "direct_candidate_verify"
+    else:
+        recommended_strategy = "operator"
+
+    allowed_strategies = [recommended_strategy]
+    if verifiability == "programmatic":
+        allowed_strategies.append("operator")
+        if semantic_rule_required:
+            allowed_strategies.append("operator_with_rule_resolution")
+    if source_shape in {"mixed_docs", "long_docs"}:
+        allowed_strategies.append("rag_extract")
+    if direct_llm_candidate_allowed:
+        allowed_strategies.append("direct_candidate_verify")
+    allowed_strategies.append("multi_agent")
+    allowed_strategies = list(dict.fromkeys(allowed_strategies))
+
+    blocked_strategies: list[str] = []
+    if context_size == "small" and verifiability == "programmatic" and "unsupported_file_type" not in flag_set:
+        blocked_strategies.append("direct_extreme_escalation")
+    if semantic_rule_required and semantic_rule_status != "resolved":
+        blocked_strategies.append("unverified_direct_submit")
+
+    return {
+        "context_size": context_size,
+        "source_shape": source_shape,
+        "verifiability": verifiability,
+        "operation_complexity": operation_complexity,
+        "semantic_rule_required": semantic_rule_required,
+        "semantic_rule_status": semantic_rule_status,
+        "semantic_rule_fields": semantic_rule_fields,
+        "direct_llm_candidate_allowed": direct_llm_candidate_allowed,
+        "direct_candidate_role": direct_candidate_role,
+        "recommended_strategy": recommended_strategy,
+        "allowed_strategies": allowed_strategies,
+        "blocked_strategies": blocked_strategies,
+    }
+
+
+def _semantic_rule_fields(capabilities: list[SourceCapability]) -> list[str]:
+    candidates: list[str] = []
+    semantic_tokens = {
+        "status", "type", "format", "diagnosis", "admission", "thrombosis",
+        "severe", "abnormal", "normal", "age", "date", "eligible",
+    }
+    for cap in capabilities:
+        for field in _columns_for_capability(cap):
+            norm = field.lower()
+            if any(tok in norm for tok in semantic_tokens):
+                candidates.append(field)
+    return list(dict.fromkeys(candidates))[:40]
+
+
+def _columns_for_capability(cap: SourceCapability) -> list[str]:
+    out: list[str] = []
+    out.extend(cap.columns)
+    out.extend(cap.json_record_fields)
+    out.extend(cap.structured_record_fields)
+    for table in cap.tables:
+        for col in table.get("columns") or []:
+            if isinstance(col, dict) and col.get("name"):
+                out.append(str(col["name"]))
+            elif isinstance(col, str):
+                out.append(col)
+    return list(dict.fromkeys(str(c) for c in out if str(c)))
 
 
 def _infer_foreign_key_candidates(

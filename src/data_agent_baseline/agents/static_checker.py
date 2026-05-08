@@ -971,6 +971,5 @@ def check_program(
 
     return issues
 
-
 def has_blocking(issues: list[StaticIssue]) -> bool:
     return any(item.severity == "error" for item in issues)

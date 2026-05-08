@@ -445,6 +445,9 @@ def repair_pandas_keyerror_or_no_such_column(
         scoped_matches = issue.location.get("closest_matches")
         if isinstance(scoped_matches, list):
             scoped_matches = [str(c) for c in scoped_matches if str(c)]
+            suffix_matches = _suffix_column_matches(bad_clean, candidates)
+            if suffix_matches:
+                scoped_matches = suffix_matches
             if len(scoped_matches) != 1:
                 # Ambiguous schema mapping (e.g. link_to_event vs
                 # link_to_member/link_to_budget) should be rewritten with
@@ -483,6 +486,31 @@ def repair_pandas_keyerror_or_no_such_column(
         action="fuzzy_match_column_name",
         notes=notes,
     )
+
+
+def _suffix_column_matches(bare_column: str, candidates: list[str]) -> list[str]:
+    """Pick a deterministic suffixed version for a bare post-merge column.
+
+    Generated pandas code often merges two sources that both contain
+    Diagnosis, then projects bare "Diagnosis". Static checker sees only
+    Diagnosis_x/Diagnosis_y or explicit suffixes. Prefer patient/right-side
+    suffixes for patient-level descriptors, otherwise only repair when
+    there is one unambiguous suffixed candidate.
+    """
+    suffixed = [
+        c for c in candidates
+        if c.startswith(f"{bare_column}_")
+    ]
+    if not suffixed:
+        return []
+    if len(suffixed) == 1:
+        return suffixed
+    lower_map = {c.lower(): c for c in suffixed}
+    for suffix in ("_patient", "_right", "_y", "_exam", "_left", "_x"):
+        key = f"{bare_column}{suffix}".lower()
+        if key in lower_map:
+            return [lower_map[key]]
+    return []
 
 
 def repair_bad_join_key(

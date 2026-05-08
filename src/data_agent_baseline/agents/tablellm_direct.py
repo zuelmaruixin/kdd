@@ -138,6 +138,13 @@ Hard requirements for the program you write:
    `knowledge.md` or real data before filtering. If that resolution changes
    any analyst value/source/field, record it in `debug_steps["plan_override"]`
    with `concept`, `field`, `old_value`, `new_value`, and `evidence`.
+   When a semantic filter has alternatives, probe candidate row counts
+   before declaring an empty result. For example, record counts for
+   `Thrombosis == 2`, `Thrombosis == 3`, and `Thrombosis >= 2` when those
+   are plausible alternatives. If the primary candidate gives zero rows
+   and another evidence-backed candidate gives rows, use the evidence-backed
+   candidate, and record the decision in `debug_steps["filters"]` and
+   `debug_steps["plan_override"]`.
 4. Do NOT print anything and do NOT write output files such as
    `answer.csv`, `prediction.csv`, or temporary result files. Do NOT
    call `display()` / `plt.show()` / network access. Put inspection/debug
@@ -186,6 +193,13 @@ Hard requirements for the program you write:
    - YYYYMM dates: treat integer `201306` and string "201306" as the
      same month via `.astype(str)`.
 10. Metric conventions:
+   - Schema Grounding is only a real-column candidate list, not a
+     semantic authority. For requested metrics, inspect actual rows and
+     simple numeric relationships before deciding whether a column is
+     direct or must be transformed. If data evidence contradicts a
+     grounding hint, use the data-backed formula/field and record the
+     override in `debug_steps["schema_mapping"]` or
+     `debug_steps["plan_override"]`.
    - For "average monthly consumption" over customer consumption rows,
      compute the average consumption value for the filtered rows, then
      divide by 12 unless the question explicitly asks for total segment
@@ -414,6 +428,8 @@ def build_codegen_prompt(
             "requires_rule_resolution": semantic_plan.get("requires_rule_resolution"),
             "unresolved_core_filters": semantic_plan.get("unresolved_core_filters"),
             "rule_resolution_queries": semantic_plan.get("rule_resolution_queries"),
+            "rule_resolution": semantic_plan.get("rule_resolution"),
+            "applied_plan_overrides": semantic_plan.get("applied_plan_overrides"),
             "consistency_checks": semantic_plan.get("consistency_checks"),
             "uncertainties": semantic_plan.get("uncertainties"),
             "confidence": semantic_plan.get("confidence"),
@@ -637,6 +653,7 @@ class CodegenDirectAgent:
                 temperature=self.sample_temperature,
                 seed=self.sample_seed,
                 stream_label=f"{self.progress_label} code-solution",
+                max_tokens=max(int(getattr(self.model, "max_tokens", 0) or 0), 2048),
             )
         except BudgetExceeded:
             raise

@@ -39,6 +39,8 @@ class SemanticConsistencyResult:
     """One consistency round result for trace/debug."""
 
     semantic_plan: dict[str, Any] | None = None
+    rule_resolution: dict[str, Any] | None = None
+    effective_plan: dict[str, Any] | None = None
     judge_history: list[dict[str, Any]] = field(default_factory=list)
     repair_history: list[dict[str, Any]] = field(default_factory=list)
     final_verdict: str = "skipped"
@@ -47,6 +49,8 @@ class SemanticConsistencyResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "semantic_plan": self.semantic_plan,
+            "rule_resolution": self.rule_resolution,
+            "effective_plan": self.effective_plan,
             "judge_history": list(self.judge_history),
             "repair_history": list(self.repair_history),
             "final_verdict": self.final_verdict,
@@ -310,6 +314,179 @@ def _apply_plan_overrides(
     return effective, overrides
 
 
+_RULE_VALUE_RE = re.compile(
+    r"['\"]?(?P<value>-?\d+(?:\.\d+)?)['\"]?\s+"
+    r"(?:indicates?|indicating|means|denotes|represents?|corresponds?\s+to)\s+"
+    r"(?P<label>[^.;\n]{0,120})",
+    re.IGNORECASE,
+)
+_RULE_LABEL_VALUE_RE = re.compile(
+    r"(?P<label>[^.;\n]{0,80}?\b(?:severe|abnormal|normal|active|eligible|open|closed)\b[^.;\n]{0,80}?)"
+    r"(?:=|:|is|value)\s*['\"]?(?P<value>-?\d+(?:\.\d+)?)['\"]?",
+    re.IGNORECASE,
+)
+
+
+def _resolve_semantic_rules(
+    *,
+    task: PublicTask,
+    compiled_task: CompiledTask,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    docs = _semantic_rule_documents(task, compiled_task)
+    filters = plan.get("filters") if isinstance(plan.get("filters"), list) else []
+    resolved: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    plan_confidence = _as_float(plan.get("confidence"), default=1.0)
+    requires_global = bool(plan.get("requires_rule_resolution")) or plan_confidence <= 0.65
+
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+        concept = str(item.get("concept") or item.get("name") or "").strip()
+        field = str(item.get("field") or item.get("chosen_field") or "").strip()
+        needs_resolution = (
+            bool(item.get("requires_rule_resolution"))
+            or item.get("value") is None
+            or requires_global
+        )
+        if not needs_resolution:
+            continue
+        match = _find_rule_value(
+            concept=concept,
+            field=field,
+            docs=docs,
+        )
+        if match is None:
+            unresolved.append({
+                "concept": concept,
+                "field": field,
+                "reason": "no explicit rule value found in semantic rule documents",
+                "alternatives": item.get("alternatives"),
+            })
+            continue
+        resolved.append({
+            "concept": concept,
+            "field": field,
+            "operator": item.get("operator", "=="),
+            "value": match["value"],
+            "old_value": item.get("value"),
+            "evidence": match["evidence"],
+            "source": match["path"],
+        })
+
+    return {
+        "resolved_filters": resolved,
+        "unresolved_filters": unresolved,
+        "documents": [
+            {"path": doc.get("path"), "chars": doc.get("chars"), "truncated": doc.get("truncated")}
+            for doc in docs
+        ],
+    }
+
+
+def _find_rule_value(
+    *,
+    concept: str,
+    field: str,
+    docs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    concept_lower = concept.lower()
+    field_lower = field.lower()
+    wants_severe = "severe" in concept_lower
+    for doc in docs:
+        text = str(doc.get("text") or "")
+        path = str(doc.get("path") or "")
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            lower = line.lower()
+            if not line:
+                continue
+            if field_lower and field_lower not in lower and not any(tok in lower for tok in concept_lower.split() if len(tok) > 3):
+                continue
+            for match in _RULE_VALUE_RE.finditer(line):
+                label = match.group("label").lower()
+                if wants_severe and "severe" not in label:
+                    continue
+                if wants_severe and "most severe" in label:
+                    continue
+                value = _coerce_rule_value(match.group("value"))
+                return {"value": value, "evidence": line, "path": path}
+            for match in _RULE_LABEL_VALUE_RE.finditer(line):
+                label = match.group("label").lower()
+                if wants_severe and "severe" not in label:
+                    continue
+                if wants_severe and "most severe" in label:
+                    continue
+                value = _coerce_rule_value(match.group("value"))
+                return {"value": value, "evidence": line, "path": path}
+    return None
+
+
+def _coerce_rule_value(raw: str) -> Any:
+    try:
+        number = float(raw)
+    except ValueError:
+        return raw
+    if number.is_integer():
+        return int(number)
+    return number
+
+
+def _as_float(value: Any, *, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _apply_rule_resolution(
+    plan: dict[str, Any],
+    rule_resolution: dict[str, Any] | None,
+) -> dict[str, Any]:
+    effective = deepcopy(plan)
+    if not rule_resolution:
+        return effective
+    resolved = [
+        item for item in (rule_resolution.get("resolved_filters") or [])
+        if isinstance(item, dict)
+    ]
+    if not resolved:
+        effective["rule_resolution"] = rule_resolution
+        return effective
+    filters = effective.get("filters")
+    if not isinstance(filters, list):
+        filters = []
+        effective["filters"] = filters
+    for resolved_filter in resolved:
+        field = str(resolved_filter.get("field") or "").strip()
+        concept = str(resolved_filter.get("concept") or "").strip().lower()
+        matched = False
+        for item in filters:
+            if not isinstance(item, dict):
+                continue
+            item_field = str(item.get("field") or item.get("chosen_field") or "").strip()
+            item_concept = str(item.get("concept") or item.get("name") or "").strip().lower()
+            if (field and field == item_field) or (concept and concept == item_concept):
+                item["value"] = resolved_filter.get("value")
+                item["operator"] = resolved_filter.get("operator", item.get("operator", "=="))
+                item["requires_rule_resolution"] = False
+                item["rule_resolution_evidence"] = resolved_filter.get("evidence")
+                matched = True
+        if not matched:
+            filters.append({
+                "concept": resolved_filter.get("concept"),
+                "field": field,
+                "operator": resolved_filter.get("operator", "=="),
+                "value": resolved_filter.get("value"),
+                "requires_rule_resolution": False,
+                "rule_resolution_evidence": resolved_filter.get("evidence"),
+            })
+    effective["requires_rule_resolution"] = bool(rule_resolution.get("unresolved_filters"))
+    effective["rule_resolution"] = rule_resolution
+    return effective
+
+
 def should_run_semantic_consistency(compiled_task: CompiledTask) -> bool:
     """Gate dual-path consistency to table-centric tasks.
 
@@ -474,6 +651,8 @@ You are checking semantic consistency:
 - whether debug_steps contains schema_inspection from real loaded columns
 - whether schema_mapping chose fields from real schema rather than from
   knowledge.md wording alone
+- whether metric formulas and field choices are supported by row-level
+  data evidence rather than only by column-name grounding hints.
 
 You may challenge the Semantic Analyst plan if the plan picked one field
 while leaving plausible alternatives unresolved. If selected mapping is
@@ -484,6 +663,10 @@ knowledge.md or runtime schema inspection, judge against the
 effective_semantic_plan after that override. Do not fail merely because
 the code disagrees with a low-confidence analyst guess that the override
 resolved.
+If row-level evidence contradicts a Schema Grounding hint, prefer the
+data-backed interpretation when the code records the evidence in
+schema_mapping, filters, or plan_override. Do not treat grounding hints
+as semantic truth.
 If debug_steps lacks schema_inspection for a table/mixed task, return
 `fail` with failure_type `schema_inspection_missing`.
 If execution output contains KeyError, IndexError, FileNotFoundError, or
@@ -680,20 +863,31 @@ class SemanticConsistencyPipeline:
         except Exception:  # noqa: BLE001
             return None
 
+        rule_resolution = _resolve_semantic_rules(
+            task=task,
+            compiled_task=compiled,
+            plan=plan,
+        )
+        effective_plan = _apply_rule_resolution(plan, rule_resolution)
+        if rule_resolution.get("resolved_filters") or rule_resolution.get("unresolved_filters"):
+            effective_plan["original_semantic_plan"] = plan
+
         try:
             from data_agent_baseline.progress import get_progress_logger
             logger = get_progress_logger()
             if logger is not None:
                 logger.codegen_debug(debug={"semantic_plan": {
-                    k: plan.get(k) for k in (
+                    k: effective_plan.get(k) for k in (
                         "schema_mapping", "join_plan", "filters",
                         "aggregation", "output", "confidence",
                     )
                 }})
+                if rule_resolution.get("resolved_filters") or rule_resolution.get("unresolved_filters"):
+                    logger.codegen_debug(debug={"rule_resolution": rule_resolution})
         except Exception:  # noqa: BLE001
             pass
 
-        return plan
+        return effective_plan
 
     # ------------------------------------------------------------------
     # Phase 2: consistency judge + bounded semantic repair
@@ -718,7 +912,10 @@ class SemanticConsistencyPipeline:
 
         compiled = self.context.compiled_task
         trace = SemanticConsistencyResult(
-            semantic_plan=semantic_plan, final_verdict="running"
+            semantic_plan=semantic_plan.get("original_semantic_plan", semantic_plan),
+            rule_resolution=semantic_plan.get("rule_resolution"),
+            effective_plan=semantic_plan,
+            final_verdict="running",
         )
         current = result
         logger = get_progress_logger()
@@ -733,6 +930,7 @@ class SemanticConsistencyPipeline:
             effective_plan, applied_overrides = _apply_plan_overrides(
                 semantic_plan, debug_steps
             )
+            trace.effective_plan = effective_plan
             preflight_judge = _preflight_judge_failure(
                 compiled_task=compiled,
                 debug_steps=debug_steps,

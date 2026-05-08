@@ -415,6 +415,7 @@ class RepairCoordinator:
                 temperature=self.sample_temperature,
                 seed=self.sample_seed,
                 stream_label="operator schema-retry",
+                max_tokens=max(int(getattr(self.model, "max_tokens", 0) or 0), 2048),
             )
         except BudgetExceeded:
             raise
