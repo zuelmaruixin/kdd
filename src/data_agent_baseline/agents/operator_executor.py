@@ -110,7 +110,9 @@ class OperatorExecutor:
             }]
 
         # --- Phase 3a: deterministic local repair ---
-        result, repair_log = coordinator.local_repair_loop(task, result)
+        result, repair_log = coordinator.local_repair_loop(
+            task, result, semantic_plan=semantic_plan
+        )
         if repair_log:
             result.manifest = list(result.manifest or []) + [{"local_repair_log": repair_log}]
 
@@ -129,8 +131,10 @@ class OperatorExecutor:
 
         # --- Phase 3c: schema-guided LLM retry (after synthesis so schema is complete) ---
         if not result.succeeded:
-            result = coordinator.schema_retry(task, result)
-            result, post_schema_repair_log = coordinator.local_repair_loop(task, result)
+            result = coordinator.schema_retry(task, result, semantic_plan=semantic_plan)
+            result, post_schema_repair_log = coordinator.local_repair_loop(
+                task, result, semantic_plan=semantic_plan
+            )
             if post_schema_repair_log:
                 result.manifest = list(result.manifest or []) + [
                     {"post_schema_retry_local_repair_log": post_schema_repair_log}

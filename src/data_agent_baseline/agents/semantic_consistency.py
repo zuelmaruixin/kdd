@@ -1043,7 +1043,10 @@ class SemanticConsistencyPipeline:
             static_issues = check_program(program, capabilities=compiled.source_capabilities)
             if static_issues and has_blocking(static_issues):
                 local_outcome = try_program_repair(
-                    program=program, issues=static_issues, compiled=compiled
+                    program=program,
+                    issues=static_issues,
+                    compiled=compiled,
+                    semantic_plan=effective_plan,
                 )
                 if local_outcome is not None and local_outcome.succeeded:
                     program = local_outcome.patched_program
@@ -1081,6 +1084,7 @@ class SemanticConsistencyPipeline:
                         program=program,
                         issues=runtime_issues,
                         compiled=compiled,
+                        semantic_plan=effective_plan,
                     )
                     if local_outcome is not None and local_outcome.succeeded:
                         new_result = exec_program(

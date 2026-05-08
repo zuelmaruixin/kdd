@@ -35,8 +35,10 @@ _SCHEMA_RETRY_SYSTEM = (
     "You are a tool-first data operator. Repair the failed Python program "
     "using the deterministic schema scan and the execution error. Output "
     "exactly one fenced ```python``` block assigning the final result to "
-    "`answer`. Do not include prose. Use only real paths, tables, columns, "
-    "and join keys listed in the diagnostics; never invent schema names. "
+    "`answer`. Do not include prose. Preserve correct code and patch only "
+    "the failed operation unless a local patch is impossible. Use only real "
+    "paths, tables, columns, and join keys listed in the diagnostics; never "
+    "invent schema names. "
     "Treat knowledge.md as semantic/rule hypotheses only, never as final "
     "proof that a column exists. Before using dataframe columns, write code "
     "that records actual loaded columns in debug_steps['schema_inspection'] "
@@ -73,6 +75,42 @@ _SCHEMA_RETRY_MARKERS = frozenset({
     "no_such_file",
     "structured_doc_synth",
 })
+
+_SEMANTIC_PLAN_KEYS = (
+    "schema_mapping",
+    "alternative_mappings",
+    "join_plan",
+    "filters",
+    "aggregation",
+    "output",
+    "requires_rule_resolution",
+    "unresolved_core_filters",
+    "rule_resolution_queries",
+    "rule_resolution",
+    "applied_plan_overrides",
+    "consistency_checks",
+    "uncertainties",
+    "confidence",
+    "original_semantic_plan",
+)
+
+
+def _compact_semantic_plan(plan: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Keep retry payload focused on the analyst context used for repair."""
+    if not isinstance(plan, dict) or not plan:
+        return None
+    compact = {key: plan.get(key) for key in _SEMANTIC_PLAN_KEYS if key in plan}
+    return compact or plan
+
+
+def _semantic_plan_from_manifest(manifest: list[Any] | None) -> dict[str, Any] | None:
+    for item in manifest or []:
+        if not isinstance(item, dict):
+            continue
+        plan = item.get("semantic_plan")
+        if isinstance(plan, dict):
+            return plan
+    return None
 
 
 def exec_program(
@@ -176,14 +214,22 @@ class RepairCoordinator:
         self.sample_temperature = sample_temperature
         self.sample_seed = sample_seed
 
-    def run(self, task: PublicTask, result: CodegenRunResult) -> CodegenRunResult:
+    def run(
+        self,
+        task: PublicTask,
+        result: CodegenRunResult,
+        *,
+        semantic_plan: dict[str, Any] | None = None,
+    ) -> CodegenRunResult:
         """Local repair then schema-retry in one call (convenience for simple cases)."""
-        result, repair_log = self.local_repair_loop(task, result)
+        result, repair_log = self.local_repair_loop(
+            task, result, semantic_plan=semantic_plan
+        )
         if repair_log:
             result.manifest = list(result.manifest or []) + [{"local_repair_log": repair_log}]
         if result.succeeded:
             return result
-        return self.schema_retry(task, result)
+        return self.schema_retry(task, result, semantic_plan=semantic_plan)
 
     # ------------------------------------------------------------------
     # Public stage methods — OperatorExecutor uses these directly when it
@@ -194,6 +240,8 @@ class RepairCoordinator:
         self,
         task: PublicTask,
         result: CodegenRunResult,
+        *,
+        semantic_plan: dict[str, Any] | None = None,
     ) -> tuple[CodegenRunResult, list[dict[str, Any]]]:
         from data_agent_baseline.agents.local_repair import (
             issues_from_exec_error,
@@ -210,6 +258,9 @@ class RepairCoordinator:
         from data_agent_baseline.progress import get_progress_logger
 
         compiled = self.context.compiled_task
+        effective_semantic_plan = (
+            semantic_plan or _semantic_plan_from_manifest(result.manifest)
+        )
         repair_log: list[dict[str, Any]] = []
         logger = get_progress_logger()
 
@@ -244,6 +295,7 @@ class RepairCoordinator:
                         program=result.program,
                         issues=issues,
                         compiled=compiled,
+                        semantic_plan=effective_semantic_plan,
                     )
                     if outcome is not None:
                         if budget is not None:
@@ -303,7 +355,10 @@ class RepairCoordinator:
                 })
 
             outcome = try_program_repair(
-                program=program, issues=issues, compiled=compiled
+                program=program,
+                issues=issues,
+                compiled=compiled,
+                semantic_plan=effective_semantic_plan,
             )
             if outcome is None:
                 break
@@ -339,6 +394,8 @@ class RepairCoordinator:
         self,
         task: PublicTask,
         failed: CodegenRunResult,
+        *,
+        semantic_plan: dict[str, Any] | None = None,
     ) -> CodegenRunResult:
         failure_str = str(failed.failure_reason or "")
         combined_failure = "\n".join([
@@ -351,6 +408,9 @@ class RepairCoordinator:
             return failed
 
         ctx = self.context
+        effective_semantic_plan = (
+            semantic_plan or _semantic_plan_from_manifest(failed.manifest)
+        )
         prior_static_issues: list[dict[str, Any]] = []
         for item in failed.manifest or []:
             if isinstance(item, dict) and isinstance(item.get("static_issues"), list):
@@ -365,6 +425,7 @@ class RepairCoordinator:
             "compiled_task": ctx.compiled_task.to_dict(),
             "failure_reason": failed.failure_reason,
             "static_issues": prior_static_issues[-12:],
+            "semantic_plan": _compact_semantic_plan(effective_semantic_plan),
             "previous_program": failed.program,
             "exec_stdout": (failed.exec_stdout or "")[-3000:],
             "exec_stderr": (failed.exec_stderr or "")[-3000:],
@@ -387,6 +448,12 @@ class RepairCoordinator:
                     "knowledge.md supplies rules and hypotheses; it does not "
                     "prove that a dataframe column/table/key exists."
                 ),
+                "targeted_repair_contract": (
+                    "Patch only the failure evidenced by static_issues, "
+                    "exec_stdout, exec_stderr, and the previous program. Do "
+                    "not restart the whole solution unless the cited failure "
+                    "cannot be fixed locally."
+                ),
             },
         }
 
@@ -399,7 +466,8 @@ class RepairCoordinator:
                         content=(
                             "Repair locally. Use the schema_scan as ground truth. "
                             "If a previous column/key is absent, map it to a real field "
-                            "from schema_diagnostics or rewrite the operation. "
+                            "from schema_diagnostics and semantic_plan, or rewrite only "
+                            "the affected operation. "
                             "Start from actual schema inspection in code: after every "
                             "load/query, write debug_steps['schema_inspection'][var] = "
                             "list(df.columns), then choose fields from that inspection. "

@@ -907,9 +907,17 @@ def try_program_repair(
     program: str,
     issues: list[StaticIssue],
     compiled: CompiledTask,
+    semantic_plan: dict[str, Any] | None = None,
 ) -> LocalRepairOutcome | None:
     """Apply program-level fixers in order of safety. First one that
-    returns ``succeeded=True`` wins."""
+    returns ``succeeded=True`` wins.
+
+    ``semantic_plan`` is accepted so callers can keep the original analyst
+    context attached throughout the repair pipeline. Current deterministic
+    fixers remain schema/error driven and deliberately avoid broad semantic
+    rewrites; LLM retry stages consume the plan for targeted repairs.
+    """
+    _ = semantic_plan
     for fixer in (
         repair_python_syntax,
         repair_missing_answer_assignment,
