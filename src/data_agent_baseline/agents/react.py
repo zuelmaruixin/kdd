@@ -13,12 +13,43 @@ from data_agent_baseline.agents.prompt import (
 )
 from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState, StepRecord
 from data_agent_baseline.benchmark.schema import PublicTask
+from data_agent_baseline.budget import BudgetExceeded
 from data_agent_baseline.tools.registry import ToolRegistry
 
 
 @dataclass(frozen=True, slots=True)
 class ReActAgentConfig:
     max_steps: int = 16
+    sample_temperature: float | None = None  # override for self-consistency sampling
+    sample_seed: int | None = None
+    # When True, repeated calls to the same read-only tool with the same
+    # arguments inside one ReAct loop are served from an in-memory cache.
+    # This stops the model from re-reading the same csv 5 times and burning
+    # tokens on identical observations.
+    cache_tool_results: bool = True
+
+
+# Tools that are pure functions of (task.context_dir, action_input) and
+# safe to cache. `execute_python` is excluded because the LLM may rely on
+# side effects (printing different things) across calls. `answer` is the
+# terminator and obviously must not be cached.
+_CACHEABLE_TOOLS: frozenset[str] = frozenset({
+    "list_context",
+    "read_csv",
+    "read_json",
+    "read_doc",
+    "inspect_sqlite_schema",
+    "execute_context_sql",
+})
+
+
+def _cache_key(action: str, action_input: dict[str, object]) -> str:
+    """Stable JSON-string key for a tool call (sorted keys handles dict reordering)."""
+    try:
+        return action + "::" + json.dumps(action_input, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        # Non-JSON-serializable args: fall through, key uses repr().
+        return action + "::" + repr(sorted(action_input.items()))
 
 
 def _strip_json_fence(raw_response: str) -> str:
@@ -32,9 +63,85 @@ def _strip_json_fence(raw_response: str) -> str:
     return text
 
 
+def _escape_control_chars_inside_json_strings(text: str) -> str:
+    """Repair common LLM JSON mistakes like literal newlines in code strings."""
+    chars: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if not in_string:
+            chars.append(char)
+            if char == '"':
+                in_string = True
+            continue
+
+        if escaped:
+            chars.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            chars.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            chars.append(char)
+            in_string = False
+            continue
+        if char == "\n":
+            chars.append("\\n")
+            continue
+        if char == "\r":
+            chars.append("\\r")
+            continue
+        if char == "\t":
+            chars.append("\\t")
+            continue
+        chars.append(char)
+    return "".join(chars)
+
+
+def _append_missing_json_closers(text: str) -> str:
+    """Append missing object/array closers when the model truncates final braces."""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if stack and stack[-1] == char:
+                stack.pop()
+    if not stack:
+        return text
+    return text + "".join(reversed(stack))
+
+
 def _load_single_json_object(text: str) -> dict[str, object]:
-    payload, end = json.JSONDecoder().raw_decode(text)
-    remainder = text[end:].strip()
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("Model response must contain a JSON object.")
+    candidate = text[start:]
+    try:
+        payload, end = json.JSONDecoder().raw_decode(candidate)
+        decoded_text = candidate
+    except json.JSONDecodeError:
+        decoded_text = _escape_control_chars_inside_json_strings(candidate)
+        try:
+            payload, end = json.JSONDecoder().raw_decode(decoded_text)
+        except json.JSONDecodeError:
+            decoded_text = _append_missing_json_closers(decoded_text)
+            payload, end = json.JSONDecoder().raw_decode(decoded_text)
+    remainder = decoded_text[end:].strip()
     if remainder:
         cleaned_remainder = re.sub(r"(?:\\[nrt])+", "", remainder).strip()
         if cleaned_remainder:
@@ -74,11 +181,13 @@ class ReActAgent:
         tools: ToolRegistry,
         config: ReActAgentConfig | None = None,
         system_prompt: str | None = None,
+        stream_label_prefix: str = "react",
     ) -> None:
         self.model = model
         self.tools = tools
         self.config = config or ReActAgentConfig()
         self.system_prompt = system_prompt or REACT_SYSTEM_PROMPT
+        self.stream_label_prefix = stream_label_prefix
 
     def _build_messages(self, task: PublicTask, state: AgentRuntimeState) -> list[ModelMessage]:
         system_content = build_system_prompt(
@@ -96,30 +205,128 @@ class ReActAgent:
 
     def run(self, task: PublicTask) -> AgentRunResult:
         state = AgentRuntimeState()
+        # Per-loop tool result cache: maps a stable key derived from
+        # (action, action_input) to the observation we emitted last time.
+        # We additionally remember whether the cached call was terminal so
+        # we never accidentally re-trigger termination on a cache hit.
+        tool_cache: dict[str, dict[str, object]] = {}
+        last_error: str | None = None
+
         for step_index in range(1, self.config.max_steps + 1):
-            raw_response = self.model.complete(self._build_messages(task, state))
+            try:
+                raw_response = self.model.complete(
+                    self._build_messages(task, state),
+                    temperature=self.config.sample_temperature,
+                    seed=self.config.sample_seed,
+                    stream_label=f"{self.stream_label_prefix} step {step_index}",
+                )
+            except BudgetExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"model_error: {exc}"
+                state.steps.append(
+                    StepRecord(
+                        step_index=step_index,
+                        thought="",
+                        action="__model_error__",
+                        action_input={},
+                        raw_response="",
+                        observation={"ok": False, "error": str(exc)},
+                        ok=False,
+                    )
+                )
+                state.failure_reason = last_error
+                break
             try:
                 model_step = parse_model_step(raw_response)
-                tool_result = self.tools.execute(task, model_step.action, model_step.action_input)
-                observation = {
-                    "ok": tool_result.ok,
-                    "tool": model_step.action,
-                    "content": tool_result.content,
-                }
-                step_record = StepRecord(
-                    step_index=step_index,
-                    thought=model_step.thought,
-                    action=model_step.action,
-                    action_input=model_step.action_input,
-                    raw_response=raw_response,
-                    observation=observation,
-                    ok=tool_result.ok,
-                )
-                state.steps.append(step_record)
-                if tool_result.is_terminal:
-                    state.answer = tool_result.answer
-                    break
+
+                cache_hit = False
+                cache_key: str | None = None
+                if (
+                    self.config.cache_tool_results
+                    and model_step.action in _CACHEABLE_TOOLS
+                ):
+                    cache_key = _cache_key(model_step.action, model_step.action_input)
+                    cached = tool_cache.get(cache_key)
+                    if cached is not None:
+                        cache_hit = True
+                        observation = {
+                            "ok": True,
+                            "tool": model_step.action,
+                            "cached": True,
+                            "content": cached["content"],
+                        }
+                        step_record = StepRecord(
+                            step_index=step_index,
+                            thought=model_step.thought,
+                            action=model_step.action,
+                            action_input=model_step.action_input,
+                            raw_response=raw_response,
+                            observation=observation,
+                            ok=True,
+                        )
+                        state.steps.append(step_record)
+
+                if not cache_hit:
+                    tool_result = self.tools.execute(
+                        task, model_step.action, model_step.action_input
+                    )
+                    observation = {
+                        "ok": tool_result.ok,
+                        "tool": model_step.action,
+                        "content": tool_result.content,
+                    }
+                    step_record = StepRecord(
+                        step_index=step_index,
+                        thought=model_step.thought,
+                        action=model_step.action,
+                        action_input=model_step.action_input,
+                        raw_response=raw_response,
+                        observation=observation,
+                        ok=tool_result.ok,
+                    )
+                    state.steps.append(step_record)
+
+                    # Cache only successful calls. Don't cache the terminal
+                    # tool (`answer`) — it terminates the loop anyway.
+                    if (
+                        cache_key is not None
+                        and tool_result.ok
+                        and not tool_result.is_terminal
+                    ):
+                        tool_cache[cache_key] = {"content": tool_result.content}
+
+                    if tool_result.is_terminal:
+                        state.answer = tool_result.answer
+                        # Emit progress event before breaking out of the loop.
+                        from data_agent_baseline.progress import get_progress_logger
+                        logger = get_progress_logger()
+                        if logger is not None:
+                            logger.react_step(
+                                prefix=self.stream_label_prefix,
+                                step_index=step_index,
+                                action=model_step.action,
+                                action_input=model_step.action_input,
+                                ok=tool_result.ok,
+                                cached=False,
+                            )
+                        break
+
+                from data_agent_baseline.progress import get_progress_logger
+                logger = get_progress_logger()
+                if logger is not None:
+                    logger.react_step(
+                        prefix=self.stream_label_prefix,
+                        step_index=step_index,
+                        action=model_step.action,
+                        action_input=model_step.action_input,
+                        ok=cache_hit or step_record.ok,
+                        cached=cache_hit,
+                    )
+            except BudgetExceeded:
+                raise
             except Exception as exc:
+                last_error = str(exc)
                 observation = {
                     "ok": False,
                     "error": str(exc),
@@ -137,7 +344,8 @@ class ReActAgent:
                 )
 
         if state.answer is None and state.failure_reason is None:
-            state.failure_reason = "Agent did not submit an answer within max_steps."
+            suffix = f" Last error: {last_error}" if last_error else ""
+            state.failure_reason = f"Agent did not submit an answer within max_steps.{suffix}"
 
         return AgentRunResult(
             task_id=task.task_id,

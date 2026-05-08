@@ -211,6 +211,136 @@ artifacts/runs/<run_id>/summary.json
   </table>
 </div>
 
+## 快速开始（按 LLM 后端选 config）
+
+| 你想用什么后端 | 用哪个 config | 备注 |
+| --- | --- | --- |
+| **DashScope (Qwen) API**          | `configs/router.dashscope.yaml`        | Easy = qwen-coder-32B, Medium/Hard = qwen-plus, Extreme = qwen-max |
+| **DeepSeek API**                  | `configs/router.deepseek.yaml`         | 全路径用 deepseek-chat，Extreme 加 4-sample SC |
+| **本地 Ollama (16GB Mac)**        | `configs/router.lite.yaml`             | 单模型替身，先把架构跑通 |
+| **本地 vLLM (NVIDIA GPU)**        | `configs/router.example.yaml` 改两个 URL | TableLLM-13b + Qwen3-8B 全尺寸，冲分用 |
+
+最简流程（以 DashScope 为例）：
+
+```bash
+# 1. 装依赖
+uv sync
+
+# 2. 把 key 填进 config
+sed -i '' 's/REPLACE_WITH_YOUR_DASHSCOPE_KEY/sk-你的key/g' configs/router.dashscope.yaml
+
+# 3. 跑通一个任务
+uv run dabench run-task task_19 --config configs/router.dashscope.yaml
+
+# 4. 跑 5 个 + 评分
+uv run dabench run-benchmark --config configs/router.dashscope.yaml --limit 5
+RUN=$(ls -t artifacts/runs | head -1)
+uv run dabench score-run artifacts/runs/$RUN --config configs/router.dashscope.yaml
+```
+
+更详细的硬件对应方案见 `RUNNING.md`。
+
+## Difficulty-aware router (recommended top-level mode)
+
+Heavy multi-agent reasoning is overkill on simple single-table questions
+and a single ReAct loop is too weak on multi-source 128K-context tasks,
+so the recommended setup is `agent.mode: router`. The router reads
+`task.difficulty` from `task.json` and dispatches to the right path:
+
+```
+Easy     -> TableLLMDirectAgent  (one-shot pandas/SQL via the open-source TableLLM-13b)
+Medium   -> ReActAgent            (single-agent ReAct, no planning overhead)
+Hard     -> MultiAgentOrchestrator (planner -> specialists -> synthesizer)
+Extreme  -> MultiAgentOrchestrator + 4-sample column-vote self-consistency
+```
+
+Every route can point at its own OpenAI-compatible endpoint, so you can
+mix providers (e.g. TableLLM via DeepInfra / HF Inference Endpoints,
+Qwen via DashScope or your own vLLM box). See
+`configs/router.example.yaml` for the full layout. The router writes a
+`router_decision` block into every `trace.json` so you can audit which
+path each task took.
+
+You don't need to fine-tune to use this — `tablellm_direct` calls the
+already-open `RUCKBReasoning/TableLLM-13b` model directly. Fine-tuning
+Qwen3-8B is still useful for the medium/hard routes when you want to run
+fully locally; see `colab/`.
+
+## Multi-agent pipeline
+
+This fork adds a planner / specialist / synthesizer pipeline on top of
+the original ReAct baseline. Switch it on by setting `agent.mode:
+multi_agent` in the config or `--mode multi_agent` on the CLI.
+
+```
+PlannerAgent          (LLM call) -> Plan(rationale, subtasks DAG)
+   │
+   ▼
+Specialist DAG         (one of: schema / sql / python / document / generic)
+   │   layered topological execution (independent layers run in parallel)
+   ▼
+SynthesizerAgent      (LLM call) -> final AnswerTable via the `answer` tool
+   │   if synthesis fails: one round of iterative re-planning
+   ▼
+trace.json with `plan`, `findings`, `synthesizer_steps`
+```
+
+The pipeline matches the three reasoning topologies the competition
+asks for: sequential chain (linear `depends_on`), branching parallel +
+merge (independent specialists in the same layer), and iterative loop
+refinement (replan on synthesizer failure).
+
+## Cross-way self-consistency
+
+Inspired by the TableLLM cross-way validation idea, you can sample the
+agent N times at temperature `T` and column-vote at the official content
+signature level. Set:
+
+```yaml
+agent:
+  self_consistency:
+    num_samples: 4
+    sample_temperature: 0.7
+    aggregator: column_vote   # or first_success
+    min_votes: 2
+```
+
+This works for both `react` and `multi_agent` modes — every sample runs
+the entire chosen pipeline.
+
+## Local scoring
+
+`data/public/output/<task_id>/gold.csv` holds the public reference
+answers. Score a finished run with:
+
+```bash
+uv run dabench score-run artifacts/runs/<run_id> --config configs/react_baseline.yaml
+```
+
+The scorer implements the official rule:
+`score = max(0, recall - lambda * extra_cols / pred_cols)` with
+column-content signature matching that ignores column names and row
+order.
+
+## Fine-tuning Qwen3-8B (Colab)
+
+End-to-end loop:
+
+1. Run `scripts/build_sft_dataset.py` locally to produce a JSONL of
+   verified ReAct rollouts (rollouts whose final answer column-matches
+   the gold).
+2. Open `colab/finetune_qwen3_8b.ipynb` on Colab. It does 4-bit
+   LoRA fine-tuning with Unsloth, then merges the adapter for vLLM.
+3. Serve the merged model locally with vLLM and point
+   `configs/react_local_vllm.example.yaml` at `http://localhost:8000/v1`.
+4. Run with multi-agent + self-consistency:
+   ```bash
+   uv run dabench run-benchmark --config configs/react_local_vllm.example.yaml
+   uv run dabench score-run artifacts/runs/<run_id> --config configs/react_local_vllm.example.yaml
+   ```
+
+See `colab/README.md` for the step-by-step.
+
 ## Main Modules
 
 | Module | Responsibility |
@@ -219,7 +349,18 @@ artifacts/runs/<run_id>/summary.json
 | `src/data_agent_baseline/tools/filesystem.py` | `list_context`, `read_csv`, `read_json`, `read_doc` |
 | `src/data_agent_baseline/tools/python_exec.py` | `execute_python` |
 | `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`, `execute_context_sql` |
-| `src/data_agent_baseline/tools/registry.py` | Tool registration and terminal `answer` |
-| `src/data_agent_baseline/agents/prompt.py` | System prompt, task prompt, observation prompt |
+| `src/data_agent_baseline/tools/registry.py` | Tool registration, terminal `answer`, specialist `report` |
+| `src/data_agent_baseline/agents/prompt.py` | System / task / observation prompts (TableLLM-inspired) |
 | `src/data_agent_baseline/agents/react.py` | ReAct runtime with JSON action protocol |
-| `src/data_agent_baseline/run/runner.py` | Single-task and benchmark execution |
+| `src/data_agent_baseline/agents/planning.py` | `Plan` / `Subtask` / `Finding` data contracts + DAG layers |
+| `src/data_agent_baseline/agents/planner.py` | Planner agent (question -> DAG plan) |
+| `src/data_agent_baseline/agents/specialist.py` | SQL / Python / Document / Schema specialists |
+| `src/data_agent_baseline/agents/synthesizer.py` | Findings -> final AnswerTable via `answer` |
+| `src/data_agent_baseline/agents/orchestrator.py` | Planner -> Specialist DAG -> Synthesizer + refinement |
+| `src/data_agent_baseline/agents/tablellm_direct.py` | One-shot code-solution agent backed by TableLLM |
+| `src/data_agent_baseline/agents/router.py` | Difficulty-aware dispatcher across the three paths |
+| `src/data_agent_baseline/eval/column_match.py` | Official column-signature scorer |
+| `src/data_agent_baseline/run/runner.py` | Single-task / benchmark / self-consistency dispatch |
+| `src/data_agent_baseline/run/self_consistency.py` | Column-vote self-consistency utilities |
+| `scripts/build_sft_dataset.py` | TableLLM-style SFT data builder |
+| `colab/finetune_qwen3_8b.ipynb` | Qwen3-8B LoRA training on Colab |

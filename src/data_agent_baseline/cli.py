@@ -14,8 +14,13 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from dataclasses import replace
+
+from data_agent_baseline.agents.model import StreamSink, set_stream_sink
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
-from data_agent_baseline.config import load_app_config
+from data_agent_baseline.config import AppConfig, RouteConfig, load_app_config
+from data_agent_baseline.eval.column_match import score_run
+from data_agent_baseline.progress import ProgressLogger, set_progress_logger
 from data_agent_baseline.run.runner import TaskRunArtifacts, create_run_output_dir, run_benchmark, run_single_task
 from data_agent_baseline.tools.filesystem import list_context_tree
 
@@ -130,13 +135,156 @@ def inspect_task(
     console.print(table)
 
 
+def _override_route(route: RouteConfig, *, model: str | None, api_base: str | None, api_key: str | None) -> RouteConfig:
+    if model is None and api_base is None and api_key is None:
+        return route
+    return replace(
+        route,
+        model=model if model is not None else route.model,
+        api_base=api_base if api_base is not None else route.api_base,
+        api_key=api_key if api_key is not None else route.api_key,
+    )
+
+
+def _apply_overrides(
+    app_config: AppConfig,
+    *,
+    mode: str | None,
+    num_samples: int | None,
+    model: str | None = None,
+    route_overrides: dict[str, dict[str, str | None]] | None = None,
+) -> AppConfig:
+    """Apply CLI overrides to a freshly-loaded :class:`AppConfig`.
+
+    ``route_overrides`` is keyed by route name (``"easy" / "medium" / "hard" / "extreme"``)
+    and each value is a dict with optional ``model``, ``api_base``, ``api_key``.
+    """
+    new_agent = app_config.agent
+
+    if mode is not None:
+        normalized_mode = mode.strip().lower()
+        valid_modes = {"react", "multi_agent", "router"}
+        if normalized_mode not in valid_modes:
+            raise typer.BadParameter(
+                f"agent mode must be one of {sorted(valid_modes)}.",
+                param_hint="--mode",
+            )
+        new_agent = replace(new_agent, mode=normalized_mode)
+
+    if num_samples is not None:
+        new_agent = replace(
+            new_agent,
+            self_consistency=replace(new_agent.self_consistency, num_samples=num_samples),
+        )
+
+    if model is not None:
+        new_agent = replace(new_agent, model=model)
+
+    if route_overrides:
+        new_routes = dict(new_agent.router.routes)
+        for route_name, fields in route_overrides.items():
+            if route_name not in new_routes:
+                # Gracefully ignore unknown route names so a typo doesn't kill the run,
+                # but warn so it shows up in the console.
+                console.print(
+                    f"[yellow]warning:[/yellow] --{route_name}-* override given but no "
+                    f"such route in {sorted(new_routes.keys())}; ignored."
+                )
+                continue
+            new_routes[route_name] = _override_route(
+                new_routes[route_name],
+                model=fields.get("model"),
+                api_base=fields.get("api_base"),
+                api_key=fields.get("api_key"),
+            )
+        new_agent = replace(new_agent, router=replace(new_agent.router, routes=new_routes))
+
+    return replace(app_config, agent=new_agent)
+
+
+def _setup_streaming(stream: bool) -> None:
+    if stream:
+        set_stream_sink(StreamSink(enabled=True))
+    else:
+        set_stream_sink(None)
+
+
+def _setup_progress_logger(*, enabled: bool, lang: str = "en") -> None:
+    if enabled:
+        set_progress_logger(ProgressLogger(enabled=True, lang=lang))
+    else:
+        set_progress_logger(None)
+
+
+def _collect_route_overrides(
+    *,
+    easy_model: str | None,
+    medium_model: str | None,
+    hard_model: str | None,
+    extreme_model: str | None,
+    easy_api_base: str | None = None,
+    medium_api_base: str | None = None,
+    hard_api_base: str | None = None,
+    extreme_api_base: str | None = None,
+    easy_api_key: str | None = None,
+    medium_api_key: str | None = None,
+    hard_api_key: str | None = None,
+    extreme_api_key: str | None = None,
+) -> dict[str, dict[str, str | None]]:
+    raw: dict[str, dict[str, str | None]] = {
+        "easy": {"model": easy_model, "api_base": easy_api_base, "api_key": easy_api_key},
+        "medium": {"model": medium_model, "api_base": medium_api_base, "api_key": medium_api_key},
+        "hard": {"model": hard_model, "api_base": hard_api_base, "api_key": hard_api_key},
+        "extreme": {"model": extreme_model, "api_base": extreme_api_base, "api_key": extreme_api_key},
+    }
+    # Drop entries where every field is None — keeps trace clean.
+    return {
+        route: fields
+        for route, fields in raw.items()
+        if any(value is not None for value in fields.values())
+    }
+
+
 @app.command("run-task")
 def run_task_command(
     task_id: str,
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+    mode: str | None = typer.Option(None, help="Override agent.mode: 'react', 'multi_agent', or 'router'."),
+    num_samples: int | None = typer.Option(None, min=1, help="Override agent.self_consistency.num_samples."),
+    model: str | None = typer.Option(None, help="Override the top-level agent.model (used when mode is react/multi_agent)."),
+    easy_model: str | None = typer.Option(None, help="Override agent.router.routes.easy.model."),
+    medium_model: str | None = typer.Option(None, help="Override agent.router.routes.medium.model."),
+    hard_model: str | None = typer.Option(None, help="Override agent.router.routes.hard.model."),
+    extreme_model: str | None = typer.Option(None, help="Override agent.router.routes.extreme.model."),
+    easy_api_base: str | None = typer.Option(None),
+    medium_api_base: str | None = typer.Option(None),
+    hard_api_base: str | None = typer.Option(None),
+    extreme_api_base: str | None = typer.Option(None),
+    easy_api_key: str | None = typer.Option(None),
+    medium_api_key: str | None = typer.Option(None),
+    hard_api_key: str | None = typer.Option(None),
+    extreme_api_key: str | None = typer.Option(None),
+    stream: bool = typer.Option(False, "--stream", help="Stream raw model tokens to stderr while running."),
+    quiet: bool = typer.Option(False, "--quiet", help="Suppress the structured event-flow log (router decision, plan, specialist findings, ...)."),
+    lang: str = typer.Option("en", "--lang", help="Structured event-log language: en or zh. Raw data is not translated."),
 ) -> None:
-    """Run the ReAct baseline on one task."""
-    app_config = load_app_config(config)
+    """Run the agent on one task. Omit --mode to use the config's agent.mode."""
+    _setup_streaming(stream)
+    if lang not in {"en", "zh"}:
+        raise typer.BadParameter("lang must be 'en' or 'zh'.", param_hint="--lang")
+    _setup_progress_logger(enabled=not quiet, lang=lang)
+    route_overrides = _collect_route_overrides(
+        easy_model=easy_model, medium_model=medium_model, hard_model=hard_model, extreme_model=extreme_model,
+        easy_api_base=easy_api_base, medium_api_base=medium_api_base, hard_api_base=hard_api_base, extreme_api_base=extreme_api_base,
+        easy_api_key=easy_api_key, medium_api_key=medium_api_key, hard_api_key=hard_api_key, extreme_api_key=extreme_api_key,
+    )
+    app_config = _apply_overrides(
+        load_app_config(config),
+        mode=mode,
+        num_samples=num_samples,
+        model=model,
+        route_overrides=route_overrides,
+    )
     try:
         _, run_output_dir = create_run_output_dir(app_config.run.output_dir, run_id=app_config.run.run_id)
     except (ValueError, FileExistsError) as exc:
@@ -157,9 +305,59 @@ def run_task_command(
 def run_benchmark_command(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
     limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
+    mode: str | None = typer.Option(None, help="Override agent.mode: 'react', 'multi_agent', or 'router'."),
+    num_samples: int | None = typer.Option(None, min=1, help="Override agent.self_consistency.num_samples."),
+    model: str | None = typer.Option(None, help="Override the top-level agent.model."),
+    easy_model: str | None = typer.Option(None),
+    medium_model: str | None = typer.Option(None),
+    hard_model: str | None = typer.Option(None),
+    extreme_model: str | None = typer.Option(None),
+    easy_api_base: str | None = typer.Option(None),
+    medium_api_base: str | None = typer.Option(None),
+    hard_api_base: str | None = typer.Option(None),
+    extreme_api_base: str | None = typer.Option(None),
+    easy_api_key: str | None = typer.Option(None),
+    medium_api_key: str | None = typer.Option(None),
+    hard_api_key: str | None = typer.Option(None),
+    extreme_api_key: str | None = typer.Option(None),
+    stream: bool = typer.Option(False, "--stream", help="Stream raw model tokens. Forces max_workers=1."),
+    show_events: bool = typer.Option(False, "--show-events", help="Force-enable structured event-flow log (off by default in batch mode because workers interleave)."),
+    lang: str = typer.Option("en", "--lang", help="Structured event-log language: en or zh. Raw data is not translated."),
 ) -> None:
-    """Run the ReAct baseline on multiple tasks from the config selection."""
-    app_config = load_app_config(config)
+    """Run the agent on multiple tasks from the config selection."""
+    if lang not in {"en", "zh"}:
+        raise typer.BadParameter("lang must be 'en' or 'zh'.", param_hint="--lang")
+    route_overrides = _collect_route_overrides(
+        easy_model=easy_model, medium_model=medium_model, hard_model=hard_model, extreme_model=extreme_model,
+        easy_api_base=easy_api_base, medium_api_base=medium_api_base, hard_api_base=hard_api_base, extreme_api_base=extreme_api_base,
+        easy_api_key=easy_api_key, medium_api_key=medium_api_key, hard_api_key=hard_api_key, extreme_api_key=extreme_api_key,
+    )
+    app_config = _apply_overrides(
+        load_app_config(config),
+        mode=mode,
+        num_samples=num_samples,
+        model=model,
+        route_overrides=route_overrides,
+    )
+    if stream:
+        # Streaming with parallel workers would interleave bytes from
+        # different tasks on the screen. Force single-worker so the user
+        # gets one coherent thought stream at a time.
+        if app_config.run.max_workers != 1:
+            console.print(
+                "[yellow]--stream forces max_workers=1[/yellow] so thought "
+                "streams don't interleave."
+            )
+            app_config = replace(
+                app_config,
+                run=replace(app_config.run, max_workers=1),
+            )
+    _setup_streaming(stream)
+    # In batch mode the event log only renders cleanly when workers are
+    # serialized — otherwise lines from concurrent tasks interleave on
+    # the screen. Enable when the user opts in or when stream is on
+    # (which already pins workers to 1).
+    _setup_progress_logger(enabled=show_events or stream, lang=lang)
     dataset = DABenchPublicDataset(app_config.dataset.root_path)
     task_total = len(dataset.iter_tasks())
     if limit is not None:
@@ -255,6 +453,57 @@ def run_benchmark_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+
+@app.command("score-run")
+def score_run_command(
+    run_dir: Path = typer.Argument(..., exists=True, file_okay=False, help="artifacts/runs/<run_id> directory."),
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+    write_summary: bool = typer.Option(True, help="Write score_summary.json into the run directory."),
+) -> None:
+    """Score predictions in <run_dir> against gold CSVs using the official rubric."""
+    app_config = load_app_config(config)
+    summary = score_run(
+        run_dir=run_dir,
+        gold_root=app_config.dataset.gold_root,
+        redundancy_lambda=app_config.scoring.redundancy_lambda,
+        numeric_tolerance=app_config.scoring.numeric_tolerance,
+        case_insensitive=app_config.scoring.case_insensitive,
+        strip_whitespace=app_config.scoring.strip_whitespace,
+    )
+
+    table = Table(title=f"Scores for {run_dir.name}")
+    table.add_column("Task")
+    table.add_column("Matched")
+    table.add_column("Pred")
+    table.add_column("Gold")
+    table.add_column("Recall")
+    table.add_column("Penalty")
+    table.add_column("Score")
+    table.add_column("Note")
+    for entry in summary.per_task:
+        table.add_row(
+            entry.task_id,
+            str(entry.matched_count),
+            str(entry.pred_col_count),
+            str(entry.gold_col_count),
+            f"{entry.recall:.3f}",
+            f"{entry.penalty:.3f}",
+            f"{entry.score:.3f}",
+            entry.error or "",
+        )
+    console.print(table)
+    console.print(
+        f"Tasks with predictions: {summary.scored_task_count}/{summary.task_count} | "
+        f"mean score: {summary.mean_score:.4f} | mean recall: {summary.mean_recall:.4f}"
+    )
+
+    if write_summary:
+        summary_path = run_dir / "score_summary.json"
+        import json as _json
+
+        summary_path.write_text(_json.dumps(summary.to_dict(), ensure_ascii=False, indent=2) + "\n")
+        console.print(f"Score summary: {summary_path}")
 
 
 def main() -> None:

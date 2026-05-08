@@ -125,6 +125,11 @@ class ToolRegistry:
     def execute(self, task: PublicTask, action: str, action_input: dict[str, Any]) -> ToolExecutionResult:
         if action not in self.handlers:
             raise KeyError(f"Unknown tool: {action}")
+        from data_agent_baseline.budget import get_budget_controller
+
+        budget = get_budget_controller()
+        if budget is not None:
+            budget.consume_tool(action)
         return self.handlers[action](task, action_input)
 
 
