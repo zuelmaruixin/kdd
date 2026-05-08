@@ -65,9 +65,10 @@ _STRUCTURED_FIELD_RE = re.compile(
 )
 _SEMANTIC_RULE_QUESTION_RE = re.compile(
     r"\b("
-    r"abnormal|normal range|normal|ratio|percentage|percent|formula|"
-    r"diagnosis|admission|inpatient|outpatient|age|years old|"
-    r"born after|born before|not yet|aren't|isn't|severe"
+    r"abnormal|normal range|outside normal|within normal|"
+    r"severe|severity|threshold|rule|defined as|definition|"
+    r"according to (?:the )?(?:knowledge|rules)|"
+    r"per (?:the )?(?:knowledge|rules)|using (?:the )?(?:knowledge|rules)"
     r")\b",
     re.I,
 )

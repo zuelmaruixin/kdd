@@ -226,6 +226,11 @@ def _df_expr_name_and_columns(
         return expr.id, list(df_sources[expr.id].get("columns") or [])
 
     if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+        if expr.func.attr == "assign":
+            base_name, base_cols = _df_expr_name_and_columns(expr.func.value, df_sources)
+            if base_name in df_sources and base_cols is not None:
+                derived = [kw.arg for kw in expr.keywords if kw.arg]
+                return base_name, list(dict.fromkeys([*base_cols, *derived]))
         if expr.func.attr in {"copy", "drop_duplicates", "reset_index"}:
             return _df_expr_name_and_columns(expr.func.value, df_sources)
 
@@ -249,6 +254,37 @@ def _df_expr_name_and_columns(
                 return base, selected or list(df_sources[base].get("columns") or [])
 
     return None, None
+
+
+def _dataframe_column_assignment_targets(
+    targets: list[ast.AST],
+    df_sources: dict[str, dict[str, Any]],
+) -> list[tuple[str, list[str]]]:
+    """Infer derived dataframe columns from assignments such as df['x'] = ..."""
+    out: list[tuple[str, list[str]]] = []
+    for target in targets:
+        if not isinstance(target, ast.Subscript):
+            continue
+        df_name: str | None = None
+        columns: list[str] = []
+        if isinstance(target.value, ast.Name) and target.value.id in df_sources:
+            df_name = target.value.id
+            columns = _strings_from_node(target.slice)
+        elif (
+            isinstance(target.value, ast.Attribute)
+            and target.value.attr in {"loc", "iloc"}
+            and isinstance(target.value.value, ast.Name)
+            and target.value.value.id in df_sources
+        ):
+            df_name = target.value.value.id
+            if isinstance(target.slice, ast.Tuple) and len(target.slice.elts) >= 2:
+                columns = _strings_from_node(target.slice.elts[1])
+            else:
+                columns = _strings_from_node(target.slice)
+        columns = [col for col in columns if col]
+        if df_name and columns:
+            out.append((df_name, columns))
+    return out
 
 
 def _literal_path_from_call(call: ast.Call) -> str | None:
@@ -437,8 +473,35 @@ def _infer_dataframe_sources(
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign) or not node.targets:
                 continue
+            for df_name, derived_cols in _dataframe_column_assignment_targets(
+                list(node.targets),
+                df_to_source,
+            ):
+                current_cols = list(df_to_source[df_name].get("columns") or [])
+                next_cols = list(dict.fromkeys([*current_cols, *derived_cols]))
+                if next_cols != current_cols:
+                    df_to_source[df_name] = {
+                        **df_to_source[df_name],
+                        "columns": next_cols,
+                    }
+                    changed = True
+
             target = _target_name(node.targets[0])
-            if not target or target in df_to_source:
+            if not target:
+                continue
+            if target in df_to_source:
+                base_name, expr_cols = _df_expr_name_and_columns(node.value, df_to_source)
+                if base_name in df_to_source and expr_cols is not None:
+                    current_cols = list(df_to_source[target].get("columns") or [])
+                    next_cols = list(dict.fromkeys(expr_cols))
+                    if next_cols != current_cols:
+                        df_to_source[target] = {
+                            **df_to_source[target],
+                            "path": df_to_source[base_name].get("path"),
+                            "kind": df_to_source[base_name].get("kind", "dataframe"),
+                            "columns": next_cols,
+                        }
+                        changed = True
                 continue
 
             base_name, expr_cols = _df_expr_name_and_columns(node.value, df_to_source)
@@ -689,6 +752,22 @@ def check_program(
         normalized = {_normalize_name(c): c for c in available}
         if _normalize_name(column) in normalized:
             return
+        closest = _closest_names(column, available)
+        link_like_matches = [
+            item for item in closest
+            if _normalize_name(item).startswith("linkto")
+        ]
+        if link_like_matches and not _normalize_name(column).startswith("linkto"):
+            repair_hint = (
+                "closest link_to_* columns are foreign keys, not semantic "
+                "attribute replacements; join the referenced table/source to "
+                "materialize the requested field instead of substituting the key"
+            )
+        else:
+            repair_hint = (
+                "map the natural-language concept to one of available_columns; "
+                "do not invent a column name"
+            )
         issues.append(StaticIssue(
             code="no_such_column",
             severity="error",
@@ -703,12 +782,9 @@ def check_program(
                 "column": column,
                 "access": access,
                 "available_columns": available,
-                "closest_matches": _closest_names(column, available),
+                "closest_matches": closest,
             },
-            repair_hint=(
-                "map the natural-language concept to one of available_columns; "
-                "do not invent a column name"
-            ),
+            repair_hint=repair_hint,
         ))
 
     for node in ast.walk(tree):

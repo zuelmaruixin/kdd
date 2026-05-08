@@ -1,158 +1,183 @@
-<div align="center">
+# DataAgent-Bench Course Project
 
-# DataAgent-Bench Starter Kit
+这是一个面向 KDD Cup 2026 DataAgent-Bench 的课程项目工程。我们基于官方
+starter kit 做了完整的 agent pipeline 改造：从简单表格题的快速程序执行，到
+多源/中难题的 schema grounding、repair、semantic guard 和可视化展示。
 
-English | [中文](README.zh.md)
+本仓库不再只是原始 ReAct baseline，而是一个可运行、可评分、可展示推理过程的
+数据问答系统。
 
-[![Official Website](https://img.shields.io/badge/Official%20Website-Visit%20dataagent.top-0ea5e9?style=for-the-badge&logo=googlechrome&logoColor=white&labelColor=0f172a)](https://dataagent.top)
-[![Demo Dataset](https://img.shields.io/badge/Demo%20Dataset-Download%20Phase%201-f59e0b?style=for-the-badge&logo=googledrive&logoColor=white&labelColor=0f172a)](https://drive.google.com/file/d/1c6u5WlFw4KV7CBRyXh5BvFYbKqxhBSbL/view)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=0f172a)](https://discord.com/invite/7eFwJQN3Fx)
+## 项目目标
 
-</div>
+DataAgent-Bench 的任务输入是一个 `task.json` 和若干上下文文件，可能包含
+CSV、JSON、SQLite、Markdown/text 等数据源。系统需要读取问题，调用模型和工具，
+最终输出一个 `prediction.csv`。
 
-> Official starter kit for the KDD Cup 2026 DataAgent-Bench challenge. The repository reads tasks from `data/public/input/` and writes predictions for downstream evaluation.
+我们的目标是：
 
-## Overview
+- 简单题尽量快：优先使用一次性代码生成和本地执行，不做多余 LLM judge。
+- 中难题尽量稳：加入 schema grounding、静态检查、执行修复、semantic guard。
+- 结果可审计：每个任务都写出 `trace.json`，记录 route、程序、执行结果和验证信息。
+- 课堂可展示：提供 Streamlit 页面，输入 task id 后实时显示执行日志和最终推理摘要。
 
-| Item | Value |
+## 当前效果
+
+按目前本地实验观察：
+
+| 难度 | 大致表现 |
 | --- | --- |
-| Dataset input | `data/public/input/` |
-| Public demo ground truth | `data/public/output/task_<id>/gold.csv` |
-| Hidden test data | `input/` only, no `output/` |
-| Entry command | `uv run dabench <command> --config PATH` |
-| Default run output | `artifacts/runs/` |
+| 简单题 | 约 70-80 分 |
+| 中等到困难题 | 约 60 分左右 |
 
-## Quick Start
+这些分数不是官方最终 hidden test 结果，只是我们在公开任务上的阶段性实验表现。
+从课程项目角度看，系统已经具备完整工程闭环：能跑单题、批量跑、评分、保存 trace、
+解释过程，并且有针对错误模式的修复和 guard。
 
-1. Install `uv` by following the official guide:
-   - https://docs.astral.sh/uv/getting-started/installation/
-2. On macOS and Linux, the standalone installer is:
+## 我们做了什么
 
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
+### 1. Tool-first Operator Executor
 
-3. Install project dependencies:
-
-   ```bash
-   uv sync
-   ```
-
-4. Confirm the dataset root is visible:
-
-   ```bash
-   uv run dabench status --config configs/react_baseline.example.yaml
-   ```
-
-5. Run the baseline:
-
-   ```bash
-   uv run dabench run-benchmark --config configs/react_baseline.example.yaml
-   ```
-
-## Dataset
-
-The public demo dataset lives under `data/public/input/`. Each task directory follows this structure:
+核心路径从“模型一步步 ReAct 调工具”改成更直接的程序执行：
 
 ```text
-data/public/input/task_<id>/
-├── task.json
-└── context/
+schema/context inspect
+-> codegen LLM 生成 Python / SQL / pandas 程序
+-> static check
+-> execute
+-> answer validation
+-> cheap semantic guard
+-> 必要时 semantic plan + judge + repair
 ```
 
-The corresponding public demo answers live separately under `data/public/output/task_<id>/gold.csv`.
-Hidden test sets only include `input/`, so there is no `output/` directory there.
+相关文件：
 
-`task.json` contains:
+- `src/data_agent_baseline/agents/operator_executor.py`
+- `src/data_agent_baseline/agents/tablellm_direct.py`
+- `src/data_agent_baseline/agents/static_checker.py`
+- `src/data_agent_baseline/agents/repair_coordinator.py`
 
-- `task_id`
-- `difficulty`
-- `question`
+### 2. Schema Grounding
 
-The `context/` directory may contain one or more of:
+为了减少字段猜错，我们加入了 deterministic schema grounding：
 
-- CSV files
-- JSON files
-- SQLite / DB files
-- Text documents
+- 从问题中抽取关键 concept。
+- 用真实 schema、列名、低基数字段样本、dtype 做匹配。
+- 在 prompt 中给 codegen 明确的候选字段。
+- 在后处理阶段检查实际使用字段是否覆盖了高风险 concept。
 
-## Configuration
+相关文件：
 
-An example config file lives at `configs/react_baseline.example.yaml`.
+- `src/data_agent_baseline/agents/schema_grounding.py`
+- `src/data_agent_baseline/agents/semantic_guard.py`
 
-```yaml
-dataset:
-  root_path: data/public/input
+### 3. Cheap Semantic Guard
 
-agent:
-  model: YOUR_MODEL_NAME
-  api_base: YOUR_API_BASE_URL
-  api_key: YOUR_API_KEY
-  max_steps: 16
-  temperature: 0.0
+简单题不会默认跑昂贵的一致性检测，但也不会只看 `answer valid` 就放行。
 
-run:
-  output_dir: artifacts/runs
-  run_id:
-  max_workers: 4
-  task_timeout_seconds: 600
+fast path 通过条件大致是：
+
+```text
+执行成功
+答案结构有效
+schema grounding 高置信
+没有 ambiguous mapping
+没有空结果 / zero intermediate count
+没有 suspicious fallback
+trace 中 used_columns 覆盖了风险字段
 ```
 
-Config fields:
+如果 cheap guard 发现风险，会升级到 semantic analyst / judge / repair。典型会拦：
 
-| Field | Meaning |
-| --- | --- |
-| `dataset.root_path` | Root directory of the public demo `input/` dataset. Relative paths are resolved from the project root. |
-| `agent.model` | Model name. |
-| `agent.api_base` | OpenAI-compatible API base URL. |
-| `agent.api_key` | API key, read directly from the config file. |
-| `agent.max_steps` | Maximum ReAct steps per task. |
-| `agent.temperature` | Sampling temperature. |
-| `run.output_dir` | Output directory for run artifacts. |
-| `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Must be a single directory name; existing run directories are rejected. |
-| `run.max_workers` | Parallel worker count for `run-benchmark`. |
-| `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
+- 问题问 `severe degree of thrombosis`，代码却只用了 `disease == "thrombosis"`。
+- filter 后中间结果为 0。
+- schema retry 或 local repair 才得到答案。
+- join/filter trace 缺失。
+- 字段 grounding 低置信或歧义。
 
-## CLI
+### 4. Semantic Consistency and Repair
+
+对于风险较高的任务，系统会启动 semantic plan 和 judge：
+
+```text
+semantic analyst
+-> rule/schema resolution
+-> compare plan vs program/debug_steps/answer
+-> semantic repair if mismatch
+```
+
+这里的 `difficulty` 只作为预算提示，不直接决定是否跑 semantic judge。真正决定因素是：
+
+- risk score
+- grounding confidence
+- rule alignment
+- execution / validation failure
+- verifiability
+
+相关文件：
+
+- `src/data_agent_baseline/agents/semantic_consistency.py`
+- `src/data_agent_baseline/agents/local_repair.py`
+
+### 5. Router and Mixed-source Handling
+
+Router 不再简单按 difficulty 分配路线，而是结合 task type、context size、
+source shape、verifiability 和 operation complexity。多源任务会尽量走
+tool-first mixed path，再根据失败类型 fallback。
+
+相关文件：
+
+- `src/data_agent_baseline/agents/router.py`
+- `src/data_agent_baseline/agents/task_compiler.py`
+- `src/data_agent_baseline/agents/structured_doc_executor.py`
+
+### 6. Streamlit Demo UI
+
+为了课堂展示，我们加了一个 Streamlit 页面：
+
+- 输入 task id。
+- 选择 config。
+- 点击运行。
+- 实时显示执行日志。
+- 跑完后展示 route、timeline、answer、generated program、debug output 和完整 trace。
+
+相关文件：
+
+- `scripts/demo_app.py`
+
+## 快速运行
+
+### 1. 安装依赖
 
 ```bash
-uv run dabench <command> --config PATH [options]
+uv sync
 ```
 
-| Command | Purpose | Example |
-| --- | --- | --- |
-| `status` | Show project paths, config path, dataset root, and public task counts. | `uv run dabench status --config configs/react_baseline.example.yaml` |
-| `inspect-task` | Show task metadata and list accessible files under `context/`. | `uv run dabench inspect-task task_1 --config configs/react_baseline.local.yaml` |
-| `run-task` | Run the baseline on one task and write outputs. | `uv run dabench run-task task_1 --config configs/react_baseline.local.yaml` |
-| `run-benchmark` | Run the baseline across the public dataset. | `uv run dabench run-benchmark --config configs/react_baseline.local.yaml` |
+如果当前镜像下载 Streamlit 失败，可以使用官方 PyPI：
 
-`run-benchmark` also supports `--limit N` to cap the number of tasks.
+```bash
+UV_DEFAULT_INDEX=https://pypi.org/simple uv sync
+```
 
-## Tools
+### 2. 检查数据集
 
-The baseline exposes these tools to the model:
+```bash
+uv run dabench status --config configs/router.deepseek.yaml
+```
 
-| Tool | Purpose | Inputs |
-| --- | --- | --- |
-| `list_context` | List files and directories under `context/`. | `max_depth` |
-| `read_csv` | Read a CSV preview. | `path`, `max_rows` |
-| `read_json` | Read a JSON preview. | `path`, `max_chars` |
-| `read_doc` | Read a text document preview. | `path`, `max_chars` |
-| `inspect_sqlite_schema` | Inspect tables in a SQLite / DB file. | `path` |
-| `execute_context_sql` | Execute read-only SQL against a SQLite / DB file in `context/`. | `path`, `sql`, `limit` |
-| `execute_python` | Execute arbitrary Python code inside the task `context/` directory. | `code` |
-| `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
+数据目录默认是：
 
-All file paths passed to tools must be relative to the task `context/` directory.
+```text
+data/public/input/
+data/public/output/
+```
 
-## Outputs
+### 3. 跑单个任务
 
-Each successful task run may produce:
+```bash
+uv run dabench run-task task_415 --config configs/router.deepseek.yaml
+```
 
-- `trace.json`
-- `prediction.csv`
-
-Per-task outputs are written to:
+输出会写到：
 
 ```text
 artifacts/runs/<run_id>/<task_id>/
@@ -160,207 +185,96 @@ artifacts/runs/<run_id>/<task_id>/
 └── prediction.csv
 ```
 
-Benchmark runs also write:
+### 4. 跑一批任务
+
+```bash
+uv run dabench run-benchmark --config configs/router.deepseek.yaml --limit 20
+```
+
+### 5. 本地评分
+
+```bash
+uv run dabench score-run artifacts/runs/<run_id> --config configs/router.deepseek.yaml
+```
+
+评分使用官方列内容匹配逻辑：
 
 ```text
-artifacts/runs/<run_id>/summary.json
+score = max(0, recall - lambda * extra_cols / pred_cols)
 ```
 
-## Contact
+## 课堂展示页面
 
-- Open issues: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
-- Official website: https://dataagent.top
-- Discord: https://discord.com/invite/7eFwJQN3Fx
-- WeChat official account: `数据智能与分析实验室 DIAL`
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center">
-        <a href="https://dataagent.top">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8"
-            alt="Official website QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Official Website
-      </td>
-      <td align="center">
-        <a href="https://discord.com/invite/7eFwJQN3Fx">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.com/invite/7eFwJQN3Fx&bgcolor=ffffff&color=111827&margin=8"
-            alt="Discord QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Discord
-      </td>
-      <td align="center">
-        <img
-          src="https://dataagent.top/HKUSTGZ_DIAL.jpg"
-          alt="WeChat official account QR code"
-          width="144"
-        />
-        <br />
-        WeChat Official Account
-      </td>
-    </tr>
-  </table>
-</div>
-
-## 快速开始（按 LLM 后端选 config）
-
-| 你想用什么后端 | 用哪个 config | 备注 |
-| --- | --- | --- |
-| **DashScope (Qwen) API**          | `configs/router.dashscope.yaml`        | Easy = qwen-coder-32B, Medium/Hard = qwen-plus, Extreme = qwen-max |
-| **DeepSeek API**                  | `configs/router.deepseek.yaml`         | 全路径用 deepseek-chat，Extreme 加 4-sample SC |
-| **本地 Ollama (16GB Mac)**        | `configs/router.lite.yaml`             | 单模型替身，先把架构跑通 |
-| **本地 vLLM (NVIDIA GPU)**        | `configs/router.example.yaml` 改两个 URL | TableLLM-13b + Qwen3-8B 全尺寸，冲分用 |
-
-最简流程（以 DashScope 为例）：
+启动 Streamlit demo：
 
 ```bash
-# 1. 装依赖
-uv sync
-
-# 2. 把 key 填进 config
-sed -i '' 's/REPLACE_WITH_YOUR_DASHSCOPE_KEY/sk-你的key/g' configs/router.dashscope.yaml
-
-# 3. 跑通一个任务
-uv run dabench run-task task_19 --config configs/router.dashscope.yaml
-
-# 4. 跑 5 个 + 评分
-uv run dabench run-benchmark --config configs/router.dashscope.yaml --limit 5
-RUN=$(ls -t artifacts/runs | head -1)
-uv run dabench score-run artifacts/runs/$RUN --config configs/router.dashscope.yaml
+UV_DEFAULT_INDEX=https://pypi.org/simple uv run streamlit run scripts/demo_app.py
 ```
 
-更详细的硬件对应方案见 `RUNNING.md`。
+页面中输入：
 
-## Difficulty-aware router (recommended top-level mode)
-
-Heavy multi-agent reasoning is overkill on simple single-table questions
-and a single ReAct loop is too weak on multi-source 128K-context tasks,
-so the recommended setup is `agent.mode: router`. The router reads
-`task.difficulty` from `task.json` and dispatches to the right path:
-
-```
-Easy     -> TableLLMDirectAgent  (one-shot pandas/SQL via the open-source TableLLM-13b)
-Medium   -> ReActAgent            (single-agent ReAct, no planning overhead)
-Hard     -> MultiAgentOrchestrator (planner -> specialists -> synthesizer)
-Extreme  -> MultiAgentOrchestrator + 4-sample column-vote self-consistency
+```text
+Config: configs/router.deepseek.yaml
+Task ID: task_415
 ```
 
-Every route can point at its own OpenAI-compatible endpoint, so you can
-mix providers (e.g. TableLLM via DeepInfra / HF Inference Endpoints,
-Qwen via DashScope or your own vLLM box). See
-`configs/router.example.yaml` for the full layout. The router writes a
-`router_decision` block into every `trace.json` so you can audit which
-path each task took.
+点击 `Run Task` 后会实时显示：
 
-You don't need to fine-tune to use this — `tablellm_direct` calls the
-already-open `RUCKBReasoning/TableLLM-13b` model directly. Fine-tuning
-Qwen3-8B is still useful for the medium/hard routes when you want to run
-fully locally; see `colab/`.
+- router / compiler / codegen 日志
+- static check / execute / repair 信息
+- cheap semantic guard 是否通过或升级
+- semantic plan / judge 是否触发
+- 最终 answer table
+- generated Python program
+- `trace.json`
 
-## Multi-agent pipeline
+## 常用配置
 
-This fork adds a planner / specialist / synthesizer pipeline on top of
-the original ReAct baseline. Switch it on by setting `agent.mode:
-multi_agent` in the config or `--mode multi_agent` on the CLI.
-
-```
-PlannerAgent          (LLM call) -> Plan(rationale, subtasks DAG)
-   │
-   ▼
-Specialist DAG         (one of: schema / sql / python / document / generic)
-   │   layered topological execution (independent layers run in parallel)
-   ▼
-SynthesizerAgent      (LLM call) -> final AnswerTable via the `answer` tool
-   │   if synthesis fails: one round of iterative re-planning
-   ▼
-trace.json with `plan`, `findings`, `synthesizer_steps`
-```
-
-The pipeline matches the three reasoning topologies the competition
-asks for: sequential chain (linear `depends_on`), branching parallel +
-merge (independent specialists in the same layer), and iterative loop
-refinement (replan on synthesizer failure).
-
-## Cross-way self-consistency
-
-Inspired by the TableLLM cross-way validation idea, you can sample the
-agent N times at temperature `T` and column-vote at the official content
-signature level. Set:
-
-```yaml
-agent:
-  self_consistency:
-    num_samples: 4
-    sample_temperature: 0.7
-    aggregator: column_vote   # or first_success
-    min_votes: 2
-```
-
-This works for both `react` and `multi_agent` modes — every sample runs
-the entire chosen pipeline.
-
-## Local scoring
-
-`data/public/output/<task_id>/gold.csv` holds the public reference
-answers. Score a finished run with:
-
-```bash
-uv run dabench score-run artifacts/runs/<run_id> --config configs/react_baseline.yaml
-```
-
-The scorer implements the official rule:
-`score = max(0, recall - lambda * extra_cols / pred_cols)` with
-column-content signature matching that ignores column names and row
-order.
-
-## Fine-tuning Qwen3-8B (Colab)
-
-End-to-end loop:
-
-1. Run `scripts/build_sft_dataset.py` locally to produce a JSONL of
-   verified ReAct rollouts (rollouts whose final answer column-matches
-   the gold).
-2. Open `colab/finetune_qwen3_8b.ipynb` on Colab. It does 4-bit
-   LoRA fine-tuning with Unsloth, then merges the adapter for vLLM.
-3. Serve the merged model locally with vLLM and point
-   `configs/react_local_vllm.example.yaml` at `http://localhost:8000/v1`.
-4. Run with multi-agent + self-consistency:
-   ```bash
-   uv run dabench run-benchmark --config configs/react_local_vllm.example.yaml
-   uv run dabench score-run artifacts/runs/<run_id> --config configs/react_local_vllm.example.yaml
-   ```
-
-See `colab/README.md` for the step-by-step.
-
-## Main Modules
-
-| Module | Responsibility |
+| Config | 用途 |
 | --- | --- |
-| `src/data_agent_baseline/benchmark/dataset.py` | Public dataset loader |
-| `src/data_agent_baseline/tools/filesystem.py` | `list_context`, `read_csv`, `read_json`, `read_doc` |
-| `src/data_agent_baseline/tools/python_exec.py` | `execute_python` |
-| `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`, `execute_context_sql` |
-| `src/data_agent_baseline/tools/registry.py` | Tool registration, terminal `answer`, specialist `report` |
-| `src/data_agent_baseline/agents/prompt.py` | System / task / observation prompts (TableLLM-inspired) |
-| `src/data_agent_baseline/agents/react.py` | ReAct runtime with JSON action protocol |
-| `src/data_agent_baseline/agents/planning.py` | `Plan` / `Subtask` / `Finding` data contracts + DAG layers |
-| `src/data_agent_baseline/agents/planner.py` | Planner agent (question -> DAG plan) |
-| `src/data_agent_baseline/agents/specialist.py` | SQL / Python / Document / Schema specialists |
-| `src/data_agent_baseline/agents/synthesizer.py` | Findings -> final AnswerTable via `answer` |
-| `src/data_agent_baseline/agents/orchestrator.py` | Planner -> Specialist DAG -> Synthesizer + refinement |
-| `src/data_agent_baseline/agents/tablellm_direct.py` | One-shot code-solution agent backed by TableLLM |
-| `src/data_agent_baseline/agents/router.py` | Difficulty-aware dispatcher across the three paths |
-| `src/data_agent_baseline/eval/column_match.py` | Official column-signature scorer |
-| `src/data_agent_baseline/run/runner.py` | Single-task / benchmark / self-consistency dispatch |
-| `src/data_agent_baseline/run/self_consistency.py` | Column-vote self-consistency utilities |
-| `scripts/build_sft_dataset.py` | TableLLM-style SFT data builder |
-| `colab/finetune_qwen3_8b.ipynb` | Qwen3-8B LoRA training on Colab |
+| `configs/router.deepseek.yaml` | 当前主要实验配置，OpenAI-compatible API |
+| `configs/router.dashscope.yaml` | DashScope / Qwen API 配置 |
+| `configs/router.example.yaml` | 路由配置模板 |
+
+注意：配置文件里包含 API endpoint 和 key 字段，提交或展示前请确认是否需要脱敏。
+
+## 关键产物
+
+| 路径 | 说明 |
+| --- | --- |
+| `src/data_agent_baseline/agents/operator_executor.py` | 主 tool-first 执行器 |
+| `src/data_agent_baseline/agents/tablellm_direct.py` | 代码生成 prompt 和执行封装 |
+| `src/data_agent_baseline/agents/schema_grounding.py` | 问题 concept 到真实 schema 的匹配 |
+| `src/data_agent_baseline/agents/semantic_guard.py` | 非 LLM 的 cheap semantic risk 检查 |
+| `src/data_agent_baseline/agents/semantic_consistency.py` | semantic analyst / judge / repair |
+| `src/data_agent_baseline/agents/repair_coordinator.py` | 本地修复和 schema retry |
+| `src/data_agent_baseline/agents/router.py` | 路由和 fallback |
+| `src/data_agent_baseline/agents/task_compiler.py` | 任务画像、预算、execution profile |
+| `src/data_agent_baseline/eval/column_match.py` | 本地评分 |
+| `scripts/demo_app.py` | 展示用 Streamlit 页面 |
+
+## 工程完整性
+
+目前系统已经具备课程项目所需的完整闭环：
+
+- 可配置模型后端。
+- 可运行单题和批量任务。
+- 可生成标准 `prediction.csv`。
+- 可用公开答案本地评分。
+- 可保存可审计 `trace.json`。
+- 有 fast path、guard path、heavy path 的分层。
+- 有静态检查、执行修复、schema retry、semantic repair。
+- 有展示页面解释运行过程。
+
+后续如果继续冲分，可以优先做：
+
+- 收集失败 case，按错误类型补规则。
+- 改进 mixed-context / long-doc extraction。
+- 对高风险 task 开更多 self-consistency 或 cross-model verification。
+- 加一个更细粒度的实时事件 logger，替代现在 Streamlit 中的控制台日志流。
+
+## 结论
+
+对于课程提交，这已经不是一个简单 starter kit，而是一个有明确工程设计、
+可运行 pipeline、可视化展示和实验结果的完整项目。当前分数还有提升空间，
+但工作量和系统完整度是够提交的。

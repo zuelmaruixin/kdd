@@ -22,6 +22,7 @@ dependencies = [
     "python-docx>=1.1.2",
     "pyyaml>=6.0.2",
     "rich>=13.9.4",
+    "streamlit>=1.51.0",
     "typer>=0.15.2",
 ]
 

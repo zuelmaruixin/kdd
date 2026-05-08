@@ -21,6 +21,7 @@ from typing import Any
 from data_agent_baseline.agents.execution_context import ExecutionContext
 from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.agents.repair_coordinator import RepairCoordinator
+from data_agent_baseline.agents.semantic_guard import assess_cheap_semantic_risk
 from data_agent_baseline.agents.semantic_consistency import SemanticConsistencyPipeline
 from data_agent_baseline.agents.tablellm_direct import (
     CodegenDirectAgent,
@@ -54,7 +55,8 @@ class OperatorExecutor:
           3. Initial codegen  or  structured-doc pre-extraction
           4. Local repair → schema-retry (RepairCoordinator)
           5. Structured-doc synthesis fallback (if record_text codegen failed)
-          6. Semantic consistency judge + repair (执行官, success-only)
+          6. Semantic consistency judge + repair when semantic plan is active
+             or when the fast path needs escalation
         """
         ctx = ExecutionContext(self.compiled_task)
 
@@ -140,9 +142,39 @@ class OperatorExecutor:
                     {"post_schema_retry_local_repair_log": post_schema_repair_log}
                 ]
 
+        if semantic_plan is None:
+            cheap_assessment = self._cheap_semantic_assessment(task, result)
+        else:
+            cheap_assessment = None
+
+        if semantic_plan is None and cheap_assessment is not None:
+            semantic_plan = sc_pipeline.plan(task, force=True)
+            if semantic_plan is not None:
+                result.manifest = list(result.manifest or []) + [{
+                    "semantic_consistency": "lazy_escalation",
+                    "semantic_plan": semantic_plan,
+                }]
+            else:
+                semantic_plan = self._fallback_semantic_plan(
+                    task=task,
+                    cheap_assessment=cheap_assessment,
+                    plan_failure=sc_pipeline.last_plan_failure,
+                )
+                result.manifest = list(result.manifest or []) + [{
+                    "semantic_consistency": "fallback_plan_from_cheap_guard",
+                    "reason": (
+                        "cheap semantic guard requested escalation, but "
+                        "semantic analyst did not produce a plan; using "
+                        "cheap-risk fallback plan for judge"
+                    ),
+                    "plan_failure": sc_pipeline.last_plan_failure,
+                    "semantic_plan": semantic_plan,
+                }]
+
         # --- Phase 4: semantic consistency judge + repair ---
-        if result.succeeded:
-            result = sc_pipeline.judge_and_repair(task, result, semantic_plan)
+        # Let the judge own both successful answers and terminal error states
+        # so static failures / invalid answers cannot be stamped as pass later.
+        result = sc_pipeline.judge_and_repair(task, result, semantic_plan)
 
         return result
 
@@ -162,6 +194,65 @@ class OperatorExecutor:
             self.compiled_task.task_type == "record_text_with_semantic_rule"
             or "record_extraction_required" in flags
         ) and self._has_record_text_docs()
+
+    def _cheap_semantic_assessment(
+        self,
+        task: PublicTask,
+        result: CodegenRunResult,
+    ) -> dict[str, Any] | None:
+        if not self.semantic_consistency_enabled:
+            return None
+        assessment = assess_cheap_semantic_risk(
+            task=task,
+            compiled=self.compiled_task,
+            result=result,
+        )
+        if assessment.should_escalate:
+            payload = assessment.to_dict()
+            result.manifest = list(result.manifest or []) + [
+                {"cheap_semantic_assessment": payload}
+            ]
+            return payload
+        return None
+
+    def _fallback_semantic_plan(
+        self,
+        *,
+        task: PublicTask,
+        cheap_assessment: dict[str, Any],
+        plan_failure: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        risks = cheap_assessment.get("risks") or []
+        return {
+            "schema_mapping": [],
+            "join_plan": [],
+            "filters": [],
+            "aggregation": None,
+            "output": {"question": task.question},
+            "requires_rule_resolution": False,
+            "unresolved_core_filters": [],
+            "rule_resolution_queries": [],
+            "rule_resolution": {},
+            "applied_plan_overrides": [],
+            "consistency_checks": [
+                "Check the generated program against cheap_semantic_assessment risks.",
+                "Verify schema_mapping, used_columns, join_keys, filters, and row counts.",
+                (
+                    "Do not pass if answer validity depends on suspicious "
+                    "fallback or ambiguous grounding."
+                ),
+            ],
+            "uncertainties": [
+                risk.get("message") or risk.get("code")
+                for risk in risks
+                if isinstance(risk, dict)
+            ],
+            "confidence": "low",
+            "cheap_semantic_assessment": cheap_assessment,
+            "plan_failure": plan_failure or {},
+            "_force_semantic_consistency": True,
+            "_force_reason": "cheap_semantic_guard_fallback_plan",
+        }
 
     def _run_structured_doc_synthesis(
         self,

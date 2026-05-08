@@ -43,6 +43,9 @@ _SCHEMA_RETRY_SYSTEM = (
     "proof that a column exists. Before using dataframe columns, write code "
     "that records actual loaded columns in debug_steps['schema_inspection'] "
     "and ground schema_mapping on those real columns. "
+    "Knowledge formulas are not default transformations; apply a formula "
+    "only when the question explicitly asks for that formula's target metric "
+    "or no direct real field can answer the requested output. "
     "For JSON object wrappers use payload['records']; for pandas merge "
     "suffixes use explicit names such as suffixes=('_exam', '_patient') "
     "and choose the correct suffixed field explicitly; for zero-row "
@@ -262,6 +265,7 @@ class RepairCoordinator:
             semantic_plan or _semantic_plan_from_manifest(result.manifest)
         )
         repair_log: list[dict[str, Any]] = []
+        zero_row_actions_seen: set[str] = set()
         logger = get_progress_logger()
 
         for attempt in range(self.max_local_repairs):
@@ -298,6 +302,9 @@ class RepairCoordinator:
                         semantic_plan=effective_semantic_plan,
                     )
                     if outcome is not None:
+                        if outcome.action in zero_row_actions_seen:
+                            break
+                        zero_row_actions_seen.add(outcome.action)
                         if budget is not None:
                             budget.consume_local_repair(outcome.action)
                         new_result = exec_program(
@@ -317,6 +324,8 @@ class RepairCoordinator:
                             "post_failure_reason": new_result.failure_reason,
                         })
                         result = new_result
+                        if new_result.succeeded and new_result.answer is not None and not new_result.answer.rows:
+                            break
                         continue
 
                 # --- answer table validation ---
@@ -442,7 +451,9 @@ class RepairCoordinator:
                     "Every loaded dataframe/result table must have its real "
                     "columns recorded in debug_steps['schema_inspection']; "
                     "debug_steps['schema_mapping'] must choose fields from "
-                    "that real inspection, not from knowledge.md wording alone."
+                    "that real inspection, not from knowledge.md wording alone. "
+                    "Also record used_tables, used_columns, join_keys, "
+                    "filter_conditions, derived_fields, and unmapped_question_terms."
                 ),
                 "knowledge_policy": (
                     "knowledge.md supplies rules and hypotheses; it does not "
@@ -504,7 +515,12 @@ class RepairCoordinator:
             task=task,
             program=program,
             raw_response=raw_response,
-            manifest=[{"schema_diagnostics": ctx.schema_diagnostics}],
+            manifest=list(failed.manifest or []) + [
+                {
+                    "schema_retry": "applied",
+                    "schema_diagnostics": ctx.schema_diagnostics,
+                }
+            ],
             python_timeout=self.python_timeout,
             label="schema_retry",
         )

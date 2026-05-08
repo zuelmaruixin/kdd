@@ -456,10 +456,17 @@ def repair_pandas_keyerror_or_no_such_column(
             candidates = scoped_matches
 
         best = min(candidates, key=lambda c: _levenshtein(c.lower(), bad_clean.lower()))
+        best_norm = re.sub(r"[^a-z0-9]+", "", best.lower())
+        bad_norm = re.sub(r"[^a-z0-9]+", "", bad_clean.lower())
+        if (
+            best_norm.startswith("linkto")
+            and not bad_norm.startswith("linkto")
+        ):
+            continue
         confidence = difflib.SequenceMatcher(
             None,
-            re.sub(r"[^a-z0-9]+", "", bad_clean.lower()),
-            re.sub(r"[^a-z0-9]+", "", best.lower()),
+            bad_norm,
+            best_norm,
         ).ratio()
         if confidence < 0.68:
             continue

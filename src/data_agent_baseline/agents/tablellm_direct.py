@@ -133,6 +133,10 @@ Hard requirements for the program you write:
    are never final schema proof. If several fields are plausible, inspect
    sample values and knowledge.md semantics; do not rely on a fixed
    keyword rule.
+   Also record lightweight trace fields so cheap validation can verify the
+   path without an LLM: `used_tables`, `used_columns`, `join_keys`,
+   `filter_conditions`, `derived_fields`, and `unmapped_question_terms`.
+   Use empty lists when a category does not apply.
    If the Semantic Analyst Plan contains a low-confidence filter, unresolved
    core filter, or `requires_rule_resolution=true`, resolve the rule from
    `knowledge.md` or real data before filtering. If that resolution changes
@@ -161,12 +165,20 @@ Hard requirements for the program you write:
    load the full file and extract records with regex/string parsing or
    the record-extraction pre-stage. Do not answer from the preview
    excerpt alone.
-8. For tasks involving `knowledge.md`, apply the rules from `knowledge.md`
-   for filters such as `format`, `status`, thresholds, and percentages.
+8. For tasks involving `knowledge.md`, use only the rules that are relevant
+   to the question's requested concept. `knowledge.md` is authoritative for
+   explicit domain rule definitions, but it is not schema authority.
    If `knowledge.md` does not define a numeric threshold, do NOT invent
    one; use explicit source-text labels/evidence instead. Treat these
    rules as semantic hypotheses that must be grounded onto real columns,
    tables, keys, or extracted record fields before final computation.
+   Formulas in `knowledge.md` are not default transformations. Apply a
+   formula only when the question explicitly asks for that formula's target
+   metric, or when the requested output cannot be computed from a direct
+   real column. If a direct real field answers the question, prefer it over
+   deriving a value from a formula. Before using a formula, record
+   `formula_name_or_rule`, `question_phrase_that_triggers_it`,
+   `input_fields`, and `output_metric` in `debug_steps["knowledge_rules_used"]`.
    When knowledge.md provides a more specific rule than the Semantic
    Analyst Plan, the code may override the plan, but only by writing the
    override into `debug_steps["plan_override"]`; otherwise the consistency
@@ -196,7 +208,9 @@ Hard requirements for the program you write:
    - Schema Grounding is only a real-column candidate list, not a
      semantic authority. For requested metrics, inspect actual rows and
      simple numeric relationships before deciding whether a column is
-     direct or must be transformed. If data evidence contradicts a
+     direct or must be transformed. Do not apply a knowledge.md formula
+     merely because the formula exists; require a question phrase that
+     asks for the formula's target metric. If data evidence contradicts a
      grounding hint, use the data-backed formula/field and record the
      override in `debug_steps["schema_mapping"]` or
      `debug_steps["plan_override"]`.

@@ -32,6 +32,7 @@ from data_agent_baseline.agents.tablellm_direct import (
 from data_agent_baseline.agents.task_compiler import CompiledTask
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
 from data_agent_baseline.budget import BudgetExceeded
+from data_agent_baseline.eval.answer_validator import validate_answer_table
 
 
 @dataclass(slots=True)
@@ -191,14 +192,88 @@ def _has_schema_inspection(debug_steps: dict[str, Any] | None) -> bool:
     return False
 
 
+def _has_zero_row_probe(debug_steps: dict[str, Any] | None) -> bool:
+    if not isinstance(debug_steps, dict):
+        return False
+    probe = debug_steps.get("zero_row_probe")
+    return isinstance(probe, dict) and bool(probe)
+
+
 def _preflight_judge_failure(
     *,
     compiled_task: CompiledTask,
+    answer: AnswerTable | None,
     debug_steps: dict[str, Any] | None,
     exec_stdout: str,
     exec_stderr: str,
     failure_reason: str | None,
+    execution_succeeded: bool = True,
+    static_issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
+    if not execution_succeeded or answer is None:
+        failure_types = ["execution_failed"]
+        mismatches = [
+            "Program did not produce an executable AnswerTable; repair must run before semantic pass."
+        ]
+        if static_issues:
+            failure_types = ["static_check_failed"]
+            issue_bits = [
+                f"{item.get('code', 'issue')}: {item.get('message', '')}"
+                for item in static_issues[:5]
+            ]
+            mismatches = [
+                "Static/schema check failed before a valid answer was produced.",
+                *issue_bits,
+            ]
+        if _has_hard_runtime_error(exec_stdout, exec_stderr, failure_reason):
+            failure_types.append("runtime_exception")
+        return {
+            "verdict": "fail",
+            "confidence": 1.0,
+            "failure_types": list(dict.fromkeys(failure_types)),
+            "mismatches": mismatches,
+            "repair_hint": (
+                "Repair the cited structural/runtime error using the previous "
+                "program, static_issues, schema_diagnostics, and semantic_plan. "
+                "Do not mark failed execution as semantically consistent."
+            ),
+            "must_fix": True,
+        }
+
+    validation = validate_answer_table(answer)
+    if not validation.valid:
+        codes = [item.code for item in validation.errors]
+        if "no_rows" in codes:
+            return {
+                "verdict": "fail",
+                "confidence": 1.0,
+                "failure_types": ["zero_rows"],
+                "mismatches": [
+                    "Program executed but produced zero answer rows.",
+                    *[item.message for item in validation.errors],
+                ],
+                "repair_hint": (
+                    "Run a zero-row probe before changing final answer logic: "
+                    "record debug_steps['zero_row_probe'] with base row counts, "
+                    "row counts after each join/filter, candidate value counts "
+                    "for every filter key, sample unique values, and the first "
+                    "operation that drops rows to zero. Patch only the operation "
+                    "identified by that probe."
+                ),
+                "must_fix": True,
+            }
+        return {
+            "verdict": "fail",
+            "confidence": 1.0,
+            "failure_types": ["invalid_answer", *codes],
+            "mismatches": [item.message for item in validation.errors],
+            "repair_hint": (
+                "Repair the final AnswerTable shape/projection before semantic pass; "
+                "do not pass empty, ragged, or fully-null answer columns."
+            ),
+            "must_fix": True,
+        }
+
     if _has_hard_runtime_error(exec_stdout, exec_stderr, failure_reason):
         return {
             "verdict": "fail",
@@ -525,6 +600,10 @@ Important uncertainty policy:
 - Treat knowledge.md as rules/semantics/hypotheses. It cannot prove that
   a dataframe column exists; the selected schema must be one of the real
   fields in the provided sources/schema diagnostics.
+- knowledge.md formulas are not default transformations. Use a formula only
+  when the question explicitly asks for that formula's target metric, or when
+  the requested output cannot be computed from a direct real column. If a
+  direct real field answers the question, prefer the direct field.
 - For every selected mapping, include evidence from real column names,
   sample values, or schema diagnostics. If evidence is only from
   knowledge.md wording, mark it uncertain.
@@ -653,6 +732,8 @@ You are checking semantic consistency:
   knowledge.md wording alone
 - whether metric formulas and field choices are supported by row-level
   data evidence rather than only by column-name grounding hints.
+- prior static/repair issues, especially no_such_column and closest_matches,
+  as evidence of what the repair was supposed to fix.
 
 You may challenge the Semantic Analyst plan if the plan picked one field
 while leaving plausible alternatives unresolved. If selected mapping is
@@ -667,10 +748,19 @@ If row-level evidence contradicts a Schema Grounding hint, prefer the
 data-backed interpretation when the code records the evidence in
 schema_mapping, filters, or plan_override. Do not treat grounding hints
 as semantic truth.
+If a prior no_such_column issue had a closest match like `link_to_event`,
+do not treat that as proof that `event_name` should be replaced by the
+foreign key; it usually means the code must join the referenced source to
+materialize the requested semantic attribute.
 If debug_steps lacks schema_inspection for a table/mixed task, return
 `fail` with failure_type `schema_inspection_missing`.
 If execution output contains KeyError, IndexError, FileNotFoundError, or
 JSONDecodeError, return `fail`; such runs must be repaired before pass.
+If the answer has zero rows, zero columns, ragged rows, or a fully empty
+column, return `fail`; invalid answer tables are never semantically pass.
+For zero rows specifically, require a `zero_row_probe` in debug_steps that
+shows row counts after each join/filter and identifies the first operation
+that drops rows to zero.
 
 Return exactly one JSON object. No prose.
 """
@@ -687,6 +777,7 @@ def judge_consistency(
     debug_steps: dict[str, Any] | None,
     exec_stdout: str = "",
     schema_diagnostics: dict[str, Any] | None = None,
+    static_issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     packet = {
         "question": task.question,
@@ -701,6 +792,7 @@ def judge_consistency(
         "program_excerpt": program[:5000],
         "exec_stdout_tail": exec_stdout[-1200:],
         "schema_diagnostics": schema_diagnostics or {},
+        "prior_static_or_repair_issues": static_issues or [],
     }
     raw = model.complete(
         [
@@ -738,16 +830,31 @@ Rules:
 - Use only real context paths and real schema fields.
 - Define `debug_steps` with schema_mapping, joins, filters, aggregation,
   output_columns, preview_rows when applicable.
+- Also define lightweight trace fields: used_tables, used_columns,
+  join_keys, filter_conditions, derived_fields, and unmapped_question_terms.
+  Use empty lists when a category does not apply.
 - Always define `debug_steps["schema_inspection"]` and fill it with
   `list(df.columns)` after each dataframe/SQL/JSON load. Then make
   `debug_steps["schema_mapping"]` choose only fields present in that
   inspection or in Source Capabilities.
 - Treat knowledge.md as semantic hypotheses/rules only. Never use a
   column/key/table solely because knowledge.md mentions that word.
+- Do not apply a knowledge.md formula merely because it exists. Apply it
+  only when the question explicitly asks for the formula's target metric or
+  when no direct real field can answer the requested output.
+- If semantic_plan contains `plan_failure`, treat it as analyst failure
+  context, not as evidence that there is no semantic risk. Use
+  `cheap_semantic_assessment` and its risks as the fallback source of
+  truth for what must be checked or repaired.
 - Assign the final result to `answer`.
 - If the judge says the analyst mapping is ambiguous, re-evaluate the
   competing real fields using schema names, sample values, and
   knowledge.md semantics; do not blindly follow the previous code.
+- If judge_result includes `zero_rows`, do not simply rewrite the whole
+  solution. Add a targeted zero-row probe in `debug_steps['zero_row_probe']`
+  with base row counts, row counts after each join/filter, candidate value
+  counts for every filter key, sample unique values, and the first operation
+  that drops rows to zero. Patch only that identified operation.
 """
 
 
@@ -832,24 +939,66 @@ class SemanticConsistencyPipeline:
         self.context = context
         self.enabled = enabled
         self.max_repairs = max_repairs
+        self.last_plan_failure: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Phase 1: semantic planning (no code)
     # ------------------------------------------------------------------
 
-    def plan(self, task: PublicTask) -> dict[str, Any] | None:
+    def plan(self, task: PublicTask, *, force: bool = False) -> dict[str, Any] | None:
         """Run the semantic analyst.  Returns plan dict, or None if skipped/failed."""
+        self.last_plan_failure = None
         if not self.enabled:
+            self.last_plan_failure = {"stage": "disabled", "force": force}
             return None
         compiled = self.context.compiled_task
-        # Plain easy table questions should stay fast and tool-first.
-        # Easy semantic-rule questions are different: a tiny wrong mapping
-        # (for example a threshold from knowledge.md or a suffixed diagnosis
-        # column after merge) is exactly where the analyst/judge split pays
-        # for itself.
-        if task.difficulty.lower() == "easy" and compiled.task_type == "table_computation":
+        profile = compiled.execution_profile or {}
+        low_complexity = profile.get("operation_complexity") in {
+            "direct_lookup",
+            "single_filter",
+        }
+        # Low-complexity table questions should stay fast and tool-first
+        # regardless of the dataset difficulty label. If the direct path
+        # fails or produces an invalid/suspicious answer, OperatorExecutor
+        # calls plan(..., force=True) and escalates into semantic repair.
+        if (
+            not force
+            and compiled.task_type in {"table_computation", "table_with_semantic_rule"}
+            and low_complexity
+            and not profile.get("semantic_rule_required")
+        ):
+            self.last_plan_failure = {
+                "stage": "fast_path_skip",
+                "force": force,
+                "reason": "low_complexity_programmatic_task",
+            }
             return None
-        if not should_run_semantic_consistency(compiled):
+        forced_but_normally_gated = force and not should_run_semantic_consistency(compiled)
+        force_allowed = (
+            compiled.task_type in {
+                "table_computation",
+                "mixed_context",
+                "table_with_semantic_rule",
+            }
+            and "needs_vision" not in set(compiled.ambiguity_flags)
+            and "unsupported_file_type" not in set(compiled.ambiguity_flags)
+        )
+        if forced_but_normally_gated and not force_allowed:
+            self.last_plan_failure = {
+                "stage": "gate_blocked",
+                "force": force,
+                "task_type": compiled.task_type,
+                "ambiguity_flags": list(compiled.ambiguity_flags),
+                "reason": "forced semantic consistency is not allowed for this task shape",
+            }
+            return None
+        if not force and not should_run_semantic_consistency(compiled):
+            self.last_plan_failure = {
+                "stage": "gate_skip",
+                "force": force,
+                "task_type": compiled.task_type,
+                "ambiguity_flags": list(compiled.ambiguity_flags),
+            }
             return None
         try:
             plan = run_semantic_analyst(
@@ -859,8 +1008,18 @@ class SemanticConsistencyPipeline:
                 schema_diagnostics=self.context.schema_diagnostics,
             )
         except BudgetExceeded:
+            self.last_plan_failure = {
+                "stage": "budget_exceeded",
+                "force": force,
+            }
             raise
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self.last_plan_failure = {
+                "stage": "analyst_exception",
+                "force": force,
+                "exception_type": type(exc).__name__,
+                "message": str(exc)[:1000],
+            }
             return None
 
         rule_resolution = _resolve_semantic_rules(
@@ -871,6 +1030,9 @@ class SemanticConsistencyPipeline:
         effective_plan = _apply_rule_resolution(plan, rule_resolution)
         if rule_resolution.get("resolved_filters") or rule_resolution.get("unresolved_filters"):
             effective_plan["original_semantic_plan"] = plan
+        if forced_but_normally_gated:
+            effective_plan["_force_semantic_consistency"] = True
+            effective_plan["_force_reason"] = "cheap_semantic_guard_escalation"
 
         try:
             from data_agent_baseline.progress import get_progress_logger
@@ -902,7 +1064,11 @@ class SemanticConsistencyPipeline:
         """Compare plan vs code vs answer; repair up to max_repairs times."""
         if not self.enabled or not semantic_plan:
             return result
-        if not should_run_semantic_consistency(self.context.compiled_task):
+        force_enabled = bool(semantic_plan.get("_force_semantic_consistency"))
+        if (
+            not force_enabled
+            and not should_run_semantic_consistency(self.context.compiled_task)
+        ):
             return result
 
         from data_agent_baseline.agents.local_repair import issues_from_exec_error, try_program_repair
@@ -919,25 +1085,55 @@ class SemanticConsistencyPipeline:
         )
         current = result
         logger = get_progress_logger()
+        zero_row_probe_required = False
 
         for attempt in range(self.max_repairs + 1):
-            if not current.succeeded or current.answer is None:
-                trace.final_verdict = "failed"
-                trace.failure_reason = current.failure_reason or "no executable answer"
-                break
-
             debug_steps = _extract_debug_steps(current.exec_stdout) or {}
             effective_plan, applied_overrides = _apply_plan_overrides(
                 semantic_plan, debug_steps
             )
             trace.effective_plan = effective_plan
+            static_issues: list[dict[str, Any]] = []
+            for item in current.manifest or []:
+                if isinstance(item, dict) and isinstance(item.get("static_issues"), list):
+                    static_issues.extend(item["static_issues"])
+                if isinstance(item, dict):
+                    for key in ("local_repair_log", "post_schema_retry_local_repair_log"):
+                        if not isinstance(item.get(key), list):
+                            continue
+                        for entry in item[key]:
+                            if isinstance(entry, dict) and isinstance(entry.get("issues"), list):
+                                static_issues.extend(entry["issues"])
             preflight_judge = _preflight_judge_failure(
                 compiled_task=compiled,
+                answer=current.answer,
                 debug_steps=debug_steps,
                 exec_stdout=current.exec_stdout,
                 exec_stderr=current.exec_stderr,
                 failure_reason=current.failure_reason,
+                execution_succeeded=current.succeeded,
+                static_issues=static_issues[-12:],
             )
+            if (
+                preflight_judge is None
+                and zero_row_probe_required
+                and not _has_zero_row_probe(debug_steps)
+            ):
+                preflight_judge = {
+                    "verdict": "fail",
+                    "confidence": 1.0,
+                    "failure_types": ["zero_row_probe_missing"],
+                    "mismatches": [
+                        "Previous repair round hit zero_rows, but the repaired program did not record debug_steps['zero_row_probe']."
+                    ],
+                    "repair_hint": (
+                        "Add debug_steps['zero_row_probe'] with base row counts, "
+                        "row counts after each join/filter, candidate value counts, "
+                        "sample unique values, and the first operation that drops "
+                        "rows to zero before attempting another semantic pass."
+                    ),
+                    "must_fix": True,
+                }
             try:
                 if preflight_judge is not None:
                     judge = preflight_judge
@@ -952,6 +1148,7 @@ class SemanticConsistencyPipeline:
                         debug_steps=debug_steps,
                         exec_stdout=current.exec_stdout,
                         schema_diagnostics=self.context.schema_diagnostics,
+                        static_issues=static_issues[-12:],
                     )
             except BudgetExceeded:
                 raise
@@ -976,6 +1173,9 @@ class SemanticConsistencyPipeline:
                 }})
 
             verdict = str(judge.get("verdict", "")).strip().lower()
+            failure_types = [str(x) for x in (judge.get("failure_types") or [])]
+            if "zero_rows" in failure_types:
+                zero_row_probe_required = True
             try:
                 confidence = float(judge.get("confidence", 0.0))
             except (TypeError, ValueError):
@@ -992,7 +1192,7 @@ class SemanticConsistencyPipeline:
                 trace.final_verdict = verdict or "fail"
                 trace.failure_reason = (
                     "semantic_consistency_failed:"
-                    + ",".join(str(x) for x in (judge.get("failure_types") or []))
+                    + ",".join(failure_types)
                 )
                 current.succeeded = False
                 current.failure_reason = trace.failure_reason
