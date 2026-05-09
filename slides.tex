@@ -60,7 +60,7 @@
 \author[Team]{Team Members}
 
 \institute[HKUST(GZ)]{
-Information Hub\\[0.3em]
+Society Hub\\[0.3em]
 The Hong Kong University of Science and Technology (Guangzhou)
 }
 
@@ -562,8 +562,9 @@ Simple table tasks: \textbf{1 LLM call total} (codegen only). Guard + judge only
 \frametitle{RAG Pipeline --- Production-Grade Document Retrieval}
 
 \begin{center}
+\resizebox{0.95\linewidth}{!}{%
 \begin{tikzpicture}[
-    node distance=0.4cm,
+    node distance=0.35cm,
     stage/.style={rectangle, draw=ustblue!70, fill=gray!6, rounded corners=2pt,
                   minimum width=9.5cm, minimum height=0.5cm, align=center, font=\scriptsize},
     arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!60},
@@ -576,10 +577,12 @@ Simple table tasks: \textbf{1 LLM call total} (codegen only). Guard + judge only
 
 \foreach \i/\j in {load/query, query/retrieve, retrieve/fuse, fuse/rerank}
     \draw[arrow] (\i) -- (\j);
-\end{tikzpicture}
+\end{tikzpicture}%
+}
 \end{center}
 
-\vspace{0.3em}
+\vspace{0.2em}
+\footnotesize
 \begin{columns}[T]
 \column{0.48\textwidth}
 \textbf{Why each step matters:}
