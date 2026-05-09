@@ -2,10 +2,15 @@
 
 这是一个面向 KDD Cup 2026 DataAgent-Bench 的课程项目工程。我们基于官方
 starter kit 做了完整的 agent pipeline 改造：从简单表格题的快速程序执行，到
-多源/中难题的 schema grounding、repair、semantic guard 和可视化展示。
+多源/中难题的 schema grounding、structured-doc extraction、repair、
+semantic guard 和可视化展示。
 
 本仓库不再只是原始 ReAct baseline，而是一个可运行、可评分、可展示推理过程的
 数据问答系统。
+
+> 给新队友交接或答辩准备时，建议直接看
+> [README.zh.md](README.zh.md) 里的“给小白队友看的系统设计详解”。那里按每一步
+> 解释了设计动机、输入输出、失败处理和对应代码位置。
 
 ## 项目目标
 
@@ -18,6 +23,8 @@ CSV、JSON、SQLite、Markdown/text 等数据源。系统需要读取问题，�
 - 简单题尽量快：优先使用一次性代码生成和本地执行，不做多余 LLM judge。
 - 中难题尽量稳：加入 schema grounding、静态检查、执行修复、semantic guard。
 - 结果可审计：每个任务都写出 `trace.json`，记录 route、程序、执行结果和验证信息。
+- 置信度可解释：把 task profile、schema grounding、cheap guard 风险分和 judge
+  confidence 都写进 trace，方便复盘为什么快放行或升级。
 - 课堂可展示：提供 Streamlit 页面，输入 task id 后实时显示执行日志和最终推理摘要。
 
 ## 当前效果
@@ -143,6 +150,132 @@ tool-first mixed path，再根据失败类型 fallback。
 相关文件：
 
 - `scripts/demo_app.py`
+
+## 项目结构
+
+当前仓库已经从 starter kit 拆成了可运行、可评分、可展示的完整工程：
+
+```text
+.
+├── configs/                         # router / model / scoring 配置
+├── data/public/                     # public input/output 数据集
+├── scripts/
+│   ├── demo_app.py                  # Streamlit 课堂展示页面
+│   ├── audit_route_flow.py          # 路由审计脚本
+│   └── run_full_public_eval.sh      # 全量 public eval 辅助脚本
+├── src/data_agent_baseline/
+│   ├── agents/                      # router、operator、grounding、repair、guard
+│   ├── benchmark/                   # 数据集读取和 AnswerTable schema
+│   ├── eval/                        # 本地 column-match 评分和答案校验
+│   ├── run/                         # 单题/批量运行和 self-consistency
+│   ├── tools/                       # 文件、SQLite、Python 执行工具
+│   ├── cli.py                       # dabench 命令行入口
+│   └── config.py                    # YAML 配置加载
+├── tests/                           # 本地测试，含 semantic guard case
+├── artifacts/                       # runs、logs、audit、cache 产物
+├── README.md
+├── README.zh.md
+└── RUNNING.md
+```
+
+`agents/` 是现在最核心的目录：
+
+| 文件 | 作用 |
+| --- | --- |
+| `router.py` | 编译 task profile，选择 route，并在失败时 cascade fallback。 |
+| `task_compiler.py` | 扫描真实上下文，生成 source capabilities、operations、预算和基础置信度。 |
+| `operator_executor.py` | 主 tool-first pipeline：planning、codegen、repair、guard、judge。 |
+| `tablellm_direct.py` | 生成并执行 Python/pandas/SQL 程序。 |
+| `schema_grounding.py` | 将问题 concept 绑定到真实字段候选。 |
+| `semantic_guard.py` | 非 LLM cheap semantic risk gate。 |
+| `semantic_consistency.py` | semantic analyst / consistency judge / semantic repair。 |
+| `repair_coordinator.py`、`local_repair.py` | 本地修复、schema retry 和执行错误修复。 |
+| `structured_doc_executor.py` | 长文档/病历式文本抽取为结构化 CSV 后再计算。 |
+
+## 置信度与风险分
+
+项目里有几类 `confidence` / `score`，它们不是同一个东西，也不是官方分数。
+
+### 1. Task Compiler 基础置信度
+
+`task_compiler.py` 在路由前给任务画像打三个确定性分数，并写入
+`trace.json -> router_decision.compiled_task`：
+
+- `task_type_confidence`：根据数据模态和语义规则判断任务类型。纯表格/文档通常是
+  `0.9`，语义规则表格约 `0.86`，mixed context 约 `0.8`，未知或纯推理会更低。
+- `operation_confidence`：根据问题关键词判断需要 filter、join、aggregate、compute
+  等操作。没有明显操作时是 `0.55`，弱关键词命中是 `0.7`，清晰命中通常是 `0.9`。
+- `source_confidence`：从 `1.0` 开始扣分；unsupported file 扣 `0.25`，文件很多扣
+  `0.1`，大文档/大表扣 `0.1`，record text 扣 `0.05`，最低保留到 `0.4`。
+
+这些分数主要用于预算、route 和风险判断，不直接表示答案正确率。
+
+### 2. Schema Grounding 字段匹配分
+
+`schema_grounding.py` 会从问题里抽取 concept，再和真实字段做匹配：
+
+- 字段名完全匹配、词匹配接近 `1.0`。
+- 子串匹配约 `0.85`。
+- 其他情况用 Levenshtein 相似度得到 `0..1` 分。
+- 如果 concept 出现在低基数字段样本值中，分数至少提升到 `0.9`。
+- 低基数字段且已有一定匹配时会加小 bonus，最多到 `1.0`。
+
+在 `semantic_guard.py` 里，风险词字段低于 `0.68` 会触发
+`grounding_low_confidence`；第一、第二候选都不低且差距小于 `0.08` 会触发
+`grounding_ambiguous`。
+
+### 3. Cheap Semantic Guard 风险分
+
+`semantic_guard.py` 的 `score` 是“风险分”，不是“置信度”。它只在 fast path
+已有结构化答案、且还没有先验 semantic plan 时运行。计算方式是：
+
+```text
+risk_score = min(1.0, sum(unique_risk_weights))
+should_escalate = any(error risk) or risk_score >= 0.5
+```
+
+典型权重包括：
+
+| 风险 | 权重 |
+| --- | --- |
+| 执行失败 / 无答案 | `1.0` |
+| invalid answer | `1.0` |
+| 空答案 | `0.75` |
+| schema retry 后才成功 | `0.8` |
+| local repair 后才成功 | `0.35` 或 `0.65` |
+| 缺少 schema inspection trace | `0.8` |
+| 缺少 used columns trace | `0.7` |
+| filter / join trace 缺失 | `0.65` |
+| used column 不在真实 schema 中 | `0.8` |
+| 中间过滤结果为 0 | `0.8` |
+| 高风险 concept 字段未覆盖 | `0.75` |
+| 公式/派生字段使用和问题不匹配 | `0.75` |
+
+所以这里是“越高越危险”。一旦发现 error 级风险，或者累计分达到 `0.5`，系统就升级到
+semantic analyst / judge / repair。
+
+### 4. Semantic Plan / Judge confidence
+
+`semantic_consistency.py` 里还有 LLM 输出的 `confidence`：
+
+- Semantic Analyst 输出 plan confidence。prompt 明确要求：如果字段映射还有未解决歧义，
+  confidence 必须 `<= 0.65`。
+- 当 plan confidence `<= 0.65` 或 `requires_rule_resolution=true` 时，系统会尝试从
+  `knowledge.md` 等规则文档中解析规则。
+- Consistency Judge 只有在 `verdict == "pass"` 且 `confidence >= 0.55` 时才放行；
+  否则进入 semantic repair 或最终 fail。
+
+复盘时主要看这些 trace 字段：
+
+```text
+router_decision.compiled_task.task_type_confidence
+router_decision.compiled_task.operation_confidence
+router_decision.compiled_task.source_confidence
+manifest[].cheap_semantic_assessment.score
+manifest[].cheap_semantic_assessment.grounding
+manifest[].semantic_plan.confidence
+manifest[].semantic_consistency.judge_history[].confidence
+```
 
 ## 快速运行
 
