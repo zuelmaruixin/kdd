@@ -70,13 +70,7 @@ The Hong Kong University of Science and Technology (Guangzhou)
     \includegraphics[width=3.3cm]{./ustlogos/UST-GZ-logo.pdf}
 }
 
-%-------- auto TOC at section start --------
-\AtBeginSection[]{
-\begin{frame}
-    \frametitle{Outline}
-    \tableofcontents[currentsection]
-\end{frame}
-}
+%-------- (removed auto-TOC at section start to avoid blank outline pages) --------
 
 \begin{document}
 
@@ -527,6 +521,7 @@ $\to$ \texttt{field\_coverage\_mismatch} (0.75) $\to$ \textbf{escalate to semant
 \frametitle{Lazy Escalation Flow}
 
 \begin{center}
+\resizebox{\linewidth}{!}{%
 \begin{tikzpicture}[
     node distance=0.5cm and 1.2cm,
     box/.style={rectangle, draw=ustblue, fill=gray!6, rounded corners=2pt,
@@ -550,10 +545,11 @@ $\to$ \texttt{field\_coverage\_mismatch} (0.75) $\to$ \textbf{escalate to semant
 \draw[arrow] (ok) -- node[above, font=\scriptsize]{Yes} (judge);
 \draw[arrow] (ok) -- node[below, font=\scriptsize]{No} (fallback);
 \draw[arrow] (fallback) -| (judge);
-\end{tikzpicture}
+\end{tikzpicture}%
+}
 \end{center}
 
-\vspace{0.2em}
+\vspace{0.4em}
 \begin{exampleblock}{Cost Savings}
 Simple table tasks: \textbf{1 LLM call total} (codegen only). Guard + judge only fires on suspicious answers.
 \end{exampleblock}
