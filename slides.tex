@@ -1,0 +1,842 @@
+\documentclass[11pt, aspectratio=169]{beamer}
+
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{xcolor}
+\usepackage{multicol,multirow}
+\usepackage{array}
+\usepackage[english]{babel}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit}
+
+%-------- theme --------
+\usetheme{Madrid}
+\usecolortheme{default}
+\useinnertheme{circles}
+\setbeamertemplate{title page}[default][colsep=-4bp,rounded=true]
+\usenavigationsymbolstemplate{}
+\setbeamerfont{date}{size=\fontsize{9}{9}\selectfont}
+\usefonttheme[onlymath]{serif}
+
+%--------------- color --------------------
+\definecolor{ustgold}{RGB}{153, 102, 0}
+\definecolor{ustblue}{RGB}{0, 51, 102}
+\definecolor{ustgold_1}{RGB}{204, 153, 0}
+\definecolor{ustblue_1}{RGB}{0, 116, 188}
+\definecolor{ustblue_2}{RGB}{99, 202, 225}
+\definecolor{ustred_1}{RGB}{237, 27, 47}
+
+\setbeamercolor*{palette primary}{bg=ustblue, fg=white}
+\setbeamercolor*{palette secondary}{bg=ustblue, fg=white}
+\setbeamercolor*{palette tertiary}{bg=ustgold_1, fg=white}
+\setbeamercolor{title}{fg=ustblue,bg=gray!10!white}
+\setbeamercolor{frametitle}{fg=ustblue,bg=gray!15!white}
+\setbeamercolor{structure}{fg=ustblue,bg=white}
+\setbeamercolor{block body}{bg=gray!10!white}
+\setbeamercolor{block title}{bg=ustblue,fg=white}
+\setbeamercolor{block title alerted}{bg=ustred_1,fg=white}
+\setbeamercolor{block title example}{bg=ustgold_1,fg=white}
+\setbeamertemplate{itemize items}{\color{ustgold_1}$\bullet$}
+
+%-------- listings style --------
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{ustblue}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{ustgold},
+  breaklines=true,
+  frame=none,
+  columns=fullflexible,
+}
+
+%--------------- title ---------------
+\title[DABench Data Agent]{DABench Data Agent}
+\subtitle{KDD Cup 2026 DataAgent-Bench --- Course Project}
+
+\author[Team]{Team Members}
+
+\institute[HKUST(GZ)]{
+Information Hub\\[0.3em]
+The Hong Kong University of Science and Technology (Guangzhou)
+}
+
+\date[2025]{Spring 2025}
+
+\titlegraphic{\vspace*{0.3cm}
+    \includegraphics[width=3.3cm]{./ustlogos/UST-GZ-logo.pdf}
+}
+
+%-------- auto TOC at section start --------
+\AtBeginSection[]{
+\begin{frame}
+    \frametitle{Outline}
+    \tableofcontents[currentsection]
+\end{frame}
+}
+
+\begin{document}
+
+\addtocounter{framenumber}{-1}
+\frame{\titlepage}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Outline}
+\tableofcontents
+\end{frame}
+%---------------------------------------------------------
+
+\section{Problem \& Scoring Rule}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Task Definition}
+
+\begin{block}{Input}
+\texttt{task.json} (question + difficulty) + heterogeneous context files:\\
+CSV, SQLite, JSON, Markdown rules, record-text prose, images
+\end{block}
+
+\vspace{0.4em}
+
+\begin{block}{Output}
+A \texttt{prediction.csv} table scored by \textbf{column-content signature matching}
+\end{block}
+
+\vspace{0.4em}
+
+\begin{alertblock}{Key Characteristics}
+\begin{itemize}
+    \item Column \textbf{names ignored}; row \textbf{order ignored}
+    \item Matching based on sorted, normalized value tuples per column
+    \item Multi-column matching via \textbf{bipartite maximum matching} (augmenting path)
+\end{itemize}
+\end{alertblock}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Scoring Formula}
+
+\begin{equation*}
+\boxed{\text{score} = \max\!\Big(0,\;\; \text{recall} \;-\; \lambda \cdot \frac{\text{extra\_cols}}{\text{pred\_cols}}\Big), \quad \lambda = 0.5}
+\end{equation*}
+
+\vspace{0.6em}
+
+\textbf{Implications for system design:}
+
+\begin{enumerate}
+    \item \textbf{Prefer fewer columns} --- every extra wrong column is penalized
+    \item \textbf{Preserve granularity} --- \texttt{first\_name} + \texttt{last\_name} $>$ merged \texttt{name}
+    \item \textbf{Normalize dtypes} --- \texttt{163109.0} $\neq$ \texttt{163109} in signature
+\end{enumerate}
+
+\vspace{0.6em}
+
+\begin{exampleblock}{Normalization}
+Numeric: round to $10^{-2}$; \quad String: \texttt{strip + lower}; \quad Empty/NaN $\to$ \texttt{\_\_EMPTY\_\_}
+\end{exampleblock}
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{Architecture Overview}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Why Not a Single ReAct Agent?}
+
+\begin{columns}[T]
+\column{0.48\textwidth}
+\textbf{Problems with vanilla ReAct:}
+\begin{itemize}
+    \item Easy tasks: wastes tokens on multi-turn tool calls
+    \item Hard tasks: drifts in intermediate steps
+    \item No structural guarantee on output table shape
+    \item Cannot cheaply verify semantic correctness
+\end{itemize}
+
+\column{0.48\textwidth}
+\textbf{Our approach:}
+\begin{itemize}
+    \item \textbf{Deterministic profiling} $\to$ classify task shape upfront
+    \item \textbf{One-shot codegen} $\to$ pandas/SQL program
+    \item \textbf{Layered risk gating} $\to$ cheap guard before LLM judge
+    \item \textbf{DAG planning} $\to$ only for truly complex tasks
+\end{itemize}
+\end{columns}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Four-Layer Architecture}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.6cm and 0.8cm,
+    box/.style={rectangle, draw=ustblue, fill=gray!8, rounded corners=3pt,
+                minimum width=3.2cm, minimum height=0.8cm, align=center,
+                font=\small},
+    arrow/.style={-{Stealth[length=5pt]}, thick, ustblue},
+]
+% Layer 1
+\node[box, fill=ustblue!15] (compiler) {1. TaskCompiler\\{\scriptsize (deterministic profiling)}};
+% Layer 2
+\node[box, fill=ustblue!15, right=of compiler] (router) {2. Router\\{\scriptsize (shape-based dispatch)}};
+% Layer 3
+\node[box, fill=ustgold_1!20, right=of router] (operator) {3. Operator Pipeline\\{\scriptsize (codegen + repair)}};
+% Layer 4
+\node[box, fill=ustred_1!15, right=of operator] (guard) {4. Risk Gating\\{\scriptsize (cheap guard + judge)}};
+
+\draw[arrow] (compiler) -- (router);
+\draw[arrow] (router) -- (operator);
+\draw[arrow] (operator) -- (guard);
+
+% Below labels
+\node[below=0.3cm of compiler, font=\scriptsize\itshape, text=gray] {No LLM};
+\node[below=0.3cm of router, font=\scriptsize\itshape, text=gray] {No LLM};
+\node[below=0.3cm of operator, font=\scriptsize\itshape, text=gray] {1 LLM call};
+\node[below=0.3cm of guard, font=\scriptsize\itshape, text=gray] {0--3 LLM calls};
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.4em}
+
+\begin{block}{Design Principle}
+\emph{``Simple tasks pay minimal LLM cost; only suspicious answers escalate to expensive semantic verification.''}
+\end{block}
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{TaskCompiler \& ExecutionProfile}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{TaskCompiler --- Deterministic Task Profiling (Zero LLM)}
+
+\begin{columns}[T]
+\column{0.52\textwidth}
+\textbf{Per-file scan $\to$ \texttt{SourceCapability}:}
+\begin{itemize}
+    \item CSV/TSV: headers, row count, top-5 values, dtype vote, cardinality
+    \item SQLite: \texttt{PRAGMA table\_info}, per-column samples
+    \item JSON: top-level keys, record fields, per-field samples
+    \item Record-text: regex pre-extraction (patient ID, dates, indicators)
+\end{itemize}
+
+\column{0.44\textwidth}
+\textbf{Task-level aggregation:}
+\begin{itemize}
+    \item \texttt{task\_type}: table\_computation, mixed\_context, document\_qa, \ldots
+    \item \texttt{operations}: filter, join, aggregate, compute, \ldots
+    \item \texttt{foreign\_key\_candidates}: Jaccard overlap of value sets
+    \item \texttt{ambiguity\_flags}: semantic rule, large doc, record text, \ldots
+    \item \texttt{budget\_level} $\to$ max LLM / tool calls
+\end{itemize}
+\end{columns}
+
+\vspace{0.4em}
+\begin{exampleblock}{Key Property}
+One scan, reused everywhere: prompt, static checker, guard, judge --- \textbf{single source of truth}.
+\end{exampleblock}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{ExecutionProfile --- 5-Dimensional Task Shape}
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Dimension} & \textbf{Values} & \textbf{Used By} \\
+\midrule
+\texttt{context\_size} & small / medium / large & Router, budget \\
+\texttt{source\_shape} & single\_table / multi\_table / long\_docs / image & Router, RAG gate \\
+\texttt{verifiability} & programmatic / evidence\_based / weak & Route selection \\
+\texttt{operation\_complexity} & direct\_lookup / single\_filter / \ldots / multi\_hop & Fast-path skip \\
+\texttt{semantic\_rule\_required} & true / false & Rule resolution \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+
+\textbf{Derived decisions:}
+\begin{itemize}
+    \item \texttt{recommended\_strategy}: operator / rag\_extract / multi\_agent / \ldots
+    \item \texttt{blocked\_strategies}: e.g.\ small+programmatic task \textbf{cannot} jump to extreme
+    \item \texttt{direct\_candidate\_role}: submit\_after\_verify / proposal\_only / disabled
+\end{itemize}
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{Router --- Shape-Based Dispatch}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Router: Dispatch by Task Shape, Not Difficulty Label}
+
+\begin{center}
+\small
+\begin{tabular}{llp{6.5cm}}
+\toprule
+\textbf{Route} & \textbf{Execution Kind} & \textbf{When Selected} \\
+\midrule
+easy & operator\_executor / tablellm\_direct & Light table task, small context, low complexity \\
+medium & operator\_executor + RAG & Mixed-source, document context \\
+hard & operator\_executor & Semantic rule required, multi-table \\
+extreme & multi\_agent (DAG) & Weak verifiability, multi-hop planning \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3em}
+
+\textbf{\texttt{\_route\_for\_execution\_profile} hard rules:}
+\begin{itemize}
+    \item \texttt{verifiability=weak} or \texttt{image} $\to$ multi\_agent
+    \item \texttt{long\_docs} $\to$ RAG-enabled operator (mandatory)
+    \item \texttt{semantic\_rule\_required} $\to$ tool\_first\_mixed / hard
+    \item \texttt{small + programmatic + low\_complexity} $\to$ easy (never extreme)
+\end{itemize}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Cascade Fallback --- By Failure Type, Not Difficulty}
+
+\begin{alertblock}{Key Insight}
+Upgrading difficulty does not fix the \emph{type} of failure. We cascade by \textbf{failure category}.
+\end{alertblock}
+
+\vspace{0.3em}
+
+\begin{center}
+\small
+\begin{tabular}{lp{7cm}}
+\toprule
+\textbf{Failure Type} & \textbf{Cascade Action} \\
+\midrule
+\texttt{zero\_rows} & \textbf{Do NOT upgrade} --- column selection is wrong, not route \\
+\texttt{unsupported\_file / budget\_exhausted} & $\to$ fallback\_multi\_agent \\
+\texttt{retrieval\_empty / doc\_context\_miss} & $\to$ RAG-enabled route \\
+\texttt{semantic\_consistency\_failed} & $\to$ tool\_first\_mixed \\
+\texttt{syntax / static / exec error} & $\to$ another operator route (block extreme for small tasks) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3em}
+
+\begin{block}{Cross-Model Verification (optional)}
+Run primary + verifier models in parallel $\to$ keep columns whose signatures agree ($\geq$ \texttt{min\_agreement}) $\to$ directly targets $-\lambda \cdot \text{extra}$ penalty.
+\end{block}
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{Operator Pipeline}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Operator Pipeline --- 7 Stages}
+
+\begin{center}
+\scriptsize
+\begin{tikzpicture}[
+    node distance=0.35cm,
+    stage/.style={rectangle, draw=ustblue, fill=gray!8, rounded corners=2pt,
+                  minimum width=11cm, minimum height=0.55cm, align=center, font=\scriptsize},
+    arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!70},
+]
+\node[stage, fill=ustblue!12] (s1) {1. ExecutionContext --- schema diagnostics computed once};
+\node[stage, fill=ustblue!12, below=of s1] (s2) {2. Semantic Analyst (plan) --- \textit{fast\_path\_skip for low-complexity tasks}};
+\node[stage, fill=ustgold_1!15, below=of s2] (s3) {3. CodegenDirectAgent --- one-shot Python/pandas/SQL program + execute};
+\node[stage, fill=ustgold_1!15, below=of s3] (s4) {4. RepairCoordinator --- Static Check $\to$ Local Repair $\to$ Schema-retry};
+\node[stage, fill=ustgold_1!15, below=of s4] (s5) {5. Structured-doc fallback --- record\_text $\to$ synthesized CSV $\to$ re-codegen};
+\node[stage, fill=ustred_1!12, below=of s5] (s6) {6. Cheap Semantic Guard --- non-LLM risk gate (lazy escalation)};
+\node[stage, fill=ustred_1!12, below=of s6] (s7) {7. Judge + Semantic Repair --- preflight $\to$ LLM judge $\to$ bounded repair};
+
+\foreach \i/\j in {s1/s2, s2/s3, s3/s4, s4/s5, s5/s6, s6/s7}
+    \draw[arrow] (\i) -- (\j);
+\end{tikzpicture}
+\end{center}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Schema Grounding + Static Checker + Local Repair}
+
+\begin{columns}[T]
+\column{0.32\textwidth}
+\textbf{Schema Grounding}
+\begin{itemize}
+    \item Extract question concepts
+    \item Match to real columns via Levenshtein + value match + cardinality
+    \item Top-3 candidates with dtype/samples
+    \item Fights \alert{column-name hallucination}
+\end{itemize}
+
+\column{0.32\textwidth}
+\textbf{Static Checker}
+\begin{itemize}
+    \item Python AST + SQL literal scan
+    \item Checks: no\_such\_file, no\_such\_table, no\_such\_column, bad\_join\_key
+    \item Tracks DataFrame lineage (\texttt{\_x/\_y} suffixes)
+    \item Runs \emph{before} execution
+\end{itemize}
+
+\column{0.32\textwidth}
+\textbf{Local Repair (0 LLM)}
+\begin{itemize}
+    \item 10+ deterministic patches
+    \item Fuzzy column name fix
+    \item JSON records loader rewrite
+    \item Cast merge keys to string
+    \item Append missing \texttt{answer} assignment
+    \item Zero-row filter normalize
+\end{itemize}
+\end{columns}
+
+\vspace{0.4em}
+\begin{block}{Shared Truth}
+Prompt, static checker, and repair all read the \textbf{same} \texttt{SourceCapability} --- no drift between ``what we told the LLM'' and ``what we verify against''.
+\end{block}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Codegen \texttt{debug\_steps} --- The Shared Evidence Layer}
+
+The generated program \textbf{must} emit structured trace fields:
+
+\vspace{0.3em}
+\begin{center}
+\small
+\begin{tabular}{lp{7.5cm}}
+\toprule
+\textbf{Field} & \textbf{Purpose} \\
+\midrule
+\texttt{schema\_inspection} & Real columns after each load (mandatory) \\
+\texttt{used\_columns} & Which columns the program actually uses \\
+\texttt{filter\_conditions} & Filter field + operator + value \\
+\texttt{join\_keys} & Join keys used \\
+\texttt{intermediate\_counts} & Row counts after each step \\
+\texttt{plan\_override} & Evidence when code overrides analyst \\
+\texttt{zero\_row\_probe} & Diagnostic when result has 0 rows \\
+\texttt{unmapped\_question\_terms} & Concepts not mapped to any column \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3em}
+These fields are read by \textbf{three consumers}: Cheap Guard (non-LLM), Preflight (deterministic), and LLM Judge --- forming a \textbf{single audit trail}.
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{Cheap Semantic Guard (Core Innovation)}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Cheap Semantic Guard --- Non-LLM Risk Gate}
+
+\begin{block}{Position in Pipeline}
+After codegen succeeds + answer is structurally valid + \textbf{no LLM analyst ran yet} (fast path) $\to$ should we trust this answer or escalate?
+\end{block}
+
+\vspace{0.3em}
+
+\textbf{Decision rule (purely deterministic, zero LLM cost):}
+\begin{equation*}
+\text{risk\_score} = \min\!\big(1.0,\;\textstyle\sum \text{unique\_risk\_weights}\big)
+\end{equation*}
+\vspace{-0.3em}
+\begin{equation*}
+\text{should\_escalate} = \text{any}(\text{severity}=\text{error}) \;\lor\; \text{risk\_score} \geq 0.5
+\end{equation*}
+
+\vspace{0.3em}
+\textbf{Four evidence categories (no model calls):}
+\begin{enumerate}
+    \item Execution / structural status
+    \item Repair history (schema-retry, local-repair log)
+    \item Trace completeness (schema\_inspection, used\_columns, filters, joins)
+    \item Schema grounding coverage (risk concepts $\leftrightarrow$ used fields)
+\end{enumerate}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Risk Rules \& Weights (Selected)}
+
+\begin{center}
+\scriptsize
+\begin{tabular}{llcl}
+\toprule
+\textbf{Category} & \textbf{Risk Code} & \textbf{Wt} & \textbf{Meaning} \\
+\midrule
+Execution & \texttt{execution\_failed} & 1.0 & No answer produced \\
+Execution & \texttt{empty\_answer\_rows} & 0.75 & 0 rows \\
+Repair & \texttt{suspicious\_fallback:schema\_retry} & 0.8 & Needed schema retry to succeed \\
+Repair & \texttt{suspicious\_fallback:local\_repair} & 0.35 & Needed local patch \\
+Trace & \texttt{trace\_missing:schema\_inspection} & 0.8 & No real-column check in trace \\
+Trace & \texttt{trace\_unknown\_used\_columns} & 0.8 & Claims columns not in schema \\
+Trace & \texttt{zero\_intermediate\_count} & 0.8 & Mid-pipeline drops to 0 rows \\
+Grounding & \texttt{grounding\_low\_confidence} & 0.7 & Risk concept $<$ 0.68 match \\
+\textbf{Coverage} & \texttt{\textbf{field\_coverage\_mismatch}} & \textbf{0.75} & \textbf{Risk concept has candidate but code didn't use it} \\
+Formula & \texttt{formula\_without\_trigger} & 0.75 & Used formula question didn't ask for \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3em}
+\begin{alertblock}{Killer Example}
+Q: ``patients with \textbf{severe degree of thrombosis}'' \\
+Code uses \texttt{disease == "thrombosis"} but grounding found \texttt{degree\_of\_thrombosis} as candidate \\
+$\to$ \texttt{field\_coverage\_mismatch} (0.75) $\to$ \textbf{escalate to semantic judge}
+\end{alertblock}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Lazy Escalation Flow}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.5cm and 1.2cm,
+    box/.style={rectangle, draw=ustblue, fill=gray!6, rounded corners=2pt,
+                minimum width=2.8cm, minimum height=0.7cm, align=center, font=\small},
+    decision/.style={diamond, draw=ustgold_1, fill=ustgold_1!10, aspect=2.5,
+                     align=center, font=\small, inner sep=1pt},
+    arrow/.style={-{Stealth[length=5pt]}, thick, ustblue!80},
+]
+\node[box] (codegen) {Codegen OK\\answer valid};
+\node[decision, right=of codegen] (guard) {Guard\\score$\geq$0.5?};
+\node[box, above right=0.3cm and 1.2cm of guard, fill=green!10] (fast) {Fast return\\(0 extra LLM)};
+\node[box, below right=0.3cm and 1.2cm of guard] (plan) {plan(force=True)};
+\node[decision, right=of plan] (ok) {Plan\\OK?};
+\node[box, below right=0.2cm and 0.8cm of ok] (fallback) {Fallback plan\\from guard risks};
+\node[box, above right=0.2cm and 0.8cm of ok] (judge) {Judge + Repair\\(max 3 rounds)};
+
+\draw[arrow] (codegen) -- (guard);
+\draw[arrow] (guard) -- node[above, font=\scriptsize]{No} (fast);
+\draw[arrow] (guard) -- node[below, font=\scriptsize]{Yes} (plan);
+\draw[arrow] (plan) -- (ok);
+\draw[arrow] (ok) -- node[above, font=\scriptsize]{Yes} (judge);
+\draw[arrow] (ok) -- node[below, font=\scriptsize]{No} (fallback);
+\draw[arrow] (fallback) -| (judge);
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.2em}
+\begin{exampleblock}{Cost Savings}
+Simple table tasks: \textbf{1 LLM call total} (codegen only). Guard + judge only fires on suspicious answers.
+\end{exampleblock}
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{RAG \& Multi-Agent}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{RAG Pipeline --- Production-Grade Document Retrieval}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.4cm,
+    stage/.style={rectangle, draw=ustblue!70, fill=gray!6, rounded corners=2pt,
+                  minimum width=9.5cm, minimum height=0.5cm, align=center, font=\scriptsize},
+    arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!60},
+]
+\node[stage] (load) {Load docs (md / txt / docx) + heading-aware chunking (1200 chars, overlap 150)};
+\node[stage, below=of load] (query) {Query expansion: original + LLM paraphrases + HyDE embedding};
+\node[stage, below=of query] (retrieve) {Parallel: BM25 (Okapi, k1=1.5, b=0.75) \quad$\|$\quad Embedding (OpenAI-compat)};
+\node[stage, below=of retrieve] (fuse) {Reciprocal Rank Fusion (RRF, k=60) --- rank-only, no score normalization};
+\node[stage, below=of fuse] (rerank) {Cross-Encoder Reranker (optional) $\to$ top-K chunks into codegen prompt};
+
+\foreach \i/\j in {load/query, query/retrieve, retrieve/fuse, fuse/rerank}
+    \draw[arrow] (\i) -- (\j);
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.3em}
+\begin{columns}[T]
+\column{0.48\textwidth}
+\textbf{Why each step matters:}
+\begin{itemize}
+    \item BM25: handles IDF saturation + length norm
+    \item RRF: fuses sparse/dense without calibration
+    \item HyDE: retrieves by ``imagined answer'' vocabulary
+\end{itemize}
+
+\column{0.48\textwidth}
+\textbf{Engineering details:}
+\begin{itemize}
+    \item Embedding cache: SHA256(\texttt{model\_id}, \texttt{text})
+    \item JSON chunking: path-recursive (\texttt{\$.records[7].name})
+    \item Heading breadcrumb as contextual prefix
+\end{itemize}
+\end{columns}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Multi-Agent Mode --- Planner $\to$ Specialist DAG $\to$ Synthesizer}
+
+\begin{columns}[T]
+\column{0.55\textwidth}
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.6cm and 0.6cm,
+    box/.style={rectangle, draw=ustblue, fill=gray!8, rounded corners=2pt,
+                minimum width=2.2cm, minimum height=0.6cm, align=center, font=\scriptsize},
+    arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!70},
+]
+\node[box, fill=ustblue!15] (planner) {Planner\\(JSON DAG)};
+\node[box, below left=0.6cm and -0.2cm of planner] (s1) {Specialist\\schema};
+\node[box, below=0.6cm of planner] (s2) {Specialist\\python};
+\node[box, below right=0.6cm and -0.2cm of planner] (s3) {Specialist\\document};
+\node[box, fill=ustgold_1!20, below=0.6cm of s2] (synth) {Synthesizer\\(\texttt{answer} tool)};
+
+\draw[arrow] (planner) -- (s1);
+\draw[arrow] (planner) -- (s2);
+\draw[arrow] (planner) -- (s3);
+\draw[arrow] (s1) -- (synth);
+\draw[arrow] (s2) -- (synth);
+\draw[arrow] (s3) -- (synth);
+\end{tikzpicture}
+\end{center}
+
+\column{0.43\textwidth}
+\textbf{Design choices:}
+\begin{itemize}
+    \item Each specialist has \textbf{limited tool subset}
+    \item Terminal tool = \texttt{report} (not \texttt{answer}) --- prevents premature submission
+    \item Only Synthesizer can call \texttt{answer}
+    \item Same-layer specialists run \textbf{in parallel} (ThreadPool)
+    \item Synthesis failure $\to$ one replan (bounded)
+    \item \texttt{read\_doc} capped at 2 calls globally
+\end{itemize}
+\end{columns}
+
+\vspace{0.3em}
+\begin{block}{Topologies Supported}
+Sequential chain \quad$|$\quad Parallel + merge \quad$|$\quad Iterative (1 replan max)
+\end{block}
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{Self-Consistency, Budget \& Demo}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Self-Consistency --- Column-Signature Voting}
+
+\textbf{Why vote per-column, not per-table?} Because the official rubric scores per-column signatures.
+
+\vspace{0.4em}
+
+\begin{enumerate}
+    \item Run \texttt{num\_samples} passes (temperature=0.7, different seeds)
+    \item Per successful sample: compute column signatures (sorted normalized tuples)
+    \item \texttt{target\_count} = mode of column counts across samples
+    \item Vote: rank signatures by frequency $\to$ top \texttt{target\_count} = winning set
+    \item Pick best sample (max coverage of winning set, min extra columns)
+    \item Project answer to winning columns only
+\end{enumerate}
+
+\vspace{0.3em}
+\begin{block}{Alignment with Scoring}
+Directly targets $\text{score} = \text{recall} - \lambda \cdot \text{extra/pred}$: voting eliminates unstable extra columns while preserving stable correct ones.
+\end{block}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Budget Controller \& Observability}
+
+\begin{columns}[T]
+\column{0.48\textwidth}
+\textbf{Budget dimensions (per task):}
+\begin{itemize}
+    \item \texttt{max\_llm\_calls}
+    \item \texttt{max\_tool\_calls}
+    \item \texttt{max\_seconds} (wall clock)
+    \item \texttt{max\_local\_repairs}
+    \item \texttt{max\_reasoner\_repairs}
+    \item \texttt{max\_multiagent\_fallbacks}
+\end{itemize}
+
+\vspace{0.3em}
+Limits = $\min$(YAML config, TaskCompiler budget\_level)
+
+\column{0.48\textwidth}
+\textbf{Trace output (\texttt{trace.json}):}
+\begin{itemize}
+    \item \texttt{router\_decision} + execution\_profile
+    \item \texttt{compiled\_task} (3 confidence scores)
+    \item \texttt{cheap\_semantic\_assessment}
+    \item \texttt{semantic\_plan} + judge\_history
+    \item \texttt{budget.events}
+    \item \texttt{answer\_validation}
+    \item \texttt{self\_consistency.voted\_signatures}
+\end{itemize}
+\end{columns}
+
+\vspace{0.4em}
+\begin{alertblock}{Cost Savings from Layered Design}
+Simple tasks: fast\_path\_skip saves analyst call; cheap guard pass saves judge + repair loop. Net: \textbf{1 LLM call} for easy tasks vs.\ 4--6 without layering.
+\end{alertblock}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Streamlit Demo --- Live Reasoning Trace}
+
+\begin{columns}[T]
+\column{0.55\textwidth}
+\textbf{What the demo shows:}
+\begin{enumerate}
+    \item Input: config path + task ID
+    \item Real-time subprocess log (ProgressLogger events)
+    \item \textbf{Reasoning Timeline} with per-stage status:
+    \begin{itemize}
+        \scriptsize
+        \item Schema inspect $\to$ Route $\to$ Codegen $\to$ Execute
+        \item Answer validation $\to$ Cheap guard $\to$ Semantic plan $\to$ Judge
+    \end{itemize}
+    \item Final answer table (DataFrame)
+    \item Generated Python program (syntax-highlighted)
+    \item Full \texttt{trace.json} (collapsible)
+\end{enumerate}
+
+\column{0.42\textwidth}
+\textbf{Launch:}
+\begin{lstlisting}[language=bash]
+uv run streamlit run \
+  scripts/demo_app.py
+\end{lstlisting}
+
+\vspace{0.3em}
+\textbf{Why it matters for the course:}
+\begin{itemize}
+    \item Auditable: every decision is visible
+    \item Explainable: risk scores, grounding, plan confidence shown
+    \item Reproducible: trace.json captures full run
+\end{itemize}
+\end{columns}
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{Conclusion}
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Summary}
+
+\begin{columns}[T]
+\column{0.48\textwidth}
+\textbf{What we built:}
+\begin{itemize}
+    \item Complete tool-first Data Agent pipeline
+    \item Deterministic task profiling (zero LLM)
+    \item Shape-based routing + failure-type cascade
+    \item 10+ local repair rules (zero LLM)
+    \item \textbf{Cheap Semantic Guard} --- non-LLM risk gating with lazy escalation
+    \item Production-grade RAG (BM25 + Embedding + RRF)
+    \item Multi-agent DAG with bounded replan
+    \item Column-signature self-consistency
+\end{itemize}
+
+\column{0.48\textwidth}
+\textbf{Engineering completeness:}
+\begin{itemize}
+    \item Configurable OpenAI-compatible backend
+    \item Single-task \& batch execution
+    \item Local scoring with official rubric
+    \item Full \texttt{trace.json} audit trail
+    \item Streamlit demo for live presentation
+    \item Budget control per task
+\end{itemize}
+
+\vspace{0.4em}
+\textbf{Observed performance (public):}\\
+Easy: $\sim$70--80 \quad Medium/Hard: $\sim$60
+\end{columns}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Future Work}
+
+\begin{itemize}
+    \item \textbf{Vision executor}: dedicated path for image\_understanding tasks
+    \item \textbf{Guard weight calibration}: auto-tune risk weights from trace data (FP/FN regression)
+    \item \textbf{Finer cross-model voting}: per-value majority within columns, not just signature intersection
+    \item \textbf{Record-text extraction}: improve structured\_doc\_executor for very long prose
+    \item \textbf{Hidden test}: submit to official evaluation after tuning on public set
+\end{itemize}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{}
+\vfill
+\begin{center}
+{\Huge\color{ustblue} Thank You}
+
+\vspace{1em}
+
+{\large Questions?}
+
+\vspace{1.5em}
+
+\includegraphics[width=3cm]{./ustlogos/UST-GZ-logo.pdf}
+
+\vspace{0.8em}
+
+{\small\color{gray} Code: \texttt{github.com/zuelmaruixin/kdd} (features branch)}
+\end{center}
+\vfill
+\end{frame}
+%---------------------------------------------------------
+
+\end{document}
