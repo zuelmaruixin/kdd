@@ -322,8 +322,8 @@ Upgrading difficulty does not fix the \emph{type} of failure. We cascade by \tex
 \vspace{0.3em}
 
 \begin{center}
-\small
-\begin{tabular}{lp{7cm}}
+\scriptsize
+\begin{tabular}{lp{7.5cm}}
 \toprule
 \textbf{Failure Type} & \textbf{Cascade Action} \\
 \midrule
@@ -338,9 +338,7 @@ Upgrading difficulty does not fix the \emph{type} of failure. We cascade by \tex
 
 \vspace{0.3em}
 
-\begin{block}{Cross-Model Verification (optional)}
-Run primary + verifier models in parallel $\to$ keep columns whose signatures agree ($\geq$ \texttt{min\_agreement}) $\to$ directly targets $-\lambda \cdot \text{extra}$ penalty.
-\end{block}
+\footnotesize\textbf{Cross-Model Verification (optional):} run primary + verifiers in parallel, keep columns whose signatures agree ($\geq$ \texttt{min\_agreement}) --- directly targets the $-\lambda \cdot \text{extra}$ penalty.
 
 \end{frame}
 %---------------------------------------------------------
