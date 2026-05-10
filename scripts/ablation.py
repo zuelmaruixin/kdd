@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import multiprocessing as mp
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -167,11 +168,99 @@ def extract_trace_metrics(trace_path: Path) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
+def _run_single_task_worker(
+    task_id: str,
+    config: AppConfig,
+    run_output_dir: Path,
+    result_queue: mp.Queue,
+) -> None:
+    """Subprocess entry point. Runs one task and posts result to queue."""
+    try:
+        artifact = run_single_task(
+            task_id=task_id,
+            config=config,
+            run_output_dir=run_output_dir,
+        )
+        result_queue.put(("ok", {
+            "succeeded": bool(artifact.succeeded),
+            "failure_reason": artifact.failure_reason or "",
+        }))
+    except Exception as exc:  # noqa: BLE001
+        result_queue.put(("exc", {"error": str(exc), "type": type(exc).__name__}))
+
+
+def _run_task_with_timeout(
+    *,
+    task_id: str,
+    config: AppConfig,
+    run_output_dir: Path,
+    timeout: float | None,
+) -> dict[str, Any]:
+    """Run one task in a subprocess; hard-kill if it exceeds timeout."""
+    if timeout is None or timeout <= 0:
+        # Inline fast path (no subprocess overhead)
+        try:
+            artifact = run_single_task(
+                task_id=task_id,
+                config=config,
+                run_output_dir=run_output_dir,
+            )
+            return {
+                "status": "ok",
+                "succeeded": bool(artifact.succeeded),
+                "failure_reason": artifact.failure_reason or "",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "exception",
+                "succeeded": False,
+                "failure_reason": f"exception: {type(exc).__name__}: {exc}",
+            }
+
+    ctx = mp.get_context("spawn")
+    queue: mp.Queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_run_single_task_worker,
+        args=(task_id, config, run_output_dir, queue),
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(2)
+        return {
+            "status": "timeout",
+            "succeeded": False,
+            "failure_reason": f"per_task_timeout_exceeded:{timeout:.0f}s",
+        }
+
+    try:
+        tag, payload = queue.get_nowait()
+    except Exception:  # queue empty (process crashed silently)
+        return {
+            "status": "crashed",
+            "succeeded": False,
+            "failure_reason": f"worker_crashed_exit_code={proc.exitcode}",
+        }
+    if tag == "ok":
+        return {"status": "ok", **payload}
+    return {
+        "status": "exception",
+        "succeeded": False,
+        "failure_reason": f"exception: {payload.get('type')}: {payload.get('error')}",
+    }
+
+
 def run_arm(
     arm: dict[str, Any],
     base_cfg: AppConfig,
     picked: list[tuple[str, str]],
     stamp: str,
+    per_task_timeout: float | None = None,
 ) -> list[dict[str, Any]]:
     """Run every picked task under this arm and return per-task metric rows."""
     arm_cfg = apply_arm(
@@ -185,41 +274,37 @@ def run_arm(
     _, run_output_dir = create_run_output_dir(arm_cfg.run.output_dir, run_id=run_id)
     console.print(f"\n[bold cyan]=== Arm: {arm['label']} ===[/bold cyan]")
     console.print(f"Run dir: {run_output_dir}")
+    if per_task_timeout:
+        console.print(f"Per-task timeout: {per_task_timeout:.0f}s (hard kill)")
 
     rows: list[dict[str, Any]] = []
     for idx, (task_id, difficulty) in enumerate(picked, 1):
         console.print(f"  [{idx}/{len(picked)}] {task_id} ({difficulty}) ...", end="")
         t0 = time.perf_counter()
-        try:
-            artifact = run_single_task(
-                task_id=task_id,
-                config=arm_cfg,
-                run_output_dir=run_output_dir,
-            )
-            elapsed = time.perf_counter() - t0
-            row = {
-                "arm": arm["name"],
-                "task_id": task_id,
-                "difficulty": difficulty,
-                "succeeded": bool(artifact.succeeded),
-                "elapsed_s": round(elapsed, 2),
-                "failure_reason": artifact.failure_reason or "",
-            }
-            console.print(
-                f" [green]ok[/green]" if artifact.succeeded else f" [red]fail[/red]",
-                f"({elapsed:.1f}s)",
-            )
-        except Exception as exc:  # noqa: BLE001
-            elapsed = time.perf_counter() - t0
-            row = {
-                "arm": arm["name"],
-                "task_id": task_id,
-                "difficulty": difficulty,
-                "succeeded": False,
-                "elapsed_s": round(elapsed, 2),
-                "failure_reason": f"exception: {exc}",
-            }
-            console.print(f" [red]exception[/red] ({elapsed:.1f}s): {exc}")
+        result = _run_task_with_timeout(
+            task_id=task_id,
+            config=arm_cfg,
+            run_output_dir=run_output_dir,
+            timeout=per_task_timeout,
+        )
+        elapsed = time.perf_counter() - t0
+        row = {
+            "arm": arm["name"],
+            "task_id": task_id,
+            "difficulty": difficulty,
+            "succeeded": result["succeeded"],
+            "elapsed_s": round(elapsed, 2),
+            "failure_reason": result.get("failure_reason", ""),
+        }
+        status = result["status"]
+        if status == "ok" and result["succeeded"]:
+            console.print(f" [green]ok[/green] ({elapsed:.1f}s)")
+        elif status == "ok":
+            console.print(f" [red]fail[/red] ({elapsed:.1f}s)")
+        elif status == "timeout":
+            console.print(f" [yellow]TIMEOUT[/yellow] ({elapsed:.1f}s)")
+        else:
+            console.print(f" [red]{status}[/red] ({elapsed:.1f}s)")
 
         # Pull trace metrics
         trace_path = run_output_dir / task_id / "trace.json"
@@ -366,6 +451,12 @@ def main() -> None:
         choices=[a["name"] for a in ARMS],
         help="Only run these arms (default: all three).",
     )
+    parser.add_argument(
+        "--per-task-timeout",
+        type=float,
+        default=180.0,
+        help="Hard kill per task after N seconds (default 180; 0 or negative disables).",
+    )
     args = parser.parse_args()
 
     base_cfg = load_app_config(args.config)
@@ -384,10 +475,20 @@ def main() -> None:
 
     arms_to_run = ARMS if not args.arms else [a for a in ARMS if a["name"] in args.arms]
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    per_task_timeout = args.per_task_timeout if args.per_task_timeout > 0 else None
 
     all_rows: list[dict[str, Any]] = []
-    for arm in arms_to_run:
-        all_rows.extend(run_arm(arm, base_cfg, picked, stamp))
+    try:
+        for arm in arms_to_run:
+            arm_rows = run_arm(
+                arm, base_cfg, picked, stamp,
+                per_task_timeout=per_task_timeout,
+            )
+            all_rows.extend(arm_rows)
+            # Incremental write so Ctrl+C still leaves partial data.
+            write_csv(all_rows, args.out)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user; printing partial summary.[/yellow]")
 
     print_comparison(all_rows)
     write_csv(all_rows, args.out)
