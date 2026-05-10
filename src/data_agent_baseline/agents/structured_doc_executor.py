@@ -46,12 +46,18 @@ from data_agent_baseline.budget import get_budget_controller
 # Question-type classifier (record_text query_type)
 # ---------------------------------------------------------------------------
 #
-# Deterministic keyword classifier — deliberately NOT an LLM call. We only
-# need to decide between two branches, and a keyword vote is both fast and
-# easy to audit from trace.json. The split is a direct response to a known
-# design gap: the previous pipeline always synthesized a CSV, which is
-# correct for count/filter-style questions but strictly loses information
-# for reading-comprehension ones.
+# The primary path is an LLM call (``temperature=0, max_tokens=10``) whose
+# verdict is persisted to disk keyed on ``(question_hash, model_id)`` so
+# repeat runs of the same task don't re-pay the classification cost.
+# A deterministic keyword vote is kept as a safety net for offline / no-
+# model runs and for LLM failures (network errors, bad JSON, etc.). Every
+# path records ``source`` so trace.json can tell after the fact whether
+# the verdict came from the LLM, the cache, or the fallback.
+#
+# The split is a direct response to a known design gap: the previous
+# pipeline always synthesized a CSV, which is correct for count/filter-
+# style questions but strictly loses information for reading-
+# comprehension ones.
 
 
 _AGGREGATE_KEYWORDS = (
@@ -73,12 +79,52 @@ _READING_KEYWORDS = (
 )
 
 
-def classify_record_text_query(question: str) -> str:
-    """Return ``aggregate`` or ``read`` for a record_text question.
+_QUERY_TYPE_SYSTEM_PROMPT = (
+    "You classify a user question about a long-form narrative report as "
+    "one of exactly two labels:\n"
+    "  aggregate  — the question asks for a count, filter, list, ranking, "
+    "statistic, or tabular value over records (e.g. 'how many', "
+    "'list all', 'which ... have', 'top N', 'average', 'sum', "
+    "'per X group by Y').\n"
+    "  read       — the question asks to summarize, describe, explain, "
+    "infer, interpret, or reason about the narrative content "
+    "(e.g. 'summarize', 'why', 'describe', 'compare the narrative', "
+    "'overall argument').\n"
+    "Reply with EXACTLY ONE lowercase word: either 'aggregate' or "
+    "'read'. No punctuation, no explanation, no quotes."
+)
 
-    The default is ``aggregate``; a question must mention explicit
-    reading-comprehension verbs to be routed to the ``read`` branch.
+
+@dataclass(slots=True)
+class RecordTextQueryTypeVerdict:
+    """Outcome of classifying a record_text question.
+
+    Surfaced end-to-end into trace.json so auditors can distinguish an
+    LLM-driven classification from a fallback after the fact.
     """
+
+    verdict: str                       # "aggregate" | "read"
+    source: str                        # llm | cache | fallback_keyword | fallback_error | fallback_no_model
+    model_id: str | None = None
+    cache_hit: bool = False
+    llm_raw: str | None = None
+    error: str | None = None
+    question_hash: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "source": self.source,
+            "model_id": self.model_id,
+            "cache_hit": self.cache_hit,
+            "llm_raw": self.llm_raw,
+            "error": self.error,
+            "question_hash": self.question_hash,
+        }
+
+
+def _keyword_classify_record_text_query(question: str) -> str:
+    """Safety-net keyword classifier. Must never raise."""
     q = (question or "").lower()
     agg_hits = sum(1 for kw in _AGGREGATE_KEYWORDS if kw in q)
     read_hits = sum(1 for kw in _READING_KEYWORDS if kw in q)
@@ -86,9 +132,183 @@ def classify_record_text_query(question: str) -> str:
         return "read"
     if agg_hits == 0 and read_hits == 0:
         # Truly ambiguous: default to aggregate so the CSV path can still
-        # catch the common case, but record the fact in notes for audit.
+        # catch the common case.
         return "aggregate"
     return "aggregate"
+
+
+def _normalize_question(question: str) -> str:
+    return re.sub(r"\s+", " ", (question or "").strip().lower())
+
+
+def _question_hash(question: str) -> str:
+    return hashlib.sha256(_normalize_question(question).encode("utf-8")).hexdigest()[:16]
+
+
+def _model_identity(model: Any) -> str:
+    api_base = getattr(model, "api_base", "scripted")
+    model_name = getattr(model, "model", type(model).__name__)
+    return f"{api_base}::{model_name}"
+
+
+def _query_type_cache_key(question_hash: str, model_id: str) -> str:
+    digest = hashlib.sha256(f"{model_id}\x00{question_hash}".encode("utf-8")).hexdigest()
+    return digest[:32]
+
+
+def _query_type_cache_path(cache_dir: Path, question_hash: str, model_id: str) -> Path:
+    return cache_dir / f"{_query_type_cache_key(question_hash, model_id)}.json"
+
+
+def _parse_query_type_response(raw: str) -> str | None:
+    """Map a raw model response to 'aggregate' / 'read' or None if unclear."""
+    if not raw:
+        return None
+    # Strip JSON fencing / quotes / whitespace. We asked for one word but
+    # tolerant parsing avoids a fallback trip on trivial decoration.
+    text = raw.strip().strip("`\"' \n\r\t.").lower()
+    if not text:
+        return None
+    # Take first non-trivial token.
+    match = re.search(r"[a-z]+", text)
+    if match is None:
+        return None
+    token = match.group(0)
+    if token.startswith("agg"):
+        return "aggregate"
+    if token.startswith("read"):
+        return "read"
+    return None
+
+
+def classify_record_text_query_verdict(
+    question: str,
+    *,
+    model: Any = None,
+    cache_dir: Path | None = None,
+) -> RecordTextQueryTypeVerdict:
+    """Full classification entry point: LLM → cache → keyword fallback.
+
+    Always returns a verdict, even if model is None or the LLM fails.
+    Budget accounting happens inside ``model.complete()`` via the global
+    ``BudgetController``; callers MUST NOT double-book. ``BudgetExceeded``
+    is allowed to propagate so the runner can terminate the task, but any
+    other exception falls through to the keyword safety net.
+    """
+    from data_agent_baseline.budget import BudgetExceeded  # local: avoid cycle
+
+    q_hash = _question_hash(question)
+
+    if model is None:
+        return RecordTextQueryTypeVerdict(
+            verdict=_keyword_classify_record_text_query(question),
+            source="fallback_no_model",
+            model_id=None,
+            question_hash=q_hash,
+        )
+
+    model_id = _model_identity(model)
+
+    # --- Cache lookup ---
+    if cache_dir is not None:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path = _query_type_cache_path(cache_dir, q_hash, model_id)
+            if cache_path.exists():
+                try:
+                    payload = json.loads(cache_path.read_text())
+                    cached_verdict = payload.get("verdict")
+                    if cached_verdict in {"aggregate", "read"}:
+                        return RecordTextQueryTypeVerdict(
+                            verdict=cached_verdict,
+                            source="cache",
+                            model_id=model_id,
+                            cache_hit=True,
+                            llm_raw=payload.get("llm_raw"),
+                            question_hash=q_hash,
+                        )
+                except (OSError, json.JSONDecodeError, TypeError):
+                    pass
+        except OSError:
+            cache_path = None  # noqa: F841 — best-effort cache init
+    # --- LLM call ---
+    try:
+        raw = model.complete(
+            [
+                ModelMessage(role="system", content=_QUERY_TYPE_SYSTEM_PROMPT),
+                ModelMessage(
+                    role="user",
+                    content=f"Question:\n{question}\n\nAnswer:",
+                ),
+            ],
+            temperature=0.0,
+            stream_label="record_text_query_type",
+            max_tokens=10,
+        )
+    except BudgetExceeded:
+        # Budget exhaustion is fatal at the task level; surface it.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return RecordTextQueryTypeVerdict(
+            verdict=_keyword_classify_record_text_query(question),
+            source="fallback_error",
+            model_id=model_id,
+            error=str(exc),
+            question_hash=q_hash,
+        )
+
+    parsed = _parse_query_type_response(raw)
+    if parsed is None:
+        return RecordTextQueryTypeVerdict(
+            verdict=_keyword_classify_record_text_query(question),
+            source="fallback_error",
+            model_id=model_id,
+            llm_raw=raw,
+            error="unparseable_llm_response",
+            question_hash=q_hash,
+        )
+
+    # --- Cache write (best effort) ---
+    if cache_dir is not None:
+        try:
+            cache_path = _query_type_cache_path(cache_dir, q_hash, model_id)
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "verdict": parsed,
+                        "model_id": model_id,
+                        "question_hash": q_hash,
+                        "llm_raw": raw,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except OSError:
+            pass
+
+    return RecordTextQueryTypeVerdict(
+        verdict=parsed,
+        source="llm",
+        model_id=model_id,
+        llm_raw=raw,
+        question_hash=q_hash,
+    )
+
+
+def classify_record_text_query(
+    question: str,
+    *,
+    model: Any = None,
+    cache_dir: Path | None = None,
+) -> str:
+    """Back-compat wrapper returning just the verdict string.
+
+    Prefer ``classify_record_text_query_verdict`` when you also want to
+    record ``source`` (llm / cache / fallback) into trace.json.
+    """
+    return classify_record_text_query_verdict(
+        question, model=model, cache_dir=cache_dir
+    ).verdict
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +598,10 @@ class StructuredDocExtraction:
     positive_previews: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     # How the question was classified; recorded for audit.
     query_type: str = "aggregate"
+    # Full classifier verdict (LLM vs cache vs fallback). Retained
+    # alongside ``query_type`` so trace.json can answer "how did we pick
+    # this branch?" without re-running the classifier.
+    query_type_verdict: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -392,6 +616,7 @@ class StructuredDocExtraction:
             "previews": {k: list(v) for k, v in self.previews.items()},
             "positive_previews": {k: list(v) for k, v in self.positive_previews.items()},
             "query_type": self.query_type,
+            "query_type_verdict": dict(self.query_type_verdict) if self.query_type_verdict else None,
         }
 
 
@@ -403,6 +628,11 @@ class StructuredDocExecutor:
     compiled_task: CompiledTask
     chunk_chars: int = 7000
     cache_dir: Path | None = None
+    # Separate cache for the record_text query_type classifier. Kept on
+    # its own directory (not the extraction cache) because the key shape
+    # is different: ``(question_hash, model_id)`` vs extraction's
+    # ``(file_hash, schema_hash, model_id, chunk_hash)``.
+    query_type_cache_dir: Path | None = None
     max_chunks_per_file: int = 8
     extraction_max_tokens: int = 900
     output_dir: Path | None = None  # where synthesized csvs are placed; default = task.context_dir / .synthesized
@@ -426,9 +656,26 @@ class StructuredDocExecutor:
             result.notes.append("no_structured_prose_files")
             return result
 
-        # Branch: read-comprehension vs aggregate. See classifier at top.
-        query_type = classify_record_text_query(task.question)
+        # Branch: read-comprehension vs aggregate. The classifier first
+        # tries the LLM (with (question_hash, model_id) cache + budget
+        # accounting inside model.complete); on failure it falls back to
+        # the deterministic keyword vote defined above. The full verdict
+        # (including ``source``) is persisted into trace.json so after-
+        # the-fact debugging can tell LLM-driven from fallback decisions
+        # apart.
+        verdict = classify_record_text_query_verdict(
+            task.question,
+            model=self.model,
+            cache_dir=self.query_type_cache_dir,
+        )
+        query_type = verdict.verdict
         result.query_type = query_type
+        result.query_type_verdict = verdict.to_dict()
+        result.notes.append(
+            f"query_type_classifier:source={verdict.source}"
+            + (":cache_hit" if verdict.cache_hit else "")
+            + (f":error={verdict.error}" if verdict.error else "")
+        )
         if query_type == "read":
             result.notes.append(
                 "skip_synthesis:query_type=read "
