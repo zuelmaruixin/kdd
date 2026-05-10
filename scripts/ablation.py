@@ -170,39 +170,84 @@ def extract_trace_metrics(trace_path: Path) -> dict[str, Any]:
 
 def _run_single_task_worker(
     task_id: str,
-    config: AppConfig,
-    run_output_dir: Path,
+    config_path: str,
+    run_output_dir: str,
+    semantic_enabled: bool,
+    max_repairs: int,
+    run_id: str,
     result_queue: mp.Queue,
 ) -> None:
-    """Subprocess entry point. Runs one task and posts result to queue."""
+    """Subprocess entry point.
+
+    Reloads the config from disk inside the child process so we do not rely on
+    pickling AppConfig (which can carry live objects / closures on the parent).
+    """
+    import traceback
+
     try:
-        artifact = run_single_task(
+        # Re-import inside child so spawn mode is stable.
+        from dataclasses import replace as _replace
+        from pathlib import Path as _Path
+
+        from data_agent_baseline.config import load_app_config as _load_cfg
+        from data_agent_baseline.run.runner import run_single_task as _run
+
+        cfg = _load_cfg(_Path(config_path))
+        # Apply arm overrides
+        new_routes = {
+            name: _replace(
+                route,
+                semantic_consistency_enabled=semantic_enabled,
+                semantic_consistency_max_repairs=max_repairs,
+            )
+            for name, route in cfg.agent.router.routes.items()
+        }
+        cfg = _replace(
+            cfg,
+            agent=_replace(cfg.agent, router=_replace(cfg.agent.router, routes=new_routes)),
+            run=_replace(cfg.run, run_id=run_id),
+        )
+
+        artifact = _run(
             task_id=task_id,
-            config=config,
-            run_output_dir=run_output_dir,
+            config=cfg,
+            run_output_dir=_Path(run_output_dir),
         )
         result_queue.put(("ok", {
             "succeeded": bool(artifact.succeeded),
             "failure_reason": artifact.failure_reason or "",
         }))
     except Exception as exc:  # noqa: BLE001
-        result_queue.put(("exc", {"error": str(exc), "type": type(exc).__name__}))
+        result_queue.put(("exc", {
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "traceback": traceback.format_exc(),
+        }))
 
 
 def _run_task_with_timeout(
     *,
     task_id: str,
-    config: AppConfig,
+    config_path: str,
     run_output_dir: Path,
+    semantic_enabled: bool,
+    max_repairs: int,
+    run_id: str,
     timeout: float | None,
+    inline_config: AppConfig | None = None,
 ) -> dict[str, Any]:
-    """Run one task in a subprocess; hard-kill if it exceeds timeout."""
+    """Run one task in a subprocess; hard-kill if it exceeds timeout.
+
+    When ``timeout`` is disabled, falls back to in-process execution using the
+    already-built ``inline_config``.
+    """
     if timeout is None or timeout <= 0:
-        # Inline fast path (no subprocess overhead)
+        if inline_config is None:
+            raise ValueError("inline_config is required when timeout is disabled")
         try:
             artifact = run_single_task(
                 task_id=task_id,
-                config=config,
+                config=inline_config,
                 run_output_dir=run_output_dir,
             )
             return {
@@ -221,7 +266,10 @@ def _run_task_with_timeout(
     queue: mp.Queue = ctx.Queue(maxsize=1)
     proc = ctx.Process(
         target=_run_single_task_worker,
-        args=(task_id, config, run_output_dir, queue),
+        args=(
+            task_id, config_path, str(run_output_dir),
+            semantic_enabled, max_repairs, run_id, queue,
+        ),
         daemon=True,
     )
     proc.start()
@@ -248,6 +296,11 @@ def _run_task_with_timeout(
         }
     if tag == "ok":
         return {"status": "ok", **payload}
+    # Exception path: keep the short reason for the CSV, but print the
+    # full traceback to console so user can see the real failure.
+    tb = payload.get("traceback") or ""
+    if tb:
+        console.print(f"[red]worker traceback:[/red]\n{tb}")
     return {
         "status": "exception",
         "succeeded": False,
@@ -258,6 +311,7 @@ def _run_task_with_timeout(
 def run_arm(
     arm: dict[str, Any],
     base_cfg: AppConfig,
+    config_path: Path,
     picked: list[tuple[str, str]],
     stamp: str,
     per_task_timeout: float | None = None,
@@ -283,9 +337,13 @@ def run_arm(
         t0 = time.perf_counter()
         result = _run_task_with_timeout(
             task_id=task_id,
-            config=arm_cfg,
+            config_path=str(config_path),
             run_output_dir=run_output_dir,
+            semantic_enabled=arm["semantic_enabled"],
+            max_repairs=arm["max_repairs"],
+            run_id=run_id,
             timeout=per_task_timeout,
+            inline_config=arm_cfg,
         )
         elapsed = time.perf_counter() - t0
         row = {
@@ -481,7 +539,7 @@ def main() -> None:
     try:
         for arm in arms_to_run:
             arm_rows = run_arm(
-                arm, base_cfg, picked, stamp,
+                arm, base_cfg, args.config, picked, stamp,
                 per_task_timeout=per_task_timeout,
             )
             all_rows.extend(arm_rows)
