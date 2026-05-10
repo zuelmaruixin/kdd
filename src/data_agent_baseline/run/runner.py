@@ -51,6 +51,22 @@ from typing import Any
 #                                primary_answer_before_intersection? }
 #   self_consistency           { num_samples, samples[], decision }
 #   local_score                { recall, penalty, score }   (only when gold known)
+#   semantic_consistency_audit { plan_ran, plan_failure?, cheap_guard_triggered_escalation,
+#                                analyst_exception_retry_succeeded,
+#                                analyst_exception_fallback_used,
+#                                lazy_escalation_plan_built,
+#                                fallback_plan_from_cheap_guard,
+#                                judge_ran, judge_attempts,
+#                                judge_final_verdict, judge_repaired_code,
+#                                final_gate }
+#       — flat summary of the semantic-consistency machinery for this
+#         task. ``final_gate`` is the quick read: "plan+judge",
+#         "escalated+judge", "cheap_guard_only", or "bypassed". Written
+#         by _run_operator_executor_pass (present only for routes whose
+#         kind is operator_executor; other executors do not run semantic
+#         consistency). On cascade, the audit reflects the LAST route's
+#         behavior, matching how ``operator_executor`` itself is
+#         reported.
 #
 # When adding new agent stages, ALWAYS write under a top-level key —
 # never inline inside an existing block — so downstream tooling can

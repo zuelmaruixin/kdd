@@ -854,6 +854,125 @@ def _run_operator_executor_pass(
             **result.to_dict(),
             "compiled_task": compiled_task.to_dict(),
         },
+        "semantic_consistency_audit": _build_semantic_consistency_audit(result.manifest),
+    }
+
+
+def _build_semantic_consistency_audit(manifest: list[Any] | None) -> dict[str, Any]:
+    """Summarize how the semantic-consistency machinery behaved on this task.
+
+    Reads the operator-executor manifest (already a canonical audit log
+    of each stage) and distills it into a flat, one-glance-readable
+    block that lives at the top of trace.json. This answers the
+    question "did the consistency judge actually run, and if not why
+    not?" without making the reader dig through ``context_manifest``.
+
+    The audit is non-authoritative: it reports, it does not decide. All
+    behavioral choices still live inside the pipeline stages themselves.
+
+    ``final_gate`` is the single most useful field. It takes one of:
+      - ``"plan+judge"``            : analyst produced a plan and judge
+                                       ran. The strong path.
+      - ``"escalated+judge"``       : analyst did NOT produce a plan on
+                                       the first try (exception or
+                                       gated/skipped), but an escalation
+                                       produced one — either via
+                                       analyst-exception retry / fallback
+                                       or via cheap-guard lazy escalation
+                                       — and judge ran against it. The
+                                       recovered path.
+      - ``"cheap_guard_only"``      : cheap semantic guard flagged risk
+                                       but escalation did not build a
+                                       plan and judge was not engaged.
+                                       Should be rare; investigate.
+      - ``"bypassed"``              : no plan, no judge. The task was
+                                       deemed low-risk and shipped
+                                       without semantic verification.
+    """
+    plan_ran = False
+    plan_failure: dict[str, Any] | None = None
+    cheap_guard_triggered_escalation = False
+    analyst_exception_retry_succeeded = False
+    analyst_exception_fallback_used = False
+    lazy_escalation_plan_built = False
+    fallback_plan_from_cheap_guard = False
+    judge_attempts = 0
+    judge_repaired_code = False
+    judge_final_verdict: str | None = None
+
+    for entry in (manifest or []):
+        if not isinstance(entry, dict):
+            continue
+
+        sc_entry = entry.get("semantic_consistency")
+        if isinstance(sc_entry, str):
+            # Tag-only entries used by OperatorExecutor to mark the
+            # Phase 3d escalation branches.
+            if sc_entry == "enabled":
+                plan_ran = True
+            elif sc_entry == "analyst_exception_retry_succeeded":
+                analyst_exception_retry_succeeded = True
+                plan_failure = dict(entry.get("original_plan_failure") or {})
+            elif sc_entry == "analyst_exception_fallback_plan":
+                analyst_exception_fallback_used = True
+                plan_failure = dict(entry.get("original_plan_failure") or {})
+            elif sc_entry == "lazy_escalation":
+                lazy_escalation_plan_built = True
+            elif sc_entry == "fallback_plan_from_cheap_guard":
+                fallback_plan_from_cheap_guard = True
+            # Any string tag starting with a sibling key implies the
+            # pipeline was engaged at some layer; treat as "plan path
+            # active" for audit readability.
+        elif isinstance(sc_entry, dict):
+            # SemanticConsistencyPipeline.judge_and_repair ends with
+            # result.manifest.append({"semantic_consistency": trace.to_dict()}),
+            # which is the only place a dict shows up here. Its shape
+            # comes from SemanticConsistencyResult.to_dict().
+            judge_history = sc_entry.get("judge_history") or []
+            repair_history = sc_entry.get("repair_history") or []
+            judge_attempts = len([h for h in judge_history if isinstance(h, dict)])
+            judge_repaired_code = any(
+                isinstance(h, dict) and h.get("succeeded") for h in repair_history
+            )
+            judge_final_verdict = (
+                str(sc_entry.get("final_verdict"))
+                if sc_entry.get("final_verdict") is not None
+                else None
+            )
+
+        if isinstance(entry.get("cheap_semantic_assessment"), dict):
+            cheap_guard_triggered_escalation = True
+
+    # Work out final_gate. Order matters: the strongest claim that
+    # applies wins.
+    judge_ran = judge_attempts > 0 or judge_final_verdict is not None
+    if judge_ran and (
+        analyst_exception_retry_succeeded
+        or analyst_exception_fallback_used
+        or lazy_escalation_plan_built
+        or fallback_plan_from_cheap_guard
+    ):
+        final_gate = "escalated+judge"
+    elif judge_ran:
+        final_gate = "plan+judge"
+    elif cheap_guard_triggered_escalation:
+        final_gate = "cheap_guard_only"
+    else:
+        final_gate = "bypassed"
+
+    return {
+        "plan_ran": plan_ran,
+        "plan_failure": plan_failure,
+        "cheap_guard_triggered_escalation": cheap_guard_triggered_escalation,
+        "analyst_exception_retry_succeeded": analyst_exception_retry_succeeded,
+        "analyst_exception_fallback_used": analyst_exception_fallback_used,
+        "lazy_escalation_plan_built": lazy_escalation_plan_built,
+        "fallback_plan_from_cheap_guard": fallback_plan_from_cheap_guard,
+        "judge_ran": judge_ran,
+        "judge_attempts": judge_attempts,
+        "judge_final_verdict": judge_final_verdict,
+        "judge_repaired_code": judge_repaired_code,
+        "final_gate": final_gate,
     }
 
 

@@ -192,6 +192,79 @@ class OperatorExecutor:
                     {"post_schema_retry_local_repair_log": post_schema_repair_log}
                 ]
 
+        # --- Phase 3d: recover semantic plan before judge runs ---
+        # Two independent recovery paths both end up ensuring that judge
+        # has a plan to judge against. Without one of these firing, a
+        # None semantic_plan causes judge_and_repair() to silently
+        # return, bypassing the entire consistency check.
+
+        # Path 1 (analyst-exception escalation). The analyst raised
+        # during Phase 1 (likely a transient LLM/network hiccup). Unlike
+        # fast_path_skip or gate_skip, an exception is NOT a signal that
+        # the plan is unnecessary — the task may still need semantic
+        # judging. We capture the original failure, try once more with
+        # force=True, and if the retry also fails we synthesize a
+        # low-confidence plan so judge is forced to run. This closes the
+        # hole where "analyst throws -> code self-overrides -> judge
+        # skipped" let unverified answers through.
+        original_plan_failure = dict(sc_pipeline.last_plan_failure or {})
+        analyst_exception_escalated = False
+        if (
+            semantic_plan is None
+            and original_plan_failure.get("stage") == "analyst_exception"
+        ):
+            retry_plan = sc_pipeline.plan(task, force=True)
+            analyst_exception_escalated = True
+            if retry_plan is not None:
+                semantic_plan = retry_plan
+                result.manifest = list(result.manifest or []) + [{
+                    "semantic_consistency": "analyst_exception_retry_succeeded",
+                    "original_plan_failure": original_plan_failure,
+                    "semantic_plan": semantic_plan,
+                }]
+            else:
+                # Retry also failed. Build a low-confidence plan so judge
+                # is forced to run against something grounded (the
+                # cheap-risk fallback shape already enforces
+                # _force_semantic_consistency=True).
+                synthetic_assessment = {
+                    "should_escalate": True,
+                    "score": 1.0,
+                    "risks": [{
+                        "code": "analyst_exception",
+                        "severity": "error",
+                        "message": (
+                            "Semantic analyst raised an exception and a "
+                            "forced retry also failed; judge must verify "
+                            "the answer without an analyst-authored plan."
+                        ),
+                        "weight": 1.0,
+                    }],
+                }
+                semantic_plan = self._fallback_semantic_plan(
+                    task=task,
+                    cheap_assessment=synthetic_assessment,
+                    plan_failure=original_plan_failure,
+                )
+                # Overwrite the fallback tag so trace readers can tell
+                # this fallback came from analyst exception, not from the
+                # cheap guard's normal escalation.
+                semantic_plan["_force_reason"] = "analyst_exception_fallback_plan"
+                result.manifest = list(result.manifest or []) + [{
+                    "semantic_consistency": "analyst_exception_fallback_plan",
+                    "reason": (
+                        "analyst raised during plan() and forced retry "
+                        "also failed; using synthetic low-confidence plan "
+                        "to keep judge in the loop"
+                    ),
+                    "original_plan_failure": original_plan_failure,
+                    "retry_plan_failure": sc_pipeline.last_plan_failure,
+                    "semantic_plan": semantic_plan,
+                }]
+
+        # Path 2 (cheap-guard lazy escalation). Unchanged from before,
+        # except that if analyst exception already supplied a plan above
+        # we skip this block (no point running two escalations).
         if semantic_plan is None:
             cheap_assessment = self._cheap_semantic_assessment(task, result)
         else:
