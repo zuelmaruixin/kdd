@@ -116,7 +116,7 @@ def _answer_frame(answer: dict[str, Any] | None) -> pd.DataFrame | None:
 
 def _route_summary(trace: dict[str, Any]) -> dict[str, Any]:
     decision = trace.get("router_decision") or {}
-    compiled = trace.get("compiled_task") or {}
+    compiled = trace.get("compiled_task") or decision.get("compiled_task") or {}
     validation = trace.get("answer_validation") or {}
     return {
         "succeeded": trace.get("succeeded"),
@@ -139,7 +139,8 @@ def _get_operator_block(trace: dict[str, Any]) -> dict[str, Any]:
 
 
 def _stage_status(trace: dict[str, Any]) -> list[tuple[str, str, str]]:
-    compiled = trace.get("compiled_task") or {}
+    decision = trace.get("router_decision") or {}
+    compiled = trace.get("compiled_task") or decision.get("compiled_task") or {}
     operator = _get_operator_block(trace)
     validation = trace.get("answer_validation") or {}
     manifest = operator.get("context_manifest") or []

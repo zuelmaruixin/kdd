@@ -402,6 +402,7 @@ def _route_for_execution_profile(
         and verifiability == "programmatic"
         and low_complexity
         and compiled.file_count <= 2 
+        and op_complexity not in {"filter_join", "aggregation", "multi_hop"} 
     ):
         candidate = _first_route_named(router, ("easy",), visited=visited)
         if candidate is not None:
