@@ -45,6 +45,11 @@ class OperatorExecutor:
     max_local_repairs: int = 3
     semantic_consistency_enabled: bool = True
     semantic_consistency_max_repairs: int = 3
+    # Transient cache of the current task's question, populated at the
+    # start of run(). Used by the record_text query_type classifier so
+    # helpers like _should_preextract_record_text() can check the
+    # question without threading it through every call.
+    _last_question_cache: str = ""
 
     def run(self, task: PublicTask) -> CodegenRunResult:
         """Execute the tool-first pipeline.
@@ -58,6 +63,9 @@ class OperatorExecutor:
           6. Semantic consistency judge + repair when semantic plan is active
              or when the fast path needs escalation
         """
+        # Cache the question so record_text routing helpers (which don't take
+        # a task arg) can still consult the query_type classifier.
+        self._last_question_cache = task.question
         ctx = ExecutionContext(self.compiled_task)
 
         sc_pipeline = SemanticConsistencyPipeline(
@@ -120,7 +128,19 @@ class OperatorExecutor:
 
         # --- Phase 3b: structured-doc synthesis (before schema-retry so that
         #     the synthesized CSV columns are available to the retry LLM) ---
-        if not result.succeeded and self._has_record_text_docs() and not self._should_preextract_record_text():
+        # Skip entirely if the query_type classifier said this is a
+        # reading-comprehension question -- synthesizing a table would
+        # drop the narrative context the question depends on.
+        from data_agent_baseline.agents.structured_doc_executor import (
+            classify_record_text_query,
+        )
+        needs_synth_fallback = (
+            not result.succeeded
+            and self._has_record_text_docs()
+            and not self._should_preextract_record_text()
+            and classify_record_text_query(task.question) != "read"
+        )
+        if needs_synth_fallback:
             try:
                 synth = self._run_structured_doc_synthesis(task=task, prior=result)
             except BudgetExceeded:
@@ -189,11 +209,23 @@ class OperatorExecutor:
         )
 
     def _should_preextract_record_text(self) -> bool:
+        if not self._has_record_text_docs():
+            return False
         flags = set(self.compiled_task.ambiguity_flags)
-        return (
+        candidate = (
             self.compiled_task.task_type == "record_text_with_semantic_rule"
             or "record_extraction_required" in flags
-        ) and self._has_record_text_docs()
+        )
+        if not candidate:
+            return False
+        # New in the record_text query_type split: reading-comprehension
+        # questions do not benefit from CSV synthesis (it drops narrative
+        # context). Let those fall through to the raw-codegen path; the
+        # operator prompt will then see the record_text files directly.
+        from data_agent_baseline.agents.structured_doc_executor import (
+            classify_record_text_query,
+        )
+        return classify_record_text_query(self._last_question_cache) != "read"
 
     def _cheap_semantic_assessment(
         self,

@@ -50,16 +50,22 @@ _MD_TABLE_SEPARATOR_RE = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$",
     re.MULTILINE,
 )
+# Generic "record id mention" regex: any paragraph that attaches a
+# 2+ digit number to an id-like noun. Kept domain-agnostic.
 _RECORD_ID_RE = re.compile(
-    r"\b(?:patient|medical record number|record number|file number|race id|id)\b"
+    r"\b(?:id|number|record|file|ref(?:erence)?|case|entry)\b"
     r"[^.\n]{0,80}?\b\d{2,}\b",
     re.I,
 )
+# Generic "looks like a field name" regex: any word commonly used
+# in key: value metadata blocks (date, value, level, description, url).
 _STRUCTURED_FIELD_RE = re.compile(
     r"\b("
-    r"birth(?:day|date)?|date of birth|born|created|recorded|description|"
-    r"got|gpt|ldh|alp|t-?bil|creatinine|platelet|level|value|"
-    r"race id|grand prix|url|website|reference|constructor"
+    r"name|id|ref|reference|date|year|month|day|"
+    r"value|level|amount|count|score|rank|"
+    r"type|status|category|class|kind|group|"
+    r"description|note|comment|remark|"
+    r"url|link|email|address|phone"
     r")\b",
     re.I,
 )
@@ -665,143 +671,87 @@ def _scan_sqlite(path: Path) -> dict[str, Any]:
         conn.close()
 
 
-# Patterns for the "structured prose" extractor. Each entry is
-# (canonical_field_name, regex). The regex captures the value; the
-# extractor strips obvious unit suffixes and quote characters.
-_STRUCTURED_FIELD_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
-    ("patient_id", re.compile(
-        r"\b(?:patient|medical record number|file number|record number|id)\b"
-        r"[^.\n]{0,40}?\b(?P<v>\d{3,8})\b",
-        re.I,
-    )),
-    ("sex", re.compile(r"\b(?P<v>female|male)\b", re.I)),
-    ("birthday", re.compile(
-        r"\bborn(?:[^.\n]{0,40}?\bon)?[^.\n]{0,80}?"
-        r"(?P<v>(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
-        r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|"
-        r"Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4})",
-        re.I,
-    )),
-    ("got", re.compile(r"\bGOT[^.\n]{0,80}?\b(?P<v>\d+(?:\.\d+)?)\s*U/L", re.I)),
-    ("gpt", re.compile(r"\bGPT[^.\n]{0,80}?\b(?P<v>\d+(?:\.\d+)?)\s*U/L", re.I)),
-    ("ldh", re.compile(r"\bLDH[^.\n]{0,80}?\b(?P<v>\d+(?:\.\d+)?)\s*U/L", re.I)),
-    ("alp", re.compile(r"\bALP[^.\n]{0,80}?\b(?P<v>\d+(?:\.\d+)?)\s*U/L", re.I)),
-    ("t_bil", re.compile(r"\bT-?BIL[^.\n]{0,80}?\b(?P<v>\d+(?:\.\d+)?)\s*mg/dL", re.I)),
-    ("creatinine", re.compile(r"\bcreatinine[^.\n]{0,80}?\b(?P<v>\d+(?:\.\d+)?)\s*mg/dL", re.I)),
-    ("uric_acid", re.compile(r"\b(?:uric\s*acid|UA)[^.\n]{0,80}?\b(?P<v>\d+(?:\.\d+)?)\s*mg/dL", re.I)),
-    ("date", re.compile(
-        r"\b(?:on|recorded on|dated|drawn on)[^.\n]{0,30}?"
-        r"(?P<v>(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
-        r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|"
-        r"Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4})",
-        re.I,
-    )),
-    ("constructor_ref", re.compile(r"\bconstructor\s*ref(?:erence)?\b[^.\n]{0,40}?(?P<v>[A-Za-z_]+)", re.I)),
-    ("url", re.compile(r"(?P<v>https?://\S+)", re.I)),
-)
+# --- Generic structured-prose scanner --------------------------------------
+#
+# We intentionally do NOT ship a hard-coded field list here. Domain-specific
+# field extraction (e.g. "GPT U/L", "creatinine mg/dL", or sports metrics) is
+# both brittle and a sign of over-fitting the profiler to a handful of
+# benchmark tasks. The profiler's job is limited to:
+#
+#   1. splitting the document into per-record paragraphs, and
+#   2. handing the first few snippets to downstream code so the actual field
+#      extraction can be done by the LLM-based StructuredDocExecutor.
+#
+# Generic field-name heuristics (" key: value " style) are used only to
+# populate the `record_fields` hint so the prompt shows *what kinds of
+# keys* appear, without dictating specific ones.
 
-# Optional "corrected to" pattern — values often appear like "originally
-# 35.0 U/L; corrected to 28.0 U/L". The corrected one wins.
-_CORRECTED_RE = re.compile(
-    r"(?:corrected|adjusted|amended|finalized|confirmed|rectified)\s+to\s+"
-    r"(?P<v>\d+(?:\.\d+)?)\s*(?:U/L|mg/dL)",
-    re.I,
+
+_KEY_VALUE_LINE_RE = re.compile(
+    r"^\s*(?P<k>[A-Za-z][A-Za-z0-9 _/\-]{1,40}?)\s*[:=]\s*(?P<v>\S.*?)\s*$",
 )
 
 
 def _split_records(text: str) -> list[str]:
     """Split a structured-prose doc into per-record paragraphs.
 
-    We intentionally cut on blank lines (the canonical paragraph
-    splitter) and then drop blocks that don't look like records (no
-    numeric id mention).
+    Heuristic: cut on blank lines (the canonical paragraph splitter) and
+    drop blocks that don't look like self-contained records — no
+    multi-digit id mention and no key:value pair means it's probably
+    abstract or narrative methodology, not a record.
     """
     blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
-    return [
-        block for block in blocks
-        if re.search(r"\b\d{3,}\b", block)
-        and re.search(r"\b(?:patient|file number|medical record|record number|id)\b", block, re.I)
-    ]
+    out: list[str] = []
+    for block in blocks:
+        has_id = bool(re.search(r"\b\d{2,}\b", block))
+        has_kv = any(_KEY_VALUE_LINE_RE.match(line) for line in block.splitlines())
+        if has_id or has_kv:
+            out.append(block)
+    return out
 
 
-def _extract_record(block: str) -> dict[str, Any]:
-    """Best-effort field extraction from one record paragraph.
+def _best_effort_record_fields(blocks: list[str], *, max_fields: int = 40) -> list[str]:
+    """Collect a generic key list from "key: value" lines across blocks.
 
-    The extractor is intentionally permissive: missing fields just don't
-    appear in the dict. The caller (the codegen prompt) then sees both
-    the field schema and concrete sample values, which is what lets the
-    LLM imitate the pattern.
+    Used only as a hint in the prompt: "records appear to use these keys".
+    No values are extracted here; the actual values come from the LLM
+    extractor downstream.
     """
-    record: dict[str, Any] = {}
-    for field_name, pattern in _STRUCTURED_FIELD_PATTERNS:
-        match = pattern.search(block)
-        if match is None:
-            continue
-        value = match.group("v").strip()
-        # Numeric coercion when the field looks numeric.
-        if field_name not in {"patient_id", "sex", "birthday", "date",
-                              "constructor_ref", "url"}:
-            try:
-                record[field_name] = float(value)
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for block in blocks:
+        for line in block.splitlines():
+            match = _KEY_VALUE_LINE_RE.match(line)
+            if match is None:
                 continue
-            except ValueError:
-                pass
-        if field_name == "patient_id":
-            try:
-                record[field_name] = int(value)
-                continue
-            except ValueError:
-                pass
-        record[field_name] = value
-
-    # Apply "corrected to" overrides for numeric fields. We pair each
-    # correction with the preceding metric mention by proximity.
-    for match in _CORRECTED_RE.finditer(block):
-        try:
-            corrected_val = float(match.group("v"))
-        except ValueError:
-            continue
-        # Find the metric word closest before this correction.
-        preceding = block[: match.start()].lower()
-        for token in ("creatinine", "uric_acid", "t_bil", "alp", "ldh", "gpt", "got"):
-            display = token.replace("_", "-")
-            if display in preceding[-200:] or token in preceding[-200:]:
-                record[token] = corrected_val
-                break
-    return record
+            key = match.group("k").strip().lower()
+            key = re.sub(r"\s+", "_", key)
+            if key and key not in seen_set:
+                seen_set.add(key)
+                seen.append(key)
+            if len(seen) >= max_fields:
+                return seen
+    return seen
 
 
 def _scan_structured_doc(path: Path) -> dict[str, Any]:
     text = path.read_text(errors="replace")
     blocks = _split_records(text)
-    records: list[dict[str, Any]] = []
-    for block in blocks:
-        record = _extract_record(block)
-        if record:
-            records.append(record)
 
-    # Field set across records — drives the prompt-side schema list.
-    seen_fields: list[str] = []
-    field_set: set[str] = set()
-    for record in records:
-        for key in record:
-            if key not in field_set:
-                field_set.add(key)
-                seen_fields.append(key)
-
-    sample_records = records[:3]
     sample_snippets: list[str] = []
     for block in blocks[:3]:
         snippet = block.replace("\n", " ").strip()
         sample_snippets.append(snippet[:600])
 
+    record_fields = _best_effort_record_fields(blocks)
+
     return {
         "chars": len(text),
-        "record_count": len(records),
-        "record_fields": seen_fields,
-        "sample_records": sample_records,
+        "record_count": len(blocks),
+        "record_fields": record_fields,
+        "sample_records": [],           # deterministic field extraction no longer runs here
         "sample_snippets": sample_snippets,
-        "all_records": records,
+        "all_records": [],
     }
 
 
@@ -895,8 +845,8 @@ def _build_source_capability(
                 structured_records=list(scan.get("sample_records") or []),
                 structured_record_fields=list(scan.get("record_fields") or []),
                 structured_record_count=int(scan.get("record_count") or 0),
-                structured_record_splitter="paragraph (\\n\\n) with id-mention filter",
-                structured_id_pattern=r"\b(?:patient|medical record number|file number|record number|id)\b[^.\n]{0,40}?\b(\d{3,8})\b",
+                structured_record_splitter="paragraph (\\n\\n) + id-mention or key:value filter",
+                structured_id_pattern=r"\b\d{2,}\b",
             )
     except Exception as exc:  # noqa: BLE001
         return SourceCapability(
