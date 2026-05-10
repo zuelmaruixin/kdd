@@ -224,7 +224,7 @@ Primary + verifiers run in parallel; keep columns whose signatures agree $\geq$ 
 \begin{center}
 \scriptsize
 \begin{tikzpicture}[
-    node distance=0.2cm,
+    node distance=0.08cm,
     stage/.style={rectangle, draw=ustblue, fill=gray!8, rounded corners=2pt,
                   minimum width=12cm, minimum height=0.5cm, align=center, font=\scriptsize},
     arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!70},
@@ -295,18 +295,19 @@ All three read the \textbf{same} \texttt{SourceCapability} scan. The prompt tell
 \section{Risk Gating (Core Innovation)}
 
 %---------------------------------------------------------
+%---------------------------------------------------------
 \begin{frame}
 \frametitle{Cheap Semantic Guard --- Non-LLM Risk Gate}
 
-\textbf{Position:} codegen succeeded + answer structurally valid + \alert{no analyst ran yet} $\to$ should we trust this answer?
+\textbf{Position:} codegen succeeded, answer structurally valid, \alert{no analyst ran yet} $\to$ trust this answer?
 
-\vspace{0.2em}
+\vspace{-0.2em}
 \begin{equation*}
 \text{risk\_score} = \min\!\big(1.0,\textstyle\sum \text{unique\_weights}\big), \quad
 \text{escalate} = \text{any error} \,\lor\, \text{score} \geq 0.5
 \end{equation*}
 
-\vspace{0.2em}
+\vspace{-0.3em}
 \begin{center}
 \scriptsize
 \begin{tabular}{llcl}
@@ -314,82 +315,76 @@ All three read the \textbf{same} \texttt{SourceCapability} scan. The prompt tell
 \textbf{Category} & \textbf{Risk Code} & \textbf{Wt} & \textbf{Meaning} \\
 \midrule
 Execution & \texttt{execution\_failed / empty\_answer\_rows} & 1.0 / 0.75 & No/zero answer rows \\
-Repair & \texttt{suspicious\_fallback:schema\_retry} & 0.8 & Needed schema retry to succeed \\
-Trace & \texttt{trace\_missing:schema\_inspection} & 0.8 & No real-column check in trace \\
-Trace & \texttt{zero\_intermediate\_count} & 0.8 & Mid-pipeline drops to 0 rows \\
-\textbf{Coverage} & \texttt{\textbf{field\_coverage\_mismatch}} & \textbf{0.75} & \textbf{Grounding found candidate but code didn't use it} \\
-Formula & \texttt{formula\_without\_trigger} & 0.75 & Used formula question didn't ask for \\
+Repair & \texttt{suspicious\_fallback:schema\_retry} & 0.8 & Needed schema retry \\
+Trace & \texttt{trace\_missing:schema\_inspection} & 0.8 & No real-column check \\
+Trace & \texttt{zero\_intermediate\_count} & 0.8 & Mid-pipeline drops to 0 \\
+\textbf{Coverage} & \texttt{\textbf{field\_coverage\_mismatch}} & \textbf{0.75} & \textbf{Grounding candidate unused} \\
+Formula & \texttt{formula\_without\_trigger} & 0.75 & Unasked formula used \\
 \bottomrule
 \end{tabular}
 \end{center}
 
+\vspace{-0.2em}
 \begin{alertblock}{Killer example}
-Q: ``patients with \textbf{severe degree of thrombosis}'' --- code uses \texttt{disease == "thrombosis"} but grounding found \texttt{degree\_of\_thrombosis} as candidate $\to$ \texttt{field\_coverage\_mismatch} (0.75) $\to$ \alert{escalate to judge} instead of silently shipping wrong answer.
+\scriptsize
+Q: \emph{``patients with severe degree of thrombosis''}. Code uses \texttt{disease=="thrombosis"} but grounding found \texttt{degree\_of\_thrombosis} $\to$ \texttt{field\_coverage\_mismatch} (0.75) $\to$ \alert{escalate to judge} instead of shipping wrong answer.
 \end{alertblock}
 
 \end{frame}
 %---------------------------------------------------------
 
 %---------------------------------------------------------
+
+%---------------------------------------------------------
+%---------------------------------------------------------
 \begin{frame}
 \frametitle{Lazy Escalation + Analyst-Exception Recovery}
 
 \begin{columns}[T]
 \column{0.55\textwidth}
-\begin{center}
-\resizebox{\linewidth}{!}{%
-\begin{tikzpicture}[
-    node distance=0.45cm and 1.0cm,
-    box/.style={rectangle, draw=ustblue, fill=gray!6, rounded corners=2pt,
-                minimum width=2.6cm, minimum height=0.7cm, align=center, font=\small},
-    decision/.style={diamond, draw=ustgold_1, fill=ustgold_1!10, aspect=2.5,
-                     align=center, font=\small, inner sep=1pt},
-    arrow/.style={-{Stealth[length=5pt]}, thick, ustblue!80},
-]
-\node[box] (codegen) {Codegen OK\\answer valid};
-\node[decision, right=of codegen] (guard) {Guard\\score$\geq$0.5?};
-\node[box, above right=0.25cm and 1.0cm of guard, fill=green!10] (fast) {Fast return\\(0 extra LLM)};
-\node[box, below right=0.25cm and 1.0cm of guard] (plan) {plan(force=True)};
-\node[decision, right=of plan] (ok) {Plan\\OK?};
-\node[box, below right=0.2cm and 0.5cm of ok] (fallback) {Fallback plan\\from guard risks};
-\node[box, above right=0.2cm and 0.5cm of ok] (judge) {Judge + Repair\\(max 3 rounds)};
-\draw[arrow] (codegen) -- (guard);
-\draw[arrow] (guard) -- node[above, font=\scriptsize]{No} (fast);
-\draw[arrow] (guard) -- node[below, font=\scriptsize]{Yes} (plan);
-\draw[arrow] (plan) -- (ok);
-\draw[arrow] (ok) -- node[above, font=\scriptsize]{Yes} (judge);
-\draw[arrow] (ok) -- node[below, font=\scriptsize]{No} (fallback);
-\draw[arrow] (fallback) -| (judge);
-\end{tikzpicture}%
-}
-\end{center}
 
-\column{0.43\textwidth}
-\textbf{Analyst-exception recovery (new):}\\
-If analyst raises during plan, we used to fall through to a silently-skipped judge. Now:
+\textbf{Decision flow:}
 \begin{itemize}
-    \item \texttt{stage==analyst\_exception} $\to$ retry once with \texttt{force=True}
-    \item Still fails $\to$ build low-confidence synthetic plan; \alert{judge must run}
+    \item Codegen OK, answer valid
+    \item Guard score $\geq 0.5$?
+    \begin{itemize}
+        \item \textbf{No} $\to$ fast return (0 extra LLM)
+        \item \textbf{Yes} $\to$ \texttt{plan(force=True)}
+    \end{itemize}
+    \item Plan OK? Yes $\to$ Judge + Repair (max 3 rounds)
+    \item Plan failed $\to$ fallback plan from guard risks $\to$ Judge
 \end{itemize}
 
-\vspace{0.3em}
-\textbf{Observability --- \texttt{semantic\_consistency\_audit}:}\\
-Top-level trace key with \texttt{final\_gate}:
+\vspace{0.4em}
+\textbf{Observability} --- \texttt{final\_gate} values:
 \begin{itemize}
     \scriptsize
     \item \texttt{plan+judge} --- strong path
     \item \texttt{escalated+judge} --- recovered
     \item \texttt{cheap\_guard\_only} --- investigate
-    \item \texttt{bypassed} --- no semantic check ran
+    \item \texttt{bypassed} --- no semantic check
 \end{itemize}
-\end{columns}
 
-\vspace{0.3em}
+\column{0.43\textwidth}
+\textbf{Analyst-exception recovery (new):}
+
+If analyst raises during plan, we used to fall through to a silently-skipped judge. Now:
+\begin{itemize}
+    \item \texttt{stage==analyst\_exception} $\to$ retry once with \texttt{force=True}
+    \item Still fails $\to$ low-confidence synthetic plan; \alert{judge must run}
+\end{itemize}
+
+\vspace{0.1em}
 \begin{exampleblock}{Effect}
-Simple tasks: \textbf{1 LLM call total} (codegen only). Hard tasks where analyst fails: guaranteed judge engagement instead of silent skip.
+Simple tasks: \textbf{1 LLM call total} (codegen only).
+
+Hard tasks where analyst fails: \alert{guaranteed judge engagement} instead of silent skip.
 \end{exampleblock}
 
+\end{columns}
 \end{frame}
+%---------------------------------------------------------
+
 %---------------------------------------------------------
 
 \section{Supporting Components}
@@ -440,7 +435,8 @@ Specialists only see \texttt{report}; only Synthesizer can call \texttt{answer}.
 %---------------------------------------------------------
 
 %---------------------------------------------------------
-\begin{frame}
+%---------------------------------------------------------
+\begin{frame}[fragile]
 \frametitle{Self-Consistency, Budget \& Demo}
 
 \begin{columns}[T]
@@ -454,10 +450,15 @@ Specialists only see \texttt{report}; only Synthesizer can call \texttt{answer}.
     \item \alert{Directly targets} $\text{recall} - \lambda \cdot \text{extra/pred}$
 \end{itemize}
 
-\vspace{0.3em}
-\textbf{Budget controller (per task):}\\
-\scriptsize\texttt{max\_llm\_calls, max\_tool\_calls, max\_seconds, max\_local\_repairs, max\_reasoner\_repairs, max\_multiagent\_fallbacks}\\
-{\footnotesize Limits = $\min$(YAML, TaskCompiler budget\_level)}
+\vspace{0.5em}
+\textbf{Budget controller (per task):}
+\begin{itemize}
+    \scriptsize
+    \item LLM / tool / time caps
+    \item Local \& reasoner repair caps
+    \item Multi-agent fallback cap
+    \item Limits $=\min$(YAML, TaskCompiler level)
+\end{itemize}
 
 \column{0.48\textwidth}
 \textbf{Streamlit demo:}
@@ -479,6 +480,8 @@ Auditable, explainable, reproducible.
 \end{columns}
 
 \end{frame}
+%---------------------------------------------------------
+
 %---------------------------------------------------------
 
 \section{Conclusion}

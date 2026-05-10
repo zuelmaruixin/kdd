@@ -234,7 +234,23 @@ def _render_stage_timeline(trace: dict[str, Any]) -> None:
 def _render_trace(trace: dict[str, Any], trace_path: Path) -> None:
     summary = _route_summary(trace)
     cols = st.columns(4)
-    cols[0].metric("Result", "OK" if summary["succeeded"] else "FAIL")
+    # Result 显示逻辑：既要跑通，也要得分（如果有标准答案）
+    local_score = trace.get("local_score") or {}
+    score_value = local_score.get("score")
+
+    if not summary["succeeded"]:
+        result_label = "FAIL"
+    elif score_value is not None and score_value < 0.1:
+        result_label = f"FAIL (score={score_value:.2f})"
+    elif score_value is not None:
+        result_label = f"OK (score={score_value:.2f})"
+    else:
+        result_label = "OK"  # 没有标准答案，不能判对错
+    if "FAIL" in result_label:
+        st.error(f"✗ {result_label}")
+    elif score_value is not None and score_value >= 0.99:
+        st.success(f"✓ {result_label}")
+    cols[0].metric("Result", result_label)
     cols[1].metric("Route", str(summary["route"] or "-"))
     cols[2].metric("Task Type", str(summary["task_type"] or "-"))
     cols[3].metric("Elapsed", f"{summary['elapsed_seconds'] or 0}s")
@@ -245,7 +261,36 @@ def _render_trace(trace: dict[str, Any], trace_path: Path) -> None:
     )
 
     _render_stage_timeline(trace)
-
+     # --- Verification Gate badge ---
+    audit = trace.get("semantic_consistency_audit") or {}
+    gate = audit.get("final_gate")
+    if gate:
+        badge = {
+            "plan+judge":       (":green[plan + judge]",
+                                 "analyst produced a plan and judge ran — strong path"),
+            "escalated+judge":  (":blue[escalated + judge]",
+                                 "plan was recovered via escalation (analyst-exception retry, "
+                                 "cheap-guard lazy escalation, or fallback plan) — recovered path"),
+            "cheap_guard_only": (":orange[cheap guard only]",
+                                 "cheap guard flagged risk but judge did not run — investigate"),
+            "bypassed":         (":gray[bypassed]",
+                                 "no plan, no judge — task deemed low-risk"),
+        }.get(gate, (f":gray[{gate}]", ""))
+        st.markdown(f"**Verification Gate:** {badge[0]}")
+        if badge[1]:
+            st.caption(badge[1])
+        # small extras if the cache hit or judge attempted repair
+        extras = []
+        if audit.get("plan_cache_hit"):
+            extras.append("plan cache hit")
+        if audit.get("plan_source") == "llm":
+            extras.append("plan from LLM")
+        if audit.get("judge_attempts"):
+            extras.append(f"judge attempts: {audit['judge_attempts']}")
+        if audit.get("judge_repaired_code"):
+            extras.append("judge repaired code")
+        if extras:
+            st.caption(" · ".join(extras))
     st.subheader("Answer")
     frame = _answer_frame(trace.get("answer"))
     if frame is None:

@@ -1240,10 +1240,15 @@ class SemanticConsistencyPipeline:
             failure_types = [str(x) for x in (judge.get("failure_types") or [])]
             if "zero_rows" in failure_types:
                 zero_row_probe_required = True
+            raw_confidence = judge.get("confidence", 0.0)
+            _CONFIDENCE_MAP = {"high": 0.95, "medium": 0.6, "low": 0.3}
+            if isinstance(raw_confidence, str):
+                raw_confidence = _CONFIDENCE_MAP.get(raw_confidence.lower().strip(), 0.0)
             try:
-                confidence = float(judge.get("confidence", 0.0))
+                confidence = float(raw_confidence)
             except (TypeError, ValueError):
                 confidence = 0.0
+
 
             if verdict == "pass" and confidence >= 0.55:
                 trace.final_verdict = "pass"

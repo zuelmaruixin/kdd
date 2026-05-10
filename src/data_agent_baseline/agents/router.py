@@ -401,6 +401,7 @@ def _route_for_execution_profile(
         context_size == "small"
         and verifiability == "programmatic"
         and low_complexity
+        and compiled.file_count <= 2 
     ):
         candidate = _first_route_named(router, ("easy",), visited=visited)
         if candidate is not None:

@@ -1,0 +1,13 @@
+arm,task_id,difficulty,succeeded,score,recall,llm_calls,tool_calls,guard_escalated,cascade,route,elapsed_s,failure_reason
+A_codegen_only,task_11,easy,True,1.0,1.0,2,1,False,1,tool_first_mixed,40.2,
+A_codegen_only,task_19,easy,True,1.0,1.0,1,1,False,1,easy,15.99,
+A_codegen_only,task_22,easy,True,1.0,1.0,1,1,False,1,easy,21.83,
+A_codegen_only,task_24,easy,True,1.0,1.0,1,1,False,1,easy,50.15,
+A_codegen_only,task_25,easy,True,1.0,1.0,1,1,False,1,easy,69.44,
+A_codegen_only,task_26,easy,True,1.0,1.0,1,1,False,1,easy,71.82,
+A_codegen_only,task_145,medium,True,1.0,1.0,1,1,False,1,easy,16.96,
+A_codegen_only,task_163,medium,True,0.0,0.0,2,3,False,1,easy,67.18,
+A_codegen_only,task_169,medium,True,0.0,0.0,1,1,False,1,easy,69.89,
+A_codegen_only,task_173,medium,False,0.0,0.0,1,2,False,1,easy,23.12,invalid_answer: Answer has zero rows.
+A_codegen_only,task_330,hard,False,0.0,0.0,0,0,,0,,360.02,per_task_timeout_exceeded:360s
+A_codegen_only,task_344,hard,False,0.0,0.0,0,0,,0,,360.01,per_task_timeout_exceeded:360s
