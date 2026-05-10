@@ -90,6 +90,57 @@ def repair_python_syntax(
     )
 
 
+def repair_dunder_file_usage(
+    *,
+    program: str,
+    issues: list[StaticIssue],
+    compiled: CompiledTask,
+) -> LocalRepairOutcome | None:
+    """Strip ``__file__`` usage (undefined inside our exec() sandbox).
+
+    The operator LLM sometimes copies "run as a script" boilerplate like
+    ``os.chdir(os.path.dirname(os.path.abspath(__file__)))`` into the
+    generated program. Inside our exec() sandbox there is no ``__file__``,
+    so the program dies with ``NameError: name '__file__' is not defined``
+    before any task logic runs. This is a deterministic transformation:
+
+      * drop the chdir-to-script-dir line entirely (best-effort; whatever
+        working directory exec() runs in is already correct for us)
+      * replace any remaining bare ``__file__`` with ``'.'`` so patterns
+        like ``open(os.path.join(os.path.dirname(__file__), 'data.csv'))``
+        resolve to the current working directory.
+    """
+    if not any(it.code == "dunder_file_undefined" for it in issues):
+        return None
+
+    chdir_re = re.compile(
+        r"os\.chdir\(os\.path\.dirname\(os\.path\.abspath\(__file__\)\)\).*"
+    )
+    bare_re = re.compile(r"\b__file__\b")
+
+    patched, chdir_hits = chdir_re.subn("", program)
+    patched, bare_hits = bare_re.subn("'.'", patched)
+
+    if chdir_hits == 0 and bare_hits == 0:
+        return None
+    try:
+        ast.parse(patched)
+    except SyntaxError:
+        return None
+
+    notes: list[str] = []
+    if chdir_hits:
+        notes.append(f"removed {chdir_hits} os.chdir(..., __file__) line(s)")
+    if bare_hits:
+        notes.append(f"replaced {bare_hits} bare __file__ occurrence(s) with '.'")
+    return LocalRepairOutcome(
+        succeeded=True,
+        patched_program=patched,
+        action="strip_dunder_file_usage",
+        notes=notes,
+    )
+
+
 def _comment_out_lines(program: str, *, line_numbers: set[int]) -> str:
     """Comment out the specified 1-indexed source lines."""
     if not line_numbers:
@@ -299,6 +350,16 @@ _MERGE_DTYPE_RE = re.compile(
     r"merge on .* columns for key ['\"]([^'\"]+)['\"]",
     re.IGNORECASE,
 )
+# The generated program sometimes prefixes its body with
+# ``os.chdir(os.path.dirname(os.path.abspath(__file__)))`` or refers to
+# ``__file__`` when opening local paths. That's copy-paste from "run this
+# file as a script" templates; inside our exec() sandbox __file__ does
+# not exist, so the program dies with NameError before any task logic
+# runs. Detect the exec error deterministically and strip the pattern.
+_NAME_DUNDER_FILE_RE = re.compile(
+    r"NameError:\s*name ['\"]__file__['\"] is not defined",
+    re.IGNORECASE,
+)
 
 
 def issues_from_exec_error(error_text: str) -> list[StaticIssue]:
@@ -315,6 +376,17 @@ def issues_from_exec_error(error_text: str) -> list[StaticIssue]:
             severity="error",
             message="Operator program did not define an `answer` variable.",
             repair_hint="append `answer = <final_dataframe_or_scalar>`",
+        ))
+
+    if _NAME_DUNDER_FILE_RE.search(error_text):
+        issues.append(StaticIssue(
+            code="dunder_file_undefined",
+            severity="error",
+            message="program references __file__, which is undefined inside exec()",
+            repair_hint=(
+                "drop any `os.chdir(os.path.dirname(os.path.abspath(__file__)))` "
+                "line and replace bare __file__ with '.'"
+            ),
         ))
 
     if match := _MERGE_DTYPE_RE.search(error_text):
@@ -927,6 +999,7 @@ def try_program_repair(
     _ = semantic_plan
     for fixer in (
         repair_python_syntax,
+        repair_dunder_file_usage,
         repair_missing_answer_assignment,
         repair_json_records_read_with_pandas,
         repair_no_such_table,
