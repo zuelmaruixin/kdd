@@ -50,6 +50,12 @@ class OperatorExecutor:
     # helpers like _should_preextract_record_text() can check the
     # question without threading it through every call.
     _last_question_cache: str = ""
+    # Cached verdict from the record_text query_type classifier for the
+    # current task. Computed once at the start of run() (the classifier
+    # itself is disk-cached on ``(question_hash, model_id)``, but we
+    # additionally avoid repeat trips through the classifier within one
+    # task so trace.json keeps a single, clear verdict block).
+    _query_type_verdict: Any = None
 
     def run(self, task: PublicTask) -> CodegenRunResult:
         """Execute the tool-first pipeline.
@@ -66,6 +72,16 @@ class OperatorExecutor:
         # Cache the question so record_text routing helpers (which don't take
         # a task arg) can still consult the query_type classifier.
         self._last_question_cache = task.question
+        # Pre-compute the record_text query_type verdict once per task —
+        # but only if this task actually ships record_text files, so that
+        # tasks with plain CSV/DB sources don't pay for a classifier LLM
+        # call they won't use. The classifier itself is disk-cached on
+        # (question_hash, model_id), budget-accounted via model.complete(),
+        # and falls back to the keyword classifier on LLM error.
+        if self._has_record_text_docs():
+            self._query_type_verdict = self._classify_query_type(task.question)
+        else:
+            self._query_type_verdict = None
         ctx = ExecutionContext(self.compiled_task)
 
         sc_pipeline = SemanticConsistencyPipeline(
@@ -119,6 +135,16 @@ class OperatorExecutor:
                 "semantic_plan": semantic_plan,
             }]
 
+        # Stamp the record_text query_type verdict onto the manifest so
+        # trace.json always records how the branch was chosen — even when
+        # the structured-doc synthesis stage is skipped (e.g. aggregate
+        # questions that succeed on the first codegen pass, or read
+        # questions where we never synthesize a CSV).
+        if self._query_type_verdict is not None:
+            result.manifest = list(result.manifest or []) + [{
+                "record_text_query_type": self._query_type_verdict.to_dict(),
+            }]
+
         # --- Phase 3a: deterministic local repair ---
         result, repair_log = coordinator.local_repair_loop(
             task, result, semantic_plan=semantic_plan
@@ -131,14 +157,12 @@ class OperatorExecutor:
         # Skip entirely if the query_type classifier said this is a
         # reading-comprehension question -- synthesizing a table would
         # drop the narrative context the question depends on.
-        from data_agent_baseline.agents.structured_doc_executor import (
-            classify_record_text_query,
-        )
         needs_synth_fallback = (
             not result.succeeded
             and self._has_record_text_docs()
             and not self._should_preextract_record_text()
-            and classify_record_text_query(task.question) != "read"
+            and self._query_type_verdict is not None
+            and self._query_type_verdict.verdict != "read"
         )
         if needs_synth_fallback:
             try:
@@ -222,10 +246,36 @@ class OperatorExecutor:
         # questions do not benefit from CSV synthesis (it drops narrative
         # context). Let those fall through to the raw-codegen path; the
         # operator prompt will then see the record_text files directly.
+        verdict = self._query_type_verdict
+        if verdict is None:
+            # Classifier hasn't run yet (e.g. called before run()); fall
+            # back to the keyword path so we never raise here.
+            verdict = self._classify_query_type(self._last_question_cache)
+            self._query_type_verdict = verdict
+        return verdict.verdict != "read"
+
+    # ------------------------------------------------------------------
+    # record_text query_type classifier
+    # ------------------------------------------------------------------
+
+    def _query_type_cache_dir(self) -> Any:
+        """Resolve the on-disk cache dir for the query_type classifier."""
+        try:
+            from data_agent_baseline.config import PROJECT_ROOT
+        except Exception:  # noqa: BLE001
+            return None
+        return PROJECT_ROOT / "artifacts" / "cache" / "record_text_query_type"
+
+    def _classify_query_type(self, question: str) -> Any:
+        """Return the cached ``RecordTextQueryTypeVerdict`` for this task."""
         from data_agent_baseline.agents.structured_doc_executor import (
-            classify_record_text_query,
+            classify_record_text_query_verdict,
         )
-        return classify_record_text_query(self._last_question_cache) != "read"
+        return classify_record_text_query_verdict(
+            question,
+            model=self.model,
+            cache_dir=self._query_type_cache_dir(),
+        )
 
     def _cheap_semantic_assessment(
         self,
@@ -308,6 +358,7 @@ class OperatorExecutor:
             model=self.model,
             compiled_task=self.compiled_task,
             cache_dir=cache_dir,
+            query_type_cache_dir=self._query_type_cache_dir(),
         )
         extraction = extractor.run(task)
         if not extraction.synthesized_csvs:
