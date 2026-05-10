@@ -264,13 +264,15 @@ def _run_task_with_timeout(
 
     ctx = mp.get_context("spawn")
     queue: mp.Queue = ctx.Queue(maxsize=1)
+    # NOTE: must NOT be daemonic -- run_single_task internally spawns
+    # subprocesses for python_exec, and daemonic processes are not allowed
+    # to have children.
     proc = ctx.Process(
         target=_run_single_task_worker,
         args=(
             task_id, config_path, str(run_output_dir),
             semantic_enabled, max_repairs, run_id, queue,
         ),
-        daemon=True,
     )
     proc.start()
     proc.join(timeout)
