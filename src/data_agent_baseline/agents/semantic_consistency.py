@@ -940,6 +940,12 @@ class SemanticConsistencyPipeline:
         self.enabled = enabled
         self.max_repairs = max_repairs
         self.last_plan_failure: dict[str, Any] | None = None
+        # "llm" when the most recent plan() call hit the analyst, "cache"
+        # when it was served from the on-disk plan cache, "" when plan()
+        # did not run or was skipped. Consumed by OperatorExecutor's
+        # manifest and the router's semantic_consistency_audit so the
+        # cost path is visible in trace.json.
+        self.last_plan_source: str = ""
 
     # ------------------------------------------------------------------
     # Phase 1: semantic planning (no code)
@@ -948,6 +954,7 @@ class SemanticConsistencyPipeline:
     def plan(self, task: PublicTask, *, force: bool = False) -> dict[str, Any] | None:
         """Run the semantic analyst.  Returns plan dict, or None if skipped/failed."""
         self.last_plan_failure = None
+        self.last_plan_source = ""
         if not self.enabled:
             self.last_plan_failure = {"stage": "disabled", "force": force}
             return None
@@ -1001,12 +1008,7 @@ class SemanticConsistencyPipeline:
             }
             return None
         try:
-            plan = run_semantic_analyst(
-                task=task,
-                model=self.model,
-                compiled_task=compiled,
-                schema_diagnostics=self.context.schema_diagnostics,
-            )
+            plan = self._plan_with_cache(task=task, compiled=compiled)
         except BudgetExceeded:
             self.last_plan_failure = {
                 "stage": "budget_exceeded",
@@ -1050,6 +1052,68 @@ class SemanticConsistencyPipeline:
             pass
 
         return effective_plan
+
+    # ------------------------------------------------------------------
+    # Phase 1 helper: on-disk cache for the analyst call
+    # ------------------------------------------------------------------
+
+    def _plan_with_cache(
+        self,
+        *,
+        task: PublicTask,
+        compiled: CompiledTask,
+    ) -> dict[str, Any]:
+        """Read analyst plan from disk cache, or call the analyst and cache.
+
+        Cache invalidation is automatic: the key mixes model id, task id,
+        the question text, and a fingerprint of the source capabilities.
+        Any of: changing the model, rewording the question, or adding /
+        removing a context file (including the synthesized CSVs written
+        by the record_text extractor) produces a fresh key and a fresh
+        analyst call. The cached payload is the RAW analyst plan before
+        rule resolution, so knowledge.md re-reads still happen every run
+        and a stale plan can never leak into _apply_rule_resolution.
+
+        On any read error the cache is silently bypassed; on any write
+        error we log-and-ignore. The analyst call itself is the source
+        of truth — the cache is an accelerator, not a dependency.
+        """
+        from data_agent_baseline.agents.semantic_plan_cache import (
+            PlanCacheKeyInputs,
+            build_source_fingerprint,
+            cache_read,
+            cache_write,
+            compute_plan_cache_key,
+            default_cache_dir,
+        )
+
+        cache_dir = default_cache_dir()
+        model_id = getattr(self.model, "model", "") or ""
+        key_inputs = PlanCacheKeyInputs(
+            model_id=model_id,
+            task_id=task.task_id,
+            question=task.question or "",
+            source_fingerprint=build_source_fingerprint(compiled.source_capabilities),
+        )
+        key = compute_plan_cache_key(key_inputs)
+        cached = cache_read(cache_dir, key)
+        if cached is not None:
+            self.last_plan_source = "cache"
+            return cached
+
+        plan = run_semantic_analyst(
+            task=task,
+            model=self.model,
+            compiled_task=compiled,
+            schema_diagnostics=self.context.schema_diagnostics,
+        )
+        self.last_plan_source = "llm"
+        cache_write(cache_dir, key, plan=plan)
+        return plan
+
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Phase 2: consistency judge + bounded semantic repair

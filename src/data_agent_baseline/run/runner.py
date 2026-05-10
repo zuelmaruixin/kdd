@@ -56,6 +56,7 @@ from typing import Any
 #                                analyst_exception_fallback_used,
 #                                lazy_escalation_plan_built,
 #                                fallback_plan_from_cheap_guard,
+#                                plan_source, plan_cache_hit,
 #                                judge_ran, judge_attempts,
 #                                judge_final_verdict, judge_repaired_code,
 #                                final_gate }

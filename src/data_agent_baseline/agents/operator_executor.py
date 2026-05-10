@@ -149,6 +149,7 @@ class OperatorExecutor:
         if semantic_plan is not None:
             result.manifest = list(result.manifest or []) + [{
                 "semantic_consistency": "enabled",
+                "plan_source": sc_pipeline.last_plan_source or "llm",
                 "semantic_plan": semantic_plan,
             }]
 
@@ -219,6 +220,7 @@ class OperatorExecutor:
                 semantic_plan = retry_plan
                 result.manifest = list(result.manifest or []) + [{
                     "semantic_consistency": "analyst_exception_retry_succeeded",
+                    "plan_source": sc_pipeline.last_plan_source or "llm",
                     "original_plan_failure": original_plan_failure,
                     "semantic_plan": semantic_plan,
                 }]
@@ -275,6 +277,7 @@ class OperatorExecutor:
             if semantic_plan is not None:
                 result.manifest = list(result.manifest or []) + [{
                     "semantic_consistency": "lazy_escalation",
+                    "plan_source": sc_pipeline.last_plan_source or "llm",
                     "semantic_plan": semantic_plan,
                 }]
             else:

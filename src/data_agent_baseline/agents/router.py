@@ -896,6 +896,7 @@ def _build_semantic_consistency_audit(manifest: list[Any] | None) -> dict[str, A
     analyst_exception_fallback_used = False
     lazy_escalation_plan_built = False
     fallback_plan_from_cheap_guard = False
+    plan_source: str | None = None
     judge_attempts = 0
     judge_repaired_code = False
     judge_final_verdict: str | None = None
@@ -903,6 +904,15 @@ def _build_semantic_consistency_audit(manifest: list[Any] | None) -> dict[str, A
     for entry in (manifest or []):
         if not isinstance(entry, dict):
             continue
+
+        # Capture the plan-cache accelerator status. Written by every
+        # branch of OperatorExecutor that attaches a semantic_plan; the
+        # last one wins, which correctly reflects the plan that judge
+        # actually ran against.
+        if "plan_source" in entry:
+            ps = entry.get("plan_source")
+            if isinstance(ps, str) and ps:
+                plan_source = ps
 
         sc_entry = entry.get("semantic_consistency")
         if isinstance(sc_entry, str):
@@ -968,6 +978,8 @@ def _build_semantic_consistency_audit(manifest: list[Any] | None) -> dict[str, A
         "analyst_exception_fallback_used": analyst_exception_fallback_used,
         "lazy_escalation_plan_built": lazy_escalation_plan_built,
         "fallback_plan_from_cheap_guard": fallback_plan_from_cheap_guard,
+        "plan_source": plan_source,
+        "plan_cache_hit": plan_source == "cache",
         "judge_ran": judge_ran,
         "judge_attempts": judge_attempts,
         "judge_final_verdict": judge_final_verdict,
