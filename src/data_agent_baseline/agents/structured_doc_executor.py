@@ -307,9 +307,21 @@ def _match_entity_schema(
 def _describe_schema_fields(
     fields: list[dict[str, str]],
     *,
-    max_desc_chars: int = 120,
+    max_desc_chars: int = 160,
 ) -> list[str]:
-    """Render parsed field dicts as human-readable hints for the prompt."""
+    """Render parsed field dicts as human-readable hints for the prompt.
+
+    Descriptions are passed through as-is (only length-capped). The
+    extractor LLM *should* see the full column semantics from
+    ``knowledge.md`` — including phrases like ``"abnormal if >= 1.5"`` —
+    because that context helps it decide e.g. that ``cre`` is a numeric
+    literal to copy, not a string. The safety guarantee that the
+    extractor doesn't then *apply* those rules lives in the system
+    prompt ("copy values literally; do NOT evaluate any rule..."), not
+    in upstream redaction — reasoning-model output is far too varied
+    for regex-level sanitization to reliably remove a rule clause
+    without also deleting useful column semantics.
+    """
     lines: list[str] = []
     for f in fields:
         name = f["name"]
@@ -382,8 +394,15 @@ _SYSTEM_PROMPT = (
     "mentioned in the chunk, output ONE JSON object with exactly the "
     "fields requested. Use null for fields not present in this chunk. "
     "When both an original and a corrected value are mentioned for the "
-    "same field, keep the corrected one. Output STRICT JSON: a single "
-    "top-level array; no prose."
+    "same field, keep the corrected one.\n\n"
+    "CRITICAL: copy values literally. Do NOT evaluate any rule, "
+    "threshold, formula, or condition (e.g. 'abnormal if >= 1.5', "
+    "'legal if status=Legal'). Do NOT filter records based on such "
+    "rules, do NOT add derived/computed fields (like `is_abnormal`), "
+    "and do NOT omit records that appear to 'fail' any condition. "
+    "Emit one JSON object per record mentioned, using only the field "
+    "names requested, with the verbatim value from the chunk or null.\n\n"
+    "Output STRICT JSON: a single top-level array; no prose."
 )
 
 
@@ -395,11 +414,21 @@ def _build_user_prompt(
     semantic_context: str,
     schema_field_details: list[dict[str, str]] | None = None,
 ) -> str:
-    # Prefer an explicit, type-annotated field list when we parsed one
-    # out of the semantic-rule document. This stops the LLM from spending
-    # tokens guessing whether ``date`` means birthday vs record-creation
-    # date (a failure mode observed when the schema fell back to the
-    # generic id/name/date/value template).
+    # We deliberately pass the semantic-rule document ("knowledge.md") to
+    # the extractor so it has enough context to recognize each column's
+    # semantics (e.g. that ``date`` values are YYYY-MM-DD, that ``cre``
+    # is a numeric literal, etc.). Truncating to the first 4000 chars
+    # keeps the prompt bounded; this is the same budget the earlier
+    # pipeline used and it was sufficient for the project's knowledge
+    # files.
+    #
+    # The system prompt carries the behavioral guardrail — "copy values
+    # literally, do NOT evaluate thresholds/rules/formulas" — so the
+    # extractor can read rule clauses without applying them. We
+    # intentionally do NOT upstream-redact rule phrases out of the
+    # context: reasoning models produce too much variation in how they
+    # describe a field, and over-aggressive regex redaction routinely
+    # deletes useful column semantics along with the rule.
     if schema_field_details:
         schema_block = "\n".join(_describe_schema_fields(schema_field_details))
     else:
@@ -408,11 +437,11 @@ def _build_user_prompt(
     return (
         "Original question (for context only; do not answer it here):\n"
         + question
-        + "\n\nSemantic/context guide from knowledge files:\n"
+        + "\n\nSemantic/context guide from knowledge files (use for column "
+        "semantics only; do NOT apply any rule or threshold stated here):\n"
         + (semantic_context[:4000] if semantic_context.strip() else "(none)")
-        + "\n\n"
-        "Schema fields (each output object must contain ALL of these keys "
-        "by their short name, with null where missing):\n"
+        + "\n\nSchema fields (each output object must contain ALL of these "
+        "keys by their short name, with null where missing):\n"
         + schema_block
         + "\n\nChunk:\n"
         + chunk
