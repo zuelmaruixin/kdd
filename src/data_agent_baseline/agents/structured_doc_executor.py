@@ -226,8 +226,13 @@ _ENTITY_HEADING_RE = re.compile(r"^#{1,6}\s+([A-Za-z][A-Za-z0-9 _-]*)\s*$")
 #   - **ID (integer):** desc                  (type + colon inside bold)
 #   - **Name (string)**: desc                 (type inside bold, colon outside)
 #   - **Format** (text): desc                 (type outside bold)
+# Supports three common markdown shapes, and ONLY at top indentation
+# (0-3 leading spaces). Nested bullets like "  - **formula:** ..."
+# under a KPI item must NOT be matched as a field of the containing
+# entity -- that was the root cause of Laboratory.md's schema getting
+# polluted with formula/description entries copied from KPI blocks.
 _FIELD_LINE_RE = re.compile(
-    r"^\s*[-*]\s*"
+    r"^[ \t]{0,3}[-*]\s+"
     r"\*\*\s*(?P<name>[^*(]+?)\s*"
     r"(?:\((?P<type1>[^)]+)\))?\s*"
     r":?\s*\*\*"
@@ -424,15 +429,32 @@ def _guess_schema(
     ``parsed_field_details`` is non-None only when strategy 1 fires; the
     extractor uses it to build a richer prompt (with type + description
     per field) so the LLM does not waste tokens guessing semantics.
+
+    Belt-and-suspenders: even if ``_parse_entity_schemas`` is somehow
+    fooled by a novel ``knowledge.md`` shape and returns a schema with
+    duplicate field names or an implausibly large field count, we
+    refuse to ship it to the extractor. Observed the extractor
+    receiving a 13-field Laboratory schema that interleaved real
+    columns with KPI ``formula``/``description`` entries; the model
+    then spent ~2k tokens reasoning about duplicate JSON keys before
+    emitting per-record nulls for every KPI field. We fall back to the
+    profiler's observed fields instead — it's narrower than the ideal
+    entity schema but never poisons the prompt.
     """
     entity_schemas = _parse_entity_schemas(semantic_context) if semantic_context else {}
     entity_fields = _match_entity_schema(cap, entity_schemas)
     if entity_fields:
-        return (
-            [f["name"] for f in entity_fields],
-            entity_fields,
-            "semantic_rule_entity",
-        )
+        names = [f["name"] for f in entity_fields]
+        # Hard sanity checks before we trust a parsed entity schema:
+        #  * duplicate field names are impossible in strict JSON, and
+        #    always signal a KPI-style block that slipped past the
+        #    heuristic filters.
+        #  * more than ~12 fields on a per-record entity is unheard-of
+        #    in this benchmark; the only way we get there is by
+        #    absorbing a neighbouring metric block.
+        if len(set(names)) == len(names) and len(names) <= 12:
+            return (names, entity_fields, "semantic_rule_entity")
+        # Otherwise: reject and fall through to the profiler schema.
 
     profiler_fields: list[str] = list(cap.structured_record_fields or [])
     if profiler_fields:
