@@ -221,7 +221,13 @@ def _looks_like_record_text(path: Path) -> bool:
         r"\b[A-Z][a-z]+\s+\d{1,2}(?:st|nd|rd|th)?",
         text,
     ))
-    numeric_hits = len(re.findall(r"\b\d+(?:\.\d+)?\s*(?:U/L|mg/dL|mmol/L)?\b", text))
+    # Count numeric literals, optionally with a short alphabetic unit suffix
+    # such as "kg", "m/s", "U/L". Kept domain-agnostic — we only care about
+    # how dense numeric content is, not what the unit actually means.
+    numeric_hits = len(re.findall(
+        r"\b\d+(?:\.\d+)?\s*(?:[A-Za-z]{1,4}(?:/[A-Za-z]{1,4})?)?\b",
+        text,
+    ))
     if record_hits >= 5 and field_hits >= 8:
         return True
     if record_hits >= 3 and field_hits >= 5 and (date_hits + numeric_hits) >= 20:
