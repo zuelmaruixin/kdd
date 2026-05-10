@@ -246,9 +246,23 @@ def _parse_entity_schemas(semantic_context: str) -> dict[str, list[dict[str, str
     """Parse `### Entity / - **Field (type):** desc` blocks out of semantic rules.
 
     Returns ``{entity_lower: [{"name": snake_case, "type": str, "desc": str,
-    "original_name": str}, ...]}``. Silent on malformed input — the caller
-    falls back to the generic schema if nothing is found for the target
-    entity, so an over-eager parser is safe.
+    "original_name": str}, ...]}``.
+
+    Defensive filtering: ``knowledge.md`` typically carries entity
+    sections (``### Patient``, ``### Laboratory``) next to KPI / metric
+    sections (``### KPIs``) whose bullets look almost identical but are
+    structured around repeated ``formula`` / ``description`` children.
+    We reject sections that look KPI-shaped — specifically, any section
+    whose fields include duplicated generic keys like ``formula`` or
+    ``description``, or whose only field is one of those. If we kept
+    them, the extractor prompt would get a schema that mixes table
+    columns with KPI metadata, which has been observed to derail a
+    reasoning model for ~2k tokens before it gives up and emits
+    per-record nulls for every metric field. Better to drop the
+    ambiguous section and fall through to the profiler's fields.
+
+    Silent on malformed input — the caller falls back to the profiler
+    schema (or a generic one) if nothing is found for the target entity.
     """
     entities: dict[str, list[dict[str, str]]] = {}
     current: str | None = None
@@ -272,7 +286,54 @@ def _parse_entity_schemas(semantic_context: str) -> dict[str, list[dict[str, str
                 "desc": field_match.group("desc").strip(),
                 "original_name": original,
             })
-    return {k: v for k, v in entities.items() if v}
+
+    cleaned: dict[str, list[dict[str, str]]] = {}
+    for entity, fields in entities.items():
+        if not fields:
+            continue
+        names = [f["name"] for f in fields]
+        if _looks_like_kpi_section(entity, names):
+            # Likely a KPI / metric definition block, not a data entity.
+            continue
+        if len(set(names)) != len(names):
+            # Duplicate field names can't round-trip through JSON and are
+            # almost always a sign the section mixes fields from multiple
+            # sub-metrics. Drop it.
+            continue
+        cleaned[entity] = fields
+    return cleaned
+
+
+# Generic metadata field names that appear inside KPI / metric blocks.
+# A section whose fields are dominated by these is not a record-text
+# entity schema — it's a metric definition block and must not be used
+# as the extraction target.
+_KPI_META_FIELDS = frozenset({"formula", "description", "numerator", "denominator"})
+# Section headings that are never per-record entities even if the
+# parser happens to pick up bullets below them.
+_NON_ENTITY_HEADINGS = frozenset({
+    "kpis", "metrics", "metric definitions", "kpi", "queries",
+    "analyses", "aggregates", "overview", "notes", "conventions",
+    "guidance", "date formats", "how to use",
+})
+
+
+def _looks_like_kpi_section(entity: str, field_names: list[str]) -> bool:
+    """True if an entity section smells like a KPI/metric definition block."""
+    if entity.lower() in _NON_ENTITY_HEADINGS:
+        return True
+    if not field_names:
+        return False
+    meta_hits = sum(1 for n in field_names if n in _KPI_META_FIELDS)
+    # Any duplicate meta field (the classic 'formula, description,
+    # formula, description' KPI shape) is a strong signal.
+    seen: set[str] = set()
+    for n in field_names:
+        if n in _KPI_META_FIELDS and n in seen:
+            return True
+        seen.add(n)
+    # If the section's fields are entirely meta, it isn't an entity.
+    return meta_hits == len(field_names)
 
 
 def _entity_for_record_text(cap: SourceCapability) -> str:
@@ -287,19 +348,25 @@ def _match_entity_schema(
     cap: SourceCapability,
     entity_schemas: dict[str, list[dict[str, str]]],
 ) -> list[dict[str, str]] | None:
-    """Find the entity block whose name best matches this file.
+    """Find the entity block whose name exactly matches this file.
 
-    First try exact stem match; fall back to "starts-with" so ``Patient.md``
-    matches a ``### Patients`` or ``### Patient_Profile`` heading.
+    Only two forms of equivalence are allowed: exact match, or
+    singular↔plural via a single trailing ``s``. We deliberately do
+    NOT do a "starts-with" fallback any more — it was observed to match
+    ``Laboratory.md`` against a ``### Laboratory KPIs`` section, which
+    then poisoned the extractor's schema with KPI metadata fields.
     """
     if not entity_schemas:
         return None
     target = _entity_for_record_text(cap)
     if target in entity_schemas:
         return entity_schemas[target]
+    # Singular/plural tolerance only.
+    target_plural = target + "s"
+    if target_plural in entity_schemas:
+        return entity_schemas[target_plural]
     for entity, fields in entity_schemas.items():
-        base = entity.rstrip("s")
-        if base == target or entity.startswith(target) or target.startswith(base):
+        if entity.rstrip("s") == target:
             return fields
     return None
 
