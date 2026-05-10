@@ -200,20 +200,165 @@ def _select_relevant_chunks(
 _GENERIC_DEFAULT_FIELDS = ["id", "name", "date", "value"]
 
 
-def _guess_schema(cap: SourceCapability, *, question: str = "") -> list[str]:
+# ---------------------------------------------------------------------------
+# Schema inference from semantic-rule documents
+# ---------------------------------------------------------------------------
+#
+# ``knowledge.md`` in this benchmark follows a near-regular shape:
+#
+#     ### <EntityName>
+#     - **<FieldName> (<type>):** <description>
+#     - **<FieldName> (<type>):** <description>
+#
+# When the profiler only sees "ID N" patterns in the record_text file (it
+# hard-codes a few common id nouns) it reports ``structured_record_fields =
+# ["patient_id"]``, which is both too narrow (we lose Sex/Birthday) and
+# misleading for the extractor LLM. If the task carries a semantic-rule
+# document that describes the same entity, parsing the schema out of it
+# produces a far better extraction target than any generic fallback.
+#
+# Matching an entity heading to a record_text file is a simple string
+# overlap on the stem: ``doc/Patient.md`` → heading ``### Patient``.
+
+
+_ENTITY_HEADING_RE = re.compile(r"^#{1,6}\s+([A-Za-z][A-Za-z0-9 _-]*)\s*$")
+# Supports three common markdown shapes:
+#   - **ID (integer):** desc                  (type + colon inside bold)
+#   - **Name (string)**: desc                 (type inside bold, colon outside)
+#   - **Format** (text): desc                 (type outside bold)
+_FIELD_LINE_RE = re.compile(
+    r"^\s*[-*]\s*"
+    r"\*\*\s*(?P<name>[^*(]+?)\s*"
+    r"(?:\((?P<type1>[^)]+)\))?\s*"
+    r":?\s*\*\*"
+    r"\s*(?:\((?P<type2>[^)]+)\))?"
+    r"\s*:?\s*(?P<desc>.*)$"
+)
+
+
+def _normalize_field_name(raw: str) -> str:
+    """Convert 'First Date' / 'Medical Record Number' → snake_case."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", raw.strip()).strip("_").lower()
+    return cleaned or raw.strip()
+
+
+def _parse_entity_schemas(semantic_context: str) -> dict[str, list[dict[str, str]]]:
+    """Parse `### Entity / - **Field (type):** desc` blocks out of semantic rules.
+
+    Returns ``{entity_lower: [{"name": snake_case, "type": str, "desc": str,
+    "original_name": str}, ...]}``. Silent on malformed input — the caller
+    falls back to the generic schema if nothing is found for the target
+    entity, so an over-eager parser is safe.
+    """
+    entities: dict[str, list[dict[str, str]]] = {}
+    current: str | None = None
+    for raw_line in semantic_context.splitlines():
+        if heading := _ENTITY_HEADING_RE.match(raw_line):
+            name = heading.group(1).strip()
+            # Skip meta headings like "# Entities" or "## Guidance" — those
+            # usually don't have field bullets directly below.
+            current = name.lower() if name else None
+            if current and current not in entities:
+                entities[current] = []
+            continue
+        if not current:
+            continue
+        if field_match := _FIELD_LINE_RE.match(raw_line):
+            original = field_match.group("name").strip()
+            ftype = (field_match.group("type1") or field_match.group("type2") or "").strip().lower()
+            entities[current].append({
+                "name": _normalize_field_name(original),
+                "type": ftype,
+                "desc": field_match.group("desc").strip(),
+                "original_name": original,
+            })
+    return {k: v for k, v in entities.items() if v}
+
+
+def _entity_for_record_text(cap: SourceCapability) -> str:
+    """Derive a probable entity name from the record_text file path."""
+    stem = Path(cap.path).stem
+    # "Patient" / "patient_profiles" / "patients-data" → "patient"
+    head = re.split(r"[_\-.\s]", stem, maxsplit=1)[0]
+    return head.lower().rstrip("s")  # simple plural strip
+
+
+def _match_entity_schema(
+    cap: SourceCapability,
+    entity_schemas: dict[str, list[dict[str, str]]],
+) -> list[dict[str, str]] | None:
+    """Find the entity block whose name best matches this file.
+
+    First try exact stem match; fall back to "starts-with" so ``Patient.md``
+    matches a ``### Patients`` or ``### Patient_Profile`` heading.
+    """
+    if not entity_schemas:
+        return None
+    target = _entity_for_record_text(cap)
+    if target in entity_schemas:
+        return entity_schemas[target]
+    for entity, fields in entity_schemas.items():
+        base = entity.rstrip("s")
+        if base == target or entity.startswith(target) or target.startswith(base):
+            return fields
+    return None
+
+
+def _describe_schema_fields(
+    fields: list[dict[str, str]],
+    *,
+    max_desc_chars: int = 120,
+) -> list[str]:
+    """Render parsed field dicts as human-readable hints for the prompt."""
+    lines: list[str] = []
+    for f in fields:
+        name = f["name"]
+        ftype = f.get("type") or ""
+        desc = (f.get("desc") or "").strip()
+        if len(desc) > max_desc_chars:
+            desc = desc[: max_desc_chars - 1] + "…"
+        suffix = f" — {desc}" if desc else ""
+        lines.append(f"- {name} ({ftype}){suffix}")
+    return lines
+
+
+def _guess_schema(
+    cap: SourceCapability,
+    *,
+    question: str = "",
+    semantic_context: str = "",
+) -> tuple[list[str], list[dict[str, str]] | None, str]:
     """Choose a target schema for a record_text file.
 
-    Strategy, in order:
-      1. Use fields the deterministic profiler already collected from the
-         file's own "key: value" lines.
-      2. Otherwise fall back to a very small generic schema.
+    Returns ``(schema_field_names, parsed_field_details, source)``.
 
-    No hard-coded topic-based lists.
+    Strategy, in order of preference:
+      1. Match an entity section in ``knowledge.md`` / semantic-rule docs
+         (e.g. ``### Patient`` with ``- **ID (integer):**`` lines) — this
+         gives the LLM real column semantics instead of the profiler's
+         narrow ``["patient_id"]`` view or a generic ``id/name/date/value``
+         template that invites hallucination.
+      2. Fall back to whatever fields the deterministic profiler already
+         observed in "key: value" lines of the file itself.
+      3. Last resort, a minimal generic schema.
+
+    ``parsed_field_details`` is non-None only when strategy 1 fires; the
+    extractor uses it to build a richer prompt (with type + description
+    per field) so the LLM does not waste tokens guessing semantics.
     """
-    fields: list[str] = list(cap.structured_record_fields or [])
-    if fields:
-        return fields
-    return list(_GENERIC_DEFAULT_FIELDS)
+    entity_schemas = _parse_entity_schemas(semantic_context) if semantic_context else {}
+    entity_fields = _match_entity_schema(cap, entity_schemas)
+    if entity_fields:
+        return (
+            [f["name"] for f in entity_fields],
+            entity_fields,
+            "semantic_rule_entity",
+        )
+
+    profiler_fields: list[str] = list(cap.structured_record_fields or [])
+    if profiler_fields:
+        return profiler_fields, None, "profiler"
+    return list(_GENERIC_DEFAULT_FIELDS), None, "generic"
 
 
 def _schema_hash(fields: list[str]) -> str:
@@ -248,20 +393,32 @@ def _build_user_prompt(
     schema_fields: list[str],
     question: str,
     semantic_context: str,
+    schema_field_details: list[dict[str, str]] | None = None,
 ) -> str:
+    # Prefer an explicit, type-annotated field list when we parsed one
+    # out of the semantic-rule document. This stops the LLM from spending
+    # tokens guessing whether ``date`` means birthday vs record-creation
+    # date (a failure mode observed when the schema fell back to the
+    # generic id/name/date/value template).
+    if schema_field_details:
+        schema_block = "\n".join(_describe_schema_fields(schema_field_details))
+    else:
+        schema_block = json.dumps(schema_fields, ensure_ascii=False)
+
     return (
-        "Original question:\n"
+        "Original question (for context only; do not answer it here):\n"
         + question
         + "\n\nSemantic/context guide from knowledge files:\n"
         + (semantic_context[:4000] if semantic_context.strip() else "(none)")
         + "\n\n"
-        "Schema fields (each output object must contain ALL of these keys, "
-        "with null where missing):\n"
-        + json.dumps(schema_fields, ensure_ascii=False)
+        "Schema fields (each output object must contain ALL of these keys "
+        "by their short name, with null where missing):\n"
+        + schema_block
         + "\n\nChunk:\n"
         + chunk
         + "\n\nReturn a JSON array of record objects only. No prose, no "
-        "markdown fencing, no explanations."
+        "markdown fencing, no explanations. Do NOT include any reasoning "
+        "or field-mapping discussion; emit only the JSON array."
     )
 
 
@@ -404,7 +561,11 @@ class StructuredDocExecutor:
     chunk_chars: int = 7000
     cache_dir: Path | None = None
     max_chunks_per_file: int = 8
-    extraction_max_tokens: int = 900
+    # 2500 accommodates ~50 records/chunk even for verbose thinking models
+    # like qwen3 (which can burn 800–1500 tokens on an internal reasoning
+    # pass before emitting JSON). Observed the extractor truncating JSON
+    # mid-array at 900.
+    extraction_max_tokens: int = 2500
     output_dir: Path | None = None  # where synthesized csvs are placed; default = task.context_dir / .synthesized
 
     def has_structured_prose(self) -> bool:
@@ -463,7 +624,12 @@ class StructuredDocExecutor:
                 result.notes.append(f"could_not_read:{cap.path}:{exc}")
                 continue
 
-            schema_fields = _guess_schema(cap, question=task.question)
+            schema_fields, schema_field_details, schema_source = _guess_schema(
+                cap,
+                question=task.question,
+                semantic_context=semantic_context,
+            )
+            result.notes.append(f"schema_source:{cap.path}:{schema_source}")
             chunks = _split_into_record_chunks(text, target_chars=self.chunk_chars)
             raw_chunk_count = len(chunks)
             chunks = _select_relevant_chunks(
@@ -521,6 +687,7 @@ class StructuredDocExecutor:
                                     schema_fields=schema_fields,
                                     question=task.question,
                                     semantic_context=semantic_context,
+                                    schema_field_details=schema_field_details,
                                 ),
                             ),
                         ],
