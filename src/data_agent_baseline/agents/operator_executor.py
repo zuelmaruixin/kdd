@@ -20,6 +20,11 @@ from typing import Any
 
 from data_agent_baseline.agents.execution_context import ExecutionContext
 from data_agent_baseline.agents.model import OpenAIModelAdapter
+from data_agent_baseline.agents.record_text_classifier import (
+    VERDICT_READ,
+    ClassificationMeta,
+    classify_record_text_query,
+)
 from data_agent_baseline.agents.repair_coordinator import RepairCoordinator
 from data_agent_baseline.agents.semantic_guard import assess_cheap_semantic_risk
 from data_agent_baseline.agents.semantic_consistency import SemanticConsistencyPipeline
@@ -45,6 +50,12 @@ class OperatorExecutor:
     max_local_repairs: int = 3
     semantic_consistency_enabled: bool = True
     semantic_consistency_max_repairs: int = 3
+    # Per-task transient state for the record_text query_type classifier.
+    # ``_query_type`` is "aggregate" | "read" | None (None == classifier
+    # never ran because there are no record_text files in this task).
+    # ``_classifier_meta`` is the audit record surfaced to trace.json.
+    _query_type: str | None = None
+    _classifier_meta: ClassificationMeta | None = None
 
     def run(self, task: PublicTask) -> CodegenRunResult:
         """Execute the tool-first pipeline.
@@ -59,6 +70,27 @@ class OperatorExecutor:
              or when the fast path needs escalation
         """
         ctx = ExecutionContext(self.compiled_task)
+
+        # --- Phase 0: record_text query_type classification (once per task) ---
+        # Decide up-front whether a table-synthesis pass is even desirable
+        # for this question. For "read" (reading-comprehension) questions,
+        # materializing a CSV drops the narrative context the answer
+        # depends on, so we want to skip the extractor in both the
+        # pre-extract (Phase 2) and post-codegen fallback (Phase 3b)
+        # branches. A single classifier call feeds both decisions and is
+        # persisted in trace.json via result.manifest below.
+        self._query_type = None
+        self._classifier_meta = None
+        if self._has_record_text_docs():
+            model_id = getattr(self.model, "model", "") or ""
+            verdict, classifier_meta = classify_record_text_query(
+                task.question,
+                model=self.model,
+                model_id=model_id,
+                stream_label="record_text_classifier",
+            )
+            self._query_type = verdict
+            self._classifier_meta = classifier_meta
 
         sc_pipeline = SemanticConsistencyPipeline(
             self.model, ctx,
@@ -105,6 +137,15 @@ class OperatorExecutor:
             )
             result = agent.run(task)
 
+        # Surface the classifier's verdict + source branch (llm / cache /
+        # fallback_keyword) into trace.json as soon as we have a result
+        # object to attach it to. Attached once per task, regardless of
+        # which pre-extract branch ran above.
+        if self._classifier_meta is not None:
+            result.manifest = list(result.manifest or []) + [
+                {"record_text_classifier": self._classifier_meta.to_dict()}
+            ]
+
         if semantic_plan is not None:
             result.manifest = list(result.manifest or []) + [{
                 "semantic_consistency": "enabled",
@@ -120,7 +161,16 @@ class OperatorExecutor:
 
         # --- Phase 3b: structured-doc synthesis (before schema-retry so that
         #     the synthesized CSV columns are available to the retry LLM) ---
-        if not result.succeeded and self._has_record_text_docs() and not self._should_preextract_record_text():
+        # Skip entirely if the query_type classifier labeled this a
+        # reading-comprehension question — synthesizing a table would
+        # drop the narrative context the answer depends on.
+        needs_synth_fallback = (
+            not result.succeeded
+            and self._has_record_text_docs()
+            and not self._should_preextract_record_text()
+            and self._query_type != VERDICT_READ
+        )
+        if needs_synth_fallback:
             try:
                 synth = self._run_structured_doc_synthesis(task=task, prior=result)
             except BudgetExceeded:
@@ -189,11 +239,20 @@ class OperatorExecutor:
         )
 
     def _should_preextract_record_text(self) -> bool:
+        if not self._has_record_text_docs():
+            return False
         flags = set(self.compiled_task.ambiguity_flags)
-        return (
+        candidate = (
             self.compiled_task.task_type == "record_text_with_semantic_rule"
             or "record_extraction_required" in flags
-        ) and self._has_record_text_docs()
+        )
+        if not candidate:
+            return False
+        # Reading-comprehension questions do not benefit from CSV
+        # synthesis (it drops narrative context). Let those fall through
+        # to the raw-codegen path; the operator prompt will then see the
+        # record_text files directly.
+        return self._query_type != VERDICT_READ
 
     def _cheap_semantic_assessment(
         self,
