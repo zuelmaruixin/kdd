@@ -1,0 +1,42 @@
+\frametitle{Self-Consistency, Budget \& Demo}
+
+\begin{columns}[T]
+\column{0.48\textwidth}
+\textbf{Self-consistency --- column-signature voting:}
+\begin{itemize}
+    \item N passes at T=0.7 with different seeds
+    \item \texttt{target\_count} = mode of column counts
+    \item Top-\texttt{target\_count} signatures by frequency = winning set
+    \item Pick sample with max coverage, min extras
+    \item \alert{Directly targets} $\text{recall} - \lambda \cdot \text{extra/pred}$
+\end{itemize}
+
+\vspace{0.5em}
+\textbf{Budget controller (per task):}
+\begin{itemize}
+    \scriptsize
+    \item LLM / tool / time caps
+    \item Local \& reasoner repair caps
+    \item Multi-agent fallback cap
+    \item Limits $=\min$(YAML, TaskCompiler level)
+\end{itemize}
+
+\column{0.48\textwidth}
+\textbf{Streamlit demo:}
+\begin{itemize}
+    \item Real-time subprocess log (ProgressLogger)
+    \item \textbf{Reasoning timeline}: schema $\to$ route $\to$ codegen $\to$ guard $\to$ judge
+    \item Final answer table + generated Python
+    \item Full \texttt{trace.json} (collapsible)
+\end{itemize}
+
+\vspace{0.3em}
+\begin{lstlisting}[language=bash]
+uv run streamlit run \
+  scripts/demo_app.py
+\end{lstlisting}
+
+\vspace{0.2em}
+Auditable, explainable, reproducible.
+\end{columns}
+

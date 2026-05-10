@@ -54,7 +54,7 @@
 }
 
 %--------------- title ---------------
-\title[DABench Data Agent]{DABench Data Agent}
+\title[FEWLLM Data Agent]{FEWLLM Data Agent}
 \subtitle{KDD Cup 2026 DataAgent-Bench --- Course Project}
 
 \author[Team]{MA Ruixin, LIN Yipeng, XIAO Yao}
@@ -229,7 +229,7 @@ Primary + verifiers run in parallel; keep columns whose signatures agree $\geq$ 
                   minimum width=12cm, minimum height=0.5cm, align=center, font=\scriptsize},
     arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!70},
 ]
-\node[stage, fill=ustblue!20] (s0) {\textbf{0. record\_text query classifier} (new): LLM labels question \texttt{aggregate} vs \texttt{read}; cached};
+\node[stage, fill=ustblue!20] (s0) {\textbf{0. record\_text query classifier} : LLM labels question \texttt{aggregate} vs \texttt{read};};
 \node[stage, fill=ustblue!12, below=of s0] (s1) {1. ExecutionContext --- schema diagnostics computed once};
 \node[stage, fill=ustblue!12, below=of s1] (s2) {2. Semantic Analyst (plan) --- \textit{fast\_path\_skip for low-complexity tasks}};
 \node[stage, fill=ustgold_1!15, below=of s2] (s3) {3. CodegenDirectAgent --- one-shot Python/pandas/SQL + execute};
@@ -337,17 +337,24 @@ Q: \emph{``patients with severe degree of thrombosis''}. Code uses \texttt{disea
 
 %---------------------------------------------------------
 %---------------------------------------------------------
-\begin{frame}
+\begin{frame}[t]
 \frametitle{Lazy Escalation + Analyst-Exception Recovery}
 
-\begin{columns}[T]
-\column{0.55\textwidth}
+\vspace{-0.4em}
+\small
+
+\begin{columns}[T,onlytextwidth]
+
+\column{0.54\textwidth}
 
 \textbf{Decision flow:}
 \begin{itemize}
+    \setlength\itemsep{0.35em}
     \item Codegen OK, answer valid
     \item Guard score $\geq 0.5$?
     \begin{itemize}
+        \scriptsize
+        \setlength\itemsep{0.2em}
         \item \textbf{No} $\to$ fast return (0 extra LLM)
         \item \textbf{Yes} $\to$ \texttt{plan(force=True)}
     \end{itemize}
@@ -355,10 +362,12 @@ Q: \emph{``patients with severe degree of thrombosis''}. Code uses \texttt{disea
     \item Plan failed $\to$ fallback plan from guard risks $\to$ Judge
 \end{itemize}
 
-\vspace{0.4em}
+\vspace{0.55em}
+
 \textbf{Observability} --- \texttt{final\_gate} values:
 \begin{itemize}
     \scriptsize
+    \setlength\itemsep{0.2em}
     \item \texttt{plan+judge} --- strong path
     \item \texttt{escalated+judge} --- recovered
     \item \texttt{cheap\_guard\_only} --- investigate
@@ -366,20 +375,32 @@ Q: \emph{``patients with severe degree of thrombosis''}. Code uses \texttt{disea
 \end{itemize}
 
 \column{0.43\textwidth}
-\textbf{Analyst-exception recovery (new):}
+
+\textbf{Analyst-exception recovery:}
+
+\vspace{0.35em}
 
 If analyst raises during plan, we used to fall through to a silently-skipped judge. Now:
+
+\vspace{0.25em}
+
 \begin{itemize}
+    \setlength\itemsep{0.4em}
     \item \texttt{stage==analyst\_exception} $\to$ retry once with \texttt{force=True}
     \item Still fails $\to$ low-confidence synthetic plan; \alert{judge must run}
 \end{itemize}
 
-\vspace{0.1em}
-\begin{exampleblock}{Effect}
+\vspace{0.75em}
+
+\textbf{Effect}
+
+\vspace{0.25em}
+
 Simple tasks: \textbf{1 LLM call total} (codegen only).
 
+\vspace{0.45em}
+
 Hard tasks where analyst fails: \alert{guaranteed judge engagement} instead of silent skip.
-\end{exampleblock}
 
 \end{columns}
 \end{frame}
