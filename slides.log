@@ -1,4 +1,4 @@
-This is XeTeX, Version 3.141592653-2.6-0.999998 (TeX Live 2026) (preloaded format=xelatex 2026.5.10)  10 MAY 2026 22:51
+This is XeTeX, Version 3.141592653-2.6-0.999998 (TeX Live 2026) (preloaded format=xelatex 2026.5.10)  11 MAY 2026 12:29
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -1182,16 +1182,43 @@ Overfull \vbox (1.0986pt too high) detected at line 250
 
 [6
 
-] [7
+]
+Overfull \vbox (87.12364pt too high) detected at line 296
+ []
+
+[7
 
 ]
 LaTeX Font Info:    Font shape `T1/lmtt/bx/n' in size <8> not available
-(Font)              Font shape `T1/lmtt/b/n' tried instead on input line 333.
+(Font)              Font shape `T1/lmtt/b/n' tried instead on input line 338.
  [8
 
-] [9
+]
+Missing character: There is no → ("2192) in font ec-lmss9!
+Missing character: There is no → ("2192) in font ec-lmss9!
+Missing character: There is no → ("2192) in font ec-lmss9!
+LaTeX Font Info:    Font shape `T1/lmtt/bx/n' in size <9> not available
+(Font)              Font shape `T1/lmtt/b/n' tried instead on input line 414.
+[9
 
 ] [10
+
+]
+Underfull \hbox (badness 10000) in paragraph at lines 555--555
+[]|\T1/lmtt/m/n/6 list_context, read_csv, read_json, read_doc,
+ []
+
+
+Underfull \hbox (badness 10000) in paragraph at lines 555--555
+[]|\T1/lmtt/m/n/6 list_context, read_doc, inspect_sqlite_schema,
+ []
+
+
+Underfull \hbox (badness 10000) in paragraph at lines 555--555
+[]|\T1/lmtt/m/n/6 list_context, read_csv/json/doc, inspect_sqlite,
+ []
+
+[11
 
 ]
 \openout4 = `slides.vrb'.
@@ -1203,17 +1230,17 @@ File: lstlang1.sty 2025/11/14 1.11b listings language file
 (/usr/local/texlive/2026/texmf-dist/tex/latex/listings/lstlang1.sty
 File: lstlang1.sty 2025/11/14 1.11b listings language file
 ))
-Overfull \vbox (14.81361pt too high) detected at line 503
+Overfull \vbox (14.81361pt too high) detected at line 601
  []
 
-[11
+[12
 
-] [12
+] [13
 
 ]
 File: ./ustlogos/UST-GZ-logo.pdf Graphic file (type pdf)
 <use ./ustlogos/UST-GZ-logo.pdf>
- [13
+ [14
 
 ]
 \tf@nav=\write6
@@ -1234,12 +1261,12 @@ Package rerunfilecheck Info: File `slides.out' has not changed.
 (rerunfilecheck)             Checksum: 78D6E2FD6BC7023E8CCCC6506D96E90C;751.
  ) 
 Here is how much of TeX's memory you used:
- 28774 strings out of 468168
- 572062 string characters out of 5432815
- 1160695 words of memory out of 5000000
- 56919 multiletter control sequences out of 15000+600000
- 721268 words of font info for 101 fonts, out of 8000000 for 9000
+ 28795 strings out of 468168
+ 572560 string characters out of 5432815
+ 1159166 words of memory out of 5000000
+ 56934 multiletter control sequences out of 15000+600000
+ 718232 words of font info for 104 fonts, out of 8000000 for 9000
  1348 hyphenation exceptions out of 8191
- 128i,15n,123p,419b,1417s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 128i,15n,123p,444b,1417s stack positions out of 10000i,1000n,20000p,200000b,200000s
 
-Output written on slides.pdf (13 pages).
+Output written on slides.pdf (14 pages).

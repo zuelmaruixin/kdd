@@ -160,7 +160,7 @@ The Hong Kong University of Science and Technology (Guangzhou)
 \node[below=0.15cm of compiler, font=\scriptsize\itshape, text=gray] {No LLM};
 \node[below=0.15cm of router, font=\scriptsize\itshape, text=gray] {No LLM};
 \node[below=0.15cm of operator, font=\scriptsize\itshape, text=gray] {1 LLM call};
-\node[below=0.15cm of guard, font=\scriptsize\itshape, text=gray] {0--3 LLM calls};
+\node[below=0.15cm of guard, font=\scriptsize\itshape, text=gray] {0--3 extra};
 \end{tikzpicture}
 \end{center}
 
@@ -256,16 +256,19 @@ Every generated program emits \texttt{schema\_inspection}, \texttt{used\_columns
 
 \begin{columns}[T]
 \column{0.32\textwidth}
-\textbf{Schema Grounding}
+\textbf{Schema Grounding}\\
+{\scriptsize\textit{Tabular-source prompt hint}}
 \begin{itemize}
-    \item Extract question concepts
-    \item Match to real columns: Levenshtein + value match + cardinality
-    \item Top-3 candidates w/ samples
-    \item \alert{Fights hallucination}
+    \item Levenshtein + value match + cardinality on real columns TOP-K to Prompt
+    \item \textbf{Per source-kind policy:}
+        \item \textbf{CSV / SQLite} --- full scoring
+        \item \textbf{JSON} --- downgrade: inject sample + record\_fields into prompt (no Levenshtein)
+        \item \textbf{text / image} --- skip
 \end{itemize}
 
 \column{0.32\textwidth}
-\textbf{Static Checker}
+\textbf{Static Checker}\\
+{\scriptsize\textit{Pre-execution gate}}
 \begin{itemize}
     \item Python AST + SQL scan
     \item \texttt{no\_such\_column}, \texttt{bad\_join\_key}, \texttt{\_x/\_y} suffixes
@@ -274,7 +277,8 @@ Every generated program emits \texttt{schema\_inspection}, \texttt{used\_columns
 \end{itemize}
 
 \column{0.32\textwidth}
-\textbf{Local Repair (0 LLM)}
+\textbf{Local Repair (0 LLM)}\\
+{\scriptsize\textit{Deterministic patcher}}
 \begin{itemize}
     \item 10+ deterministic patches
     \item Fuzzy column-name fix
@@ -284,12 +288,13 @@ Every generated program emits \texttt{schema\_inspection}, \texttt{used\_columns
 \end{itemize}
 \end{columns}
 
-\vspace{0.5em}
-\begin{alertblock}{Why these three work together}
-All three read the \textbf{same} \texttt{SourceCapability} scan. The prompt tells the LLM what's real; the static checker verifies the LLM didn't invent; local repair fixes the remaining deterministic mistakes without an extra LLM call.
+\vspace{0.4em}
+\begin{alertblock}{Source-kind-agnostic defense (real safety net)}
+Grounding is a prompt optimization, not a universal guard. The \alert{actual per-source defense} lives downstream and works on \emph{every} source kind: \textbf{schema\_inspection} (codegen must dump \texttt{list(df.columns)} after load) $\to$ \textbf{static checker} $\to$ \textbf{cheap guard} (reads trace, not source) $\to$ \textbf{LLM judge}. All four read the same \texttt{SourceCapability} scan --- one audit trail, no drift.
 \end{alertblock}
 
 \end{frame}
+
 %---------------------------------------------------------
 
 \section{Risk Gating (Core Innovation)}
@@ -299,7 +304,7 @@ All three read the \textbf{same} \texttt{SourceCapability} scan. The prompt tell
 \begin{frame}
 \frametitle{Cheap Semantic Guard --- Non-LLM Risk Gate}
 
-\textbf{Position:} codegen succeeded, answer structurally valid, \alert{no analyst ran yet} $\to$ trust this answer?
+\textbf{Position:} codegen succeeded, answer structurally valid, $\to$ trust this answer?
 
 \vspace{-0.2em}
 \begin{equation*}
@@ -335,75 +340,79 @@ Q: \emph{``patients with severe degree of thrombosis''}. Code uses \texttt{disea
 
 %---------------------------------------------------------
 
-%---------------------------------------------------------
-%---------------------------------------------------------
 \begin{frame}[t]
 \frametitle{Lazy Escalation + Analyst-Exception Recovery}
 
-\vspace{-0.4em}
-\small
+\vspace{-0.65em}
+\footnotesize
 
 \begin{columns}[T,onlytextwidth]
 
-\column{0.54\textwidth}
+\column{0.48\textwidth}
 
-\textbf{Decision flow:}
-\begin{itemize}
-    \setlength\itemsep{0.35em}
-    \item Codegen OK, answer valid
-    \item Guard score $\geq 0.5$?
-    \begin{itemize}
-        \scriptsize
-        \setlength\itemsep{0.2em}
-        \item \textbf{No} $\to$ fast return (0 extra LLM)
-        \item \textbf{Yes} $\to$ \texttt{plan(force=True)}
-    \end{itemize}
-    \item Plan OK? Yes $\to$ Judge + Repair (max 3 rounds)
-    \item Plan failed $\to$ fallback plan from guard risks $\to$ Judge
-\end{itemize}
+\textbf{1. Post-codegen gate}
 
-\vspace{0.55em}
-
-\textbf{Observability} --- \texttt{final\_gate} values:
-\begin{itemize}
-    \scriptsize
-    \setlength\itemsep{0.2em}
-    \item \texttt{plan+judge} --- strong path
-    \item \texttt{escalated+judge} --- recovered
-    \item \texttt{cheap\_guard\_only} --- investigate
-    \item \texttt{bypassed} --- no semantic check
-\end{itemize}
-
-\column{0.43\textwidth}
-
-\textbf{Analyst-exception recovery:}
+\vspace{0.1em}
+After codegen succeeds and the answer is structurally valid, the \textbf{Cheap Guard} scores 10+ deterministic rules (non-LLM). If \texttt{score < 0.5} \alert{$\to$ fast return}, zero extra LLM cost. Otherwise escalate.
 
 \vspace{0.35em}
 
-If analyst raises during plan, we used to fall through to a silently-skipped judge. Now:
+\textbf{2. Escalation flow (LLM path)}
 
-\vspace{0.25em}
-
+\vspace{0.1em}
 \begin{itemize}
-    \setlength\itemsep{0.4em}
-    \item \texttt{stage==analyst\_exception} $\to$ retry once with \texttt{force=True}
-    \item Still fails $\to$ low-confidence synthetic plan; \alert{judge must run}
+    \setlength\itemsep{0.05em}
+    \item \textbf{Analyst} (1 LLM call) --- emits semantic plan
+    \item \textbf{Judge} --- compares plan vs code
+    \begin{itemize}
+        \scriptsize
+        \setlength\itemsep{0.03em}
+        \item \texttt{pass} $\to$ done
+        \item \texttt{fail} / \texttt{low\_confidence} $\to$ \textbf{Semantic Repair} rewrites code
+    \end{itemize}
+    \item Judge--Repair loops at most \textbf{3 rounds}
 \end{itemize}
 
-\vspace{0.75em}
-
-\textbf{Effect}
-
 \vspace{0.25em}
 
-Simple tasks: \textbf{1 LLM call total} (codegen only).
+\textbf{3. Analyst-exception recovery}
+\texttt{stage=analyst\_exception} → retry once with \texttt{force=True}; still fails → low-confidence synthetic plan → \alert{judge must run}.
 
-\vspace{0.45em}
+\column{0.49\textwidth}
 
-Hard tasks where analyst fails: \alert{guaranteed judge engagement} instead of silent skip.
+\textbf{4. Observability --- \texttt{final\_gate}}
+
+\vspace{0.05em}
+Top-level field in \texttt{trace.json}:
+\begin{itemize}
+    \scriptsize
+    \setlength\itemsep{0.05em}
+    \item \texttt{plan+judge} --- strong path
+    \item \texttt{escalated+judge} --- recovered (retry / fallback / lazy escalation)
+    \item \texttt{cheap\_guard\_only} --- guard fired but judge did not run (investigate)
+    \item \texttt{bypassed} --- no semantic check
+\end{itemize}
+
+\vspace{0.3em}
+
+\textbf{5. Cost}
+
+\vspace{0.05em}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item Simple task: \textbf{1 LLM call} (codegen only)
+    \item Rule-based task: 3--5 calls (analyst + codegen + judge $\pm$ repair)
+    \item Analyst exception: +1 retry +1 judge (worst case)
+\end{itemize}
+\vspace{0.1em}
+\alert{\textbf{Core guarantee}}
+
+\scriptsize
+No suspicious answer ships unchecked: if guard escalates, judge \emph{will} run --- even if analyst fails.
 
 \end{columns}
 \end{frame}
+%---------------------------------------------------------
 %---------------------------------------------------------
 
 %---------------------------------------------------------
@@ -423,7 +432,6 @@ Hard tasks where analyst fails: \alert{guaranteed judge engagement} instead of s
     \item \textbf{Hybrid retrieval}: BM25 $\parallel$ Embedding
     \item \textbf{RRF fusion} (rank-only, no score calibration)
     \item Optional cross-encoder reranker
-    \item Embedding cache: \texttt{SHA256(model, text)}
 \end{itemize}
 
 \column{0.42\textwidth}
@@ -449,12 +457,102 @@ Hard tasks where analyst fails: \alert{guaranteed judge engagement} instead of s
 \end{tikzpicture}
 \end{center}
 \scriptsize
-Specialists only see \texttt{report}; only Synthesizer can call \texttt{answer}. Same-layer specialists run in parallel.
 \end{columns}
 
 \end{frame}
 %---------------------------------------------------------
+\begin{frame}[t]
+\frametitle{Multi-Agent Mode --- Roles \& Permissions}
 
+\vspace{-0.7em}
+\scriptsize
+
+\begin{columns}[T,onlytextwidth]
+
+% ================= LEFT COLUMN =================
+\column{0.49\textwidth}
+
+\textbf{1. Planner}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \textbf{Job:} decompose the question into a DAG of sub-tasks
+    \item \textbf{Output:} JSON plan with dependencies
+    \item \textbf{Tools:} none; pure reasoning only
+    \item \textbf{Constraint:} cannot call \texttt{answer} or \texttt{report}
+\end{itemize}
+
+\vspace{0.25em}
+
+\textbf{2. Specialists} (5 kinds, parallel execution)
+
+\vspace{0.1em}
+\tiny
+\begin{tabular}{@{}p{0.19\linewidth}p{0.75\linewidth}@{}}
+\toprule
+\textbf{Kind} & \textbf{Allowed tools} \\
+\midrule
+Schema &
+\texttt{list\_context, read\_csv, read\_json, read\_doc, inspect\_sqlite\_schema} \\
+
+SQL &
+\texttt{list\_context, read\_doc, inspect\_sqlite\_schema, execute\_context\_sql} \\
+
+Python &
+\texttt{list\_context, read\_csv/json/doc, inspect\_sqlite, execute\_sql, execute\_python} \\
+
+Document &
+\texttt{list\_context, read\_doc, read\_json, read\_csv} \\
+
+Generic &
+all tools; full ReAct \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.25em}
+\scriptsize
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item Terminal tool = \texttt{report}, not \texttt{answer}
+    \item \texttt{read\_doc} capped at 2 calls per specialist
+    \item Max 12 ReAct steps per specialist
+\end{itemize}
+
+% ================= RIGHT COLUMN =================
+\column{0.49\textwidth}
+
+\textbf{3. Synthesizer}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \textbf{Job:} merge specialist findings into one final answer
+    \item \textbf{Input:} all \texttt{report} payloads
+    \item Only role allowed to call \texttt{answer}
+    \item Max 6 ReAct steps
+    \item Synthesis failure $\to$ one replan allowed
+\end{itemize}
+
+\vspace{0.25em}
+
+\textbf{4. Orchestrator}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item Dispatches sub-tasks via ThreadPool
+    \item Same-layer specialists run \textbf{in parallel}
+    \item Enforces DAG dependencies
+    \item Layer $N$ waits for layer $N-1$
+    \item Iterative refinement: 1 replan max
+    \item Budget cap: \texttt{max\_multiagent\_fallbacks = 1}
+\end{itemize}
+
+\vspace{0.25em}
+
+\begin{block}{Key design: permission isolation}
+\tiny
+Specialists cannot submit the final answer. They only \texttt{report} findings. 
+The Synthesizer must cross-check all reports before committing the final \texttt{answer}.
+\end{block}
+
+\end{columns}
+\end{frame}
 %---------------------------------------------------------
 %---------------------------------------------------------
 \begin{frame}[fragile]
@@ -528,7 +626,7 @@ Auditable, explainable, reproducible.
 
 \column{0.48\textwidth}
 \textbf{Observed performance (public):}\\
-Easy: $\sim$70--80 \quad Medium/Hard: $\sim$60
+Easy: $\sim$90 \quad Medium/Hard: $\sim$80
 
 \vspace{0.4em}
 \textbf{Future work:}
