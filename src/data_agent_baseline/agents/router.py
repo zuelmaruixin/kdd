@@ -7,6 +7,7 @@ mixed context, image understanding, or pure-reasoning fallback.
 
 Each route has its own endpoint and execution kind:
 
+    - "agentic_operator" -> Planner + operator tool actions + reflection
     - "operator_executor" -> tool-first code/RAG executor
     - "tablellm_direct" -> :class:`TableLLMDirectAgent`
     - "react"           -> :class:`ReActAgent`
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from data_agent_baseline.agents.model import OpenAIModelAdapter
+from data_agent_baseline.agents.agentic_operator import AgenticOperatorExecutor
 from data_agent_baseline.agents.orchestrator import (
     MultiAgentOrchestrator,
     OrchestratorConfig,
@@ -313,11 +315,11 @@ def _route_for_compiled_task(
 
     if task_type == "table_computation":
         candidate = _first_route_with_kind(
-            router, ("operator_executor", "tablellm_direct", "react", "multi_agent"), visited=visited
+            router, ("agentic_operator", "operator_executor", "tablellm_direct", "react", "multi_agent"), visited=visited
         )
     elif task_type in {"document_qa", "mixed_context"}:
         candidate = _first_route_with_kind(
-            router, ("operator_executor", "tablellm_direct", "react", "multi_agent"),
+            router, ("agentic_operator", "operator_executor", "tablellm_direct", "react", "multi_agent"),
             require_rag=True,
             visited=visited,
         )
@@ -331,7 +333,7 @@ def _route_for_compiled_task(
             router, ("multi_agent", "react"), visited=visited,
         )
     else:
-        candidate = _first_route_with_kind(router, ("react", "operator_executor", "multi_agent"), visited=visited)
+        candidate = _first_route_with_kind(router, ("react", "agentic_operator", "operator_executor", "multi_agent"), visited=visited)
 
     if candidate is not None:
         return candidate, "task_type_auto", False
@@ -371,7 +373,7 @@ def _route_for_execution_profile(
     if strategy == "rag_extract" or source_shape == "long_docs":
         candidate = _first_route_with_kind(
             router,
-            ("operator_executor", "tablellm_direct", "react", "multi_agent"),
+            ("agentic_operator", "operator_executor", "tablellm_direct", "react", "multi_agent"),
             require_rag=True,
             visited=visited,
         )
@@ -391,7 +393,7 @@ def _route_for_execution_profile(
             return candidate, "profile_operator_with_rule_resolution", False
         candidate = _first_route_with_kind(
             router,
-            ("operator_executor", "tablellm_direct", "react"),
+            ("agentic_operator", "operator_executor", "tablellm_direct", "react"),
             visited=visited,
         )
         if candidate is not None:
@@ -408,21 +410,21 @@ def _route_for_execution_profile(
         if candidate is not None:
             return candidate, "profile_direct_candidate_verify_as_easy_operator", False
         candidate = _first_route_with_kind(
-            router, ("operator_executor", "tablellm_direct"), visited=visited
+            router, ("agentic_operator", "operator_executor", "tablellm_direct"), visited=visited
         )
         if candidate is not None:
             return candidate, "profile_direct_candidate_verify_as_operator", False
 
     if context_size == "small" and verifiability == "evidence_based" and low_complexity:
         candidate = _first_route_with_kind(
-            router, ("react", "operator_executor", "multi_agent"), visited=visited
+            router, ("react", "agentic_operator", "operator_executor", "multi_agent"), visited=visited
         )
         if candidate is not None:
             return candidate, "profile_direct_candidate_evidence_stub", False
 
     if op_complexity in {"filter_join", "aggregation", "multi_hop"} or source_shape == "multi_table":
         candidate = _first_route_with_kind(
-            router, ("operator_executor", "tablellm_direct", "react", "multi_agent"),
+            router, ("agentic_operator", "operator_executor", "tablellm_direct", "react", "multi_agent"),
             visited=visited,
         )
         if candidate is not None:
@@ -521,7 +523,7 @@ def _next_repair_route(
     if failure_type in {"retrieval_empty", "doc_context_miss"}:
         return _first_route_with_kind(
             router,
-            ("operator_executor", "tablellm_direct", "react", "multi_agent"),
+            ("agentic_operator", "operator_executor", "tablellm_direct", "react", "multi_agent"),
             require_rag=True,
             visited=visited,
         )
@@ -530,7 +532,7 @@ def _next_repair_route(
         candidate = _first_route_named(router, ("tool_first_mixed", "hard", "easy"), visited=visited)
         if candidate is not None:
             return candidate
-        return _first_route_with_kind(router, ("operator_executor", "tablellm_direct", "react"), visited=visited)
+        return _first_route_with_kind(router, ("agentic_operator", "operator_executor", "tablellm_direct", "react"), visited=visited)
 
     if failure_type in {"missing_answer", "syntax_error", "static_error", "exec_error"}:
         if small_programmatic:
@@ -552,14 +554,14 @@ def _next_repair_route(
             return candidate
         return _first_route_with_kind(
             router,
-            ("operator_executor", "tablellm_direct", "react"),
+            ("agentic_operator", "operator_executor", "tablellm_direct", "react"),
             visited=visited,
         )
 
     if current_kind == "react":
-        kind_order = ("operator_executor", "tablellm_direct", "multi_agent")
-    elif current_kind in {"operator_executor", "tablellm_direct"}:
-        kind_order = ("operator_executor", "tablellm_direct", "react")
+        kind_order = ("agentic_operator", "operator_executor", "tablellm_direct", "multi_agent")
+    elif current_kind in {"agentic_operator", "operator_executor", "tablellm_direct"}:
+        kind_order = ("agentic_operator", "operator_executor", "tablellm_direct", "react")
     else:
         kind_order = ()
 
@@ -860,6 +862,47 @@ def _run_operator_executor_pass(
     }
 
 
+def _run_agentic_operator_pass(
+    *,
+    task: PublicTask,
+    adapter: OpenAIModelAdapter,
+    route: RouteConfig,
+    compiled_task: CompiledTask,
+    sample_temperature: float | None,
+    sample_seed: int | None,
+) -> dict[str, Any]:
+    ma = route.multi_agent
+    executor = AgenticOperatorExecutor(
+        model=adapter,
+        compiled_task=compiled_task,
+        max_table_rows=route.tablellm_max_table_rows,
+        max_input_chars=route.tablellm_max_input_chars,
+        python_timeout=route.tablellm_python_timeout,
+        sample_temperature=sample_temperature,
+        sample_seed=sample_seed,
+        rag_kwargs=_build_rag_kwargs(route),
+        semantic_consistency_enabled=route.semantic_consistency_enabled,
+        semantic_consistency_max_repairs=route.semantic_consistency_max_repairs,
+        planner_temperature=ma.planner_temperature,
+        max_reflection_rounds=1 if ma.enable_iterative_refinement else 0,
+    )
+    result = executor.run(task)
+    return {
+        "task_id": task.task_id,
+        "answer": result.answer.to_dict() if result.answer is not None else None,
+        "steps": [],
+        "succeeded": result.succeeded,
+        "failure_reason": result.failure_reason,
+        "agent_mode": "router",
+        "agentic_operator": {
+            **result.to_dict(),
+            "agent_kind": "agentic_operator",
+            "compiled_task": compiled_task.to_dict(),
+        },
+        "semantic_consistency_audit": _build_semantic_consistency_audit(result.manifest),
+    }
+
+
 def _build_semantic_consistency_audit(manifest: list[Any] | None) -> dict[str, Any]:
     """Summarize how the semantic-consistency machinery behaved on this task.
 
@@ -1008,6 +1051,7 @@ def _run_react_pass_for_route(
             sample_temperature=sample_temperature,
             sample_seed=sample_seed,
             cache_tool_results=cache_tool_results,
+            verification_rounds=route.verification_rounds,
         ),
     )
     payload = agent.run(task).to_dict()
@@ -1073,6 +1117,15 @@ def _run_route_pass(
     sample_seed: int | None,
 ) -> dict[str, Any]:
     kind = route.kind.lower()
+    if kind == "agentic_operator":
+        return _run_agentic_operator_pass(
+            task=task,
+            adapter=adapter,
+            route=route,
+            compiled_task=compiled_task,
+            sample_temperature=sample_temperature,
+            sample_seed=sample_seed,
+        )
     if kind == "operator_executor":
         return _run_operator_executor_pass(
             task=task,
@@ -1339,7 +1392,7 @@ def _try_reasoner_repair(
         return payload
     if not _payload_indicates_failure(payload):
         return payload
-    if route.kind.lower() not in {"operator_executor", "tablellm_direct"}:
+    if route.kind.lower() not in {"agentic_operator", "operator_executor", "tablellm_direct"}:
         return payload
     flags = set(compiled_task.ambiguity_flags)
     reasoner_allowed = (
@@ -1351,7 +1404,12 @@ def _try_reasoner_repair(
     )
     if not reasoner_allowed:
         return payload
-    failed_block = payload.get("operator_executor") or payload.get("tablellm_direct") or {}
+    failed_block = (
+        payload.get("agentic_operator")
+        or payload.get("operator_executor")
+        or payload.get("tablellm_direct")
+        or {}
+    )
     if isinstance(failed_block, dict) and not failed_block.get("program"):
         return payload
 
@@ -1886,7 +1944,7 @@ def run_router(
         # route, apply it to the actual final executor kind instead of
         # silently skipping tool-first routes; otherwise the config can say
         # "verify hard/extreme" while the code never does.
-        verify_kind_allowlist = {"operator_executor", "tablellm_direct", "multi_agent"}
+        verify_kind_allowlist = {"agentic_operator", "operator_executor", "tablellm_direct", "multi_agent"}
         if (
             cmv.enabled
             and cmv.verifiers

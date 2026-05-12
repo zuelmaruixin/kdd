@@ -1,0 +1,161 @@
+# Agent-first submission config.
+#
+# Primary path is a harness-style ReAct loop with one self-verification
+# round (`react_harness`). The agent does Plan → tool actions → call
+# `answer` (draft) → reflect → call `answer` again (final).
+#
+# The `agentic_operator` routes (Planner + Operator + Reflection critic)
+# are kept defined here for ablation comparisons but are no longer hung
+# off the default route or any task_type.
+#
+# Fill in api_key/model/api_base for your provider before running.
+
+dataset:
+  root_path: data/public/input
+  gold_root: data/public/output
+
+agent:
+  provider: openai_compatible
+  mode: router
+  model: REPLACE_WITH_MODEL
+  api_base: https://your-openai-compatible-endpoint.example.com/v1
+  api_key: REPLACE_WITH_API_KEY
+  # Harness-style ReAct: unlimited LLM calls within a 10-minute wallclock
+  # per task. Force-kill is enforced by budget.max_seconds below.
+  max_steps: 40
+  temperature: 0.0
+  max_tokens: 4096
+  request_timeout: 360
+
+  budget:
+    enabled: true
+    max_llm_calls: -1
+    max_tool_calls: -1
+    # 600 s = 10 min per task hard ceiling. Triggers BudgetExceeded and
+    # terminates the ReAct loop regardless of step count.
+    max_seconds: 600
+
+  # Main-path self-consistency stays at 1 because the agent now improves
+  # itself through one self-verify round rather than answer voting.
+  self_consistency:
+    num_samples: 1
+    sample_temperature: 0.7
+    aggregator: column_vote
+    min_votes: 1
+
+  router:
+    enabled: true
+    default_route: react_harness
+    estimate_when_missing: true
+    cascade_on_failure: true
+    cascade_order: [react_harness, agentic_mixed, agentic_table, fallback_multi_agent]
+    cascade_max_extra_attempts: 1
+
+    task_type_routing:
+      table_computation: react_harness
+      table_with_semantic_rule: react_harness
+      record_text_with_semantic_rule: react_harness
+      document_qa: react_harness
+      mixed_context: react_harness
+      image_understanding: react_harness
+      pure_reasoning: react_harness
+
+    routes:
+      react_harness:
+        kind: react
+        model: REPLACE_WITH_MODEL
+        api_base: https://your-openai-compatible-endpoint.example.com/v1
+        api_key: REPLACE_WITH_API_KEY
+        temperature: 0.0
+        max_tokens: 4096
+        request_timeout: 360
+        max_steps: 40
+        verification_rounds: 1
+        self_consistency:
+          num_samples: 1
+
+      # Ablation route — kept defined but not in task_type_routing.
+      agentic_table:
+        kind: agentic_operator
+        model: REPLACE_WITH_MODEL
+        api_base: https://your-openai-compatible-endpoint.example.com/v1
+        api_key: REPLACE_WITH_API_KEY
+        temperature: 0.0
+        max_tokens: 2048
+        request_timeout: 240
+        tablellm_max_table_rows: 80
+        tablellm_max_input_chars: 20000
+        tablellm_python_timeout: 45
+        semantic_consistency:
+          enabled: true
+          max_repairs: 2
+        multi_agent:
+          enabled: true
+          planner_temperature: 0.0
+          enable_iterative_refinement: true
+        self_consistency:
+          num_samples: 1
+
+      agentic_mixed:
+        kind: agentic_operator
+        model: REPLACE_WITH_MODEL
+        api_base: https://your-openai-compatible-endpoint.example.com/v1
+        api_key: REPLACE_WITH_API_KEY
+        temperature: 0.0
+        max_tokens: 4096
+        request_timeout: 600
+        rag:
+          enabled: true
+          top_k: 6
+          first_stage_top_n: 30
+          rrf_k: 60
+          max_chunk_chars: 1200
+          chunk_overlap_chars: 150
+          doc_char_budget: 6000
+          use_hybrid: false
+          query_expansion_enabled: true
+          query_expansion_paraphrases: 2
+          query_expansion_include_hyde: true
+        tablellm_max_table_rows: 80
+        tablellm_max_input_chars: 26000
+        tablellm_python_timeout: 60
+        semantic_consistency:
+          enabled: true
+          max_repairs: 3
+        multi_agent:
+          enabled: true
+          planner_temperature: 0.0
+          enable_iterative_refinement: true
+        self_consistency:
+          num_samples: 1
+
+      fallback_multi_agent:
+        kind: multi_agent
+        model: REPLACE_WITH_MODEL
+        api_base: https://your-openai-compatible-endpoint.example.com/v1
+        api_key: REPLACE_WITH_API_KEY
+        temperature: 0.0
+        max_tokens: 4096
+        request_timeout: 600
+        multi_agent:
+          enabled: true
+          planner_temperature: 0.0
+          specialist_max_steps: 10
+          specialist_temperature: 0.0
+          synthesizer_max_steps: 6
+          synthesizer_temperature: 0.0
+          max_specialist_workers: 3
+          enable_iterative_refinement: true
+        self_consistency:
+          num_samples: 1
+
+run:
+  output_dir: artifacts/runs
+  max_workers: 1
+  task_timeout_seconds: 1500
+
+scoring:
+  redundancy_lambda: 0.5
+  numeric_tolerance: 1.0e-2
+  case_insensitive: true
+  strip_whitespace: true

@@ -113,6 +113,7 @@ class RouteConfig:
     """One path inside the task-type router.
 
     `kind` selects the agent flavor that handles tasks routed here:
+        - "agentic_operator": Planner -> tool action -> reflection -> optional retry
         - "operator_executor": tool-first pandas/SQL/RAG code execution
         - "codegen_direct" : legacy alias for one-shot executable codegen
         - "tablellm_direct": legacy alias kept for old configs
@@ -135,6 +136,9 @@ class RouteConfig:
     retry_backoff_seconds: float = -1.0
     # ReAct-only knob.
     max_steps: int = 16
+    # ReAct-only: how many extra `answer` rounds to require for
+    # self-verification. 0 = legacy behavior (commit on first answer).
+    verification_rounds: int = 1
     # codegen_direct / operator_executor knobs. The tablellm_* field
     # names are kept for config compatibility; YAML may use codegen_*.
     tablellm_max_table_rows: int = 50
@@ -158,11 +162,11 @@ class CrossModelVerifierSpec:
     """One additional model that gets to re-solve the same task in parallel
     with the primary route, used by ``CrossModelVerifyConfig``.
 
-    Inherits the primary route's pipeline kind (multi_agent / react /
-    tablellm_direct) and per-stage knobs; only the model + endpoint are
-    swapped out. This lets you run e.g. a Qwen multi-agent and a DeepSeek
-    multi-agent over the same plan / specialist topology without
-    duplicating the rest of the route config.
+    Inherits the primary route's agent kind (agentic_operator /
+    multi_agent / react / tablellm_direct) and per-stage knobs; only the
+    model + endpoint are swapped out. This lets you run e.g. a Qwen
+    agent and a DeepSeek agent over the same topology without duplicating
+    the rest of the route config.
     """
 
     name: str = ""
@@ -353,7 +357,13 @@ def _normalized_route_kind(value: Any) -> str:
     kind = str(value).strip().lower() or "react"
     if kind == "codegen_direct":
         return "tablellm_direct"
-    valid_kinds = {"operator_executor", "tablellm_direct", "react", "multi_agent"}
+    valid_kinds = {
+        "agentic_operator",
+        "operator_executor",
+        "tablellm_direct",
+        "react",
+        "multi_agent",
+    }
     if kind not in valid_kinds:
         raise ValueError(
             f"agent.router.routes.<name>.kind must be one of {sorted(valid_kinds)}, got {value!r}."
@@ -434,6 +444,7 @@ def _load_route(name: str, payload: dict, agent_defaults: "AgentConfig") -> Rout
         max_retries=int(payload.get("max_retries", -1)),
         retry_backoff_seconds=float(payload.get("retry_backoff_seconds", -1.0)),
         max_steps=int(payload.get("max_steps", agent_defaults.max_steps)),
+        verification_rounds=int(payload.get("verification_rounds", 1)),
         tablellm_max_table_rows=int(payload.get("codegen_max_table_rows", payload.get("tablellm_max_table_rows", 50))),
         tablellm_max_input_chars=int(payload.get("codegen_max_input_chars", payload.get("tablellm_max_input_chars", 12000))),
         tablellm_python_timeout=int(payload.get("codegen_python_timeout", payload.get("tablellm_python_timeout", 30))),

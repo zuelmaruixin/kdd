@@ -42,20 +42,49 @@ Critical scoring details (read carefully):
 
 How to work (TableLLM-inspired schema-link first, then code):
 1. Start with `list_context` so you know every file you may use.
-2. Schema-link: for each candidate file, peek at it (`read_csv`,
+2. If `knowledge.md` (or any doc named like `*knowledge*`, `*rule*`,
+   `*definition*`, `*glossary*`) is present, READ IT NEXT, before any
+   data file. The instructions / definitions / formulas / thresholds /
+   filters in those docs are AUTHORITATIVE and override your prior
+   knowledge of the domain. See "Knowledge file priority" below.
+3. Schema-link: for each candidate data file, peek at it (`read_csv`,
    `read_json`, `read_doc`, `inspect_sqlite_schema`) and decide which
-   columns / fields are relevant to the question. Read any
-   `knowledge.md` / docs that explain non-obvious business rules.
-3. Pick the right tool for the data: prefer `execute_context_sql`
+   columns / fields are relevant to the question.
+4. Pick the right tool for the data: prefer `execute_context_sql`
    when the source is SQLite; prefer `execute_python` (pandas) for CSV
    / JSON joins, aggregations, ranking, deduplication.
-4. Materialize the answer table you intend to submit. Print it from
+5. Materialize the answer table you intend to submit. Print it from
    `execute_python` so you can re-read its content before submitting.
-5. Call `answer` once with the final columns and rows. Use lists of
+6. Call `answer` once with the final columns and rows. Use lists of
    strings/numbers; avoid nested objects.
-6. Before planning or answering, identify the requested answer type:
+7. Before planning or answering, identify the requested answer type:
    count, ratio, difference, sum, average, max/min, list, boolean, etc.
    Then ensure the final computation matches that answer type.
+
+Knowledge file priority (NON-NEGOTIABLE):
+- If `knowledge.md` (or an equivalent docs file) is in the context, it
+  is the SINGLE SOURCE OF TRUTH for domain definitions, business rules,
+  filters, formulas, thresholds, abbreviations, units, and any term
+  that has a specialized meaning in this dataset.
+- When the knowledge file's definition conflicts with what you "know"
+  from general training data, the knowledge file ALWAYS wins. Do not
+  default to a textbook formula or a popular convention if the
+  knowledge file says otherwise.
+- Apply the rule *semantically*, do NOT copy formulas verbatim. The
+  variable names in the knowledge file may be conceptual labels
+  ("long_shots", "qualifying drivers", "valid orders") that map onto
+  *different* column names in the actual data. You must:
+    (a) parse the rule into its conditions / operations,
+    (b) look at the real columns/tables via the inspection tools,
+    (c) translate the rule into code that uses the actual column names
+        and dtypes,
+    (d) sanity-check the result before submitting.
+- If a term in the question is not defined in the knowledge file, you
+  may fall back to your own understanding — but call this out in your
+  `thought` so it's clear which definition you used.
+- Never invent thresholds, cut-offs, or formulas the knowledge file did
+  not state. If the file is silent on a numeric parameter, compute the
+  answer using ONLY the explicitly stated rules.
 
 
 Output format (every step):
@@ -67,6 +96,22 @@ Output format (every step):
 - Keep `thought` short (1-3 sentences). Reason in observations, not in
   prose.
 
+Self-verification (important — read fully):
+- The runtime will not always terminate immediately on your first
+  `answer` call. By default, the very first `answer` is treated as a
+  *draft*: the runtime intercepts it and feeds it back as an
+  observation that says `"status": "draft_submitted"`, along with the
+  number of verification rounds remaining.
+- When you see such a draft_submitted observation, do NOT assume you
+  are finished. Use the opportunity to verify: re-run the critical
+  computation (`execute_python` / `execute_context_sql`), re-read any
+  ambiguous column, re-confirm the requested answer type (count, list,
+  ratio, etc.). If you find a mistake, correct it; otherwise resubmit
+  the same `answer` payload. Only the `answer` call made AFTER the
+  draft is the one that actually commits.
+- If the observation tells you `remaining_rounds: 0`, the next `answer`
+  call is final and terminates the loop.
+
 Defensive rules:
 - All file paths passed to tools are RELATIVE to the task `context/`
   directory.
@@ -74,7 +119,8 @@ Defensive rules:
   observed via a tool.
 - If a step fails, re-read the failure observation and adjust; do not
   give up after one failure.
-- The task is complete only after a successful `answer` call.
+- The task is complete only after the final (post-verification)
+  `answer` call.
 """.strip()
 
 
@@ -155,7 +201,13 @@ def build_task_prompt(task: PublicTask) -> str:
         "Reminder: the grader ignores column NAMES and row ORDER and matches by "
         "column content signature, with a small penalty for extra columns. "
         "Output ONLY the columns the question asks for. "
-        "When you have the final table, call the `answer` tool exactly once."
+        "When you have the final table, call the `answer` tool exactly once.\n"
+        "Authoritative source: if `knowledge.md` (or an equivalent docs file) "
+        "exists in this task's context, READ IT FIRST and treat its "
+        "definitions/rules/formulas as ground truth — overriding any prior "
+        "knowledge you have about the domain. Apply those rules semantically "
+        "against the actual column names you observe; do not copy formulas "
+        "verbatim with the wrong variables."
     )
 
 

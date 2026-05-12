@@ -19,7 +19,7 @@ from data_agent_baseline.tools.registry import ToolRegistry
 
 @dataclass(frozen=True, slots=True)
 class ReActAgentConfig:
-    max_steps: int = 16
+    max_steps: int = 40
     sample_temperature: float | None = None  # override for self-consistency sampling
     sample_seed: int | None = None
     # When True, repeated calls to the same read-only tool with the same
@@ -27,6 +27,12 @@ class ReActAgentConfig:
     # This stops the model from re-reading the same csv 5 times and burning
     # tokens on identical observations.
     cache_tool_results: bool = True
+    # Harness-style self-verification. After the first `answer` call we
+    # don't terminate — we feed back a verification prompt and require the
+    # model to call `answer` again. `verification_rounds=1` means one
+    # extra answer call (i.e. total 2). Set to 0 to terminate on first
+    # answer (legacy behavior).
+    verification_rounds: int = 1
 
 
 # Tools that are pure functions of (task.context_dir, action_input) and
@@ -211,6 +217,13 @@ class ReActAgent:
         # we never accidentally re-trigger termination on a cache hit.
         tool_cache: dict[str, dict[str, object]] = {}
         last_error: str | None = None
+        # Self-verify accounting: how many `answer` calls have we let
+        # through, and how many we need before we terminate.
+        answers_seen = 0
+        required_answers = max(0, self.config.verification_rounds) + 1
+        # Most recent draft answer, retained so we can fall back to it if
+        # the model fails to call answer again after self-verify reflection.
+        pending_answer = None
 
         for step_index in range(1, self.config.max_steps + 1):
             try:
@@ -220,7 +233,17 @@ class ReActAgent:
                     seed=self.config.sample_seed,
                     stream_label=f"{self.stream_label_prefix} step {step_index}",
                 )
-            except BudgetExceeded:
+            except BudgetExceeded as budget_exc:
+                # If we already have a self-verify draft, the budget timeout
+                # interrupted us mid-verification. Don't throw away the
+                # draft — commit it and let the run finish gracefully.
+                if pending_answer is not None:
+                    state.answer = pending_answer
+                    state.failure_reason = (
+                        f"budget_exceeded_during_self_verify: {budget_exc}; "
+                        "committed most recent draft answer."
+                    )
+                    break
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_error = f"model_error: {exc}"
@@ -271,6 +294,67 @@ class ReActAgent:
                     tool_result = self.tools.execute(
                         task, model_step.action, model_step.action_input
                     )
+
+                    is_answer_call = (
+                        tool_result.is_terminal and tool_result.answer is not None
+                    )
+                    final_answer_call = False
+                    if is_answer_call:
+                        answers_seen += 1
+                        pending_answer = tool_result.answer
+                        final_answer_call = answers_seen >= required_answers
+
+                    if is_answer_call and not final_answer_call:
+                        # Replace the would-be terminal observation with a
+                        # self-verification prompt: force the model to look
+                        # at its own draft one more time before we commit.
+                        verify_content = {
+                            "status": "draft_submitted",
+                            "verification_round": answers_seen,
+                            "remaining_rounds": required_answers - answers_seen,
+                            "draft_columns": list(tool_result.answer.columns),
+                            "draft_row_count": len(tool_result.answer.rows),
+                            "instructions": (
+                                "This is a self-verification round. Re-check the draft "
+                                "answer against the question and the data: confirm the "
+                                "columns match exactly what the question asks for, "
+                                "verify numeric/string formats, and re-run any "
+                                "computations you are unsure about with execute_python "
+                                "or execute_context_sql. When you are satisfied, call "
+                                "`answer` again — either resubmitting the same table or "
+                                "submitting a corrected one. The next `answer` call "
+                                "will be final."
+                            ),
+                        }
+                        observation = {
+                            "ok": True,
+                            "tool": model_step.action,
+                            "content": verify_content,
+                        }
+                        step_record = StepRecord(
+                            step_index=step_index,
+                            thought=model_step.thought,
+                            action=model_step.action,
+                            action_input=model_step.action_input,
+                            raw_response=raw_response,
+                            observation=observation,
+                            ok=True,
+                        )
+                        state.steps.append(step_record)
+
+                        from data_agent_baseline.progress import get_progress_logger
+                        logger = get_progress_logger()
+                        if logger is not None:
+                            logger.react_step(
+                                prefix=self.stream_label_prefix,
+                                step_index=step_index,
+                                action=model_step.action,
+                                action_input=model_step.action_input,
+                                ok=True,
+                                cached=False,
+                            )
+                        continue
+
                     observation = {
                         "ok": tool_result.ok,
                         "tool": model_step.action,
@@ -323,7 +407,14 @@ class ReActAgent:
                         ok=cache_hit or step_record.ok,
                         cached=cache_hit,
                     )
-            except BudgetExceeded:
+            except BudgetExceeded as budget_exc:
+                if pending_answer is not None:
+                    state.answer = pending_answer
+                    state.failure_reason = (
+                        f"budget_exceeded_during_self_verify: {budget_exc}; "
+                        "committed most recent draft answer."
+                    )
+                    break
                 raise
             except Exception as exc:
                 last_error = str(exc)
@@ -343,7 +434,16 @@ class ReActAgent:
                     )
                 )
 
-        if state.answer is None and state.failure_reason is None:
+        if state.answer is None and pending_answer is not None:
+            # Self-verify cycle was started but the model never confirmed.
+            # Don't waste a partially-correct draft — fall back to it and
+            # record that we couldn't run the full verification.
+            state.answer = pending_answer
+            state.failure_reason = (
+                "Agent did not finish self-verification; falling back to "
+                "the most recent draft answer."
+            )
+        elif state.answer is None and state.failure_reason is None:
             suffix = f" Last error: {last_error}" if last_error else ""
             state.failure_reason = f"Agent did not submit an answer within max_steps.{suffix}"
 

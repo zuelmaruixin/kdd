@@ -37,7 +37,7 @@ Output rules:
 
 
 def _failed_block(payload: dict[str, Any]) -> dict[str, Any]:
-    for key in ("operator_executor", "tablellm_direct"):
+    for key in ("agentic_operator", "operator_executor", "tablellm_direct"):
         block = payload.get(key)
         if isinstance(block, dict):
             return block

@@ -82,13 +82,13 @@ The Hong Kong University of Science and Technology (Guangzhou)
 \column{0.5\textwidth}
 \begin{enumerate}
     \item \textbf{Problem \& Architecture}\\{\small Task, scoring rule, four-layer design}
-    \item \textbf{Pipeline \& Routing}\\{\small TaskCompiler, Router, Operator stages}
+    \item \textbf{Agent Loop \& Routing}\\{\small TaskCompiler, Controller, Tool actions}
     \item \textbf{Risk Gating (Core Innovation)}\\{\small Cheap guard + lazy escalation + audit}
 \end{enumerate}
 \column{0.5\textwidth}
 \begin{enumerate}
     \setcounter{enumi}{3}
-    \item \textbf{Supporting Components}\\{\small RAG, multi-agent, self-consistency}
+    \item \textbf{Supporting Components}\\{\small RAG tools, multi-agent, self-consistency}
     \item \textbf{Demo \& Conclusion}
 \end{enumerate}
 \end{columns}
@@ -138,44 +138,80 @@ The Hong Kong University of Science and Technology (Guangzhou)
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{Why Layered? --- Four-Layer Architecture}
+\frametitle{Why Agentic? --- Controller, Tools, Memory, Verifier}
 
-\textbf{Vanilla ReAct breaks down:} easy tasks waste tokens on multi-turn tool calls; hard tasks drift in intermediate steps; no structural guarantee on output shape; no cheap way to verify semantic correctness.
+\textbf{Raw ReAct is too unconstrained:} easy tasks waste tokens on repeated tool calls; hard tasks drift across intermediate observations; final tables need strict shape control and semantic verification.
 
 \vspace{0.4em}
 \begin{center}
 \begin{tikzpicture}[
-    node distance=0.5cm and 0.55cm,
+    node distance=0.48cm and 0.55cm,
     box/.style={rectangle, draw=ustblue, fill=gray!8, rounded corners=3pt,
-                minimum width=2.9cm, minimum height=0.8cm, align=center, font=\small},
+                minimum width=2.65cm, minimum height=0.8cm, align=center, font=\small},
     arrow/.style={-{Stealth[length=5pt]}, thick, ustblue},
 ]
-\node[box, fill=ustblue!15] (compiler) {1. TaskCompiler\\{\scriptsize deterministic profiling}};
-\node[box, fill=ustblue!15, right=of compiler] (router) {2. Router\\{\scriptsize shape-based dispatch}};
-\node[box, fill=ustgold_1!20, right=of router] (operator) {3. Operator Pipeline\\{\scriptsize codegen + repair}};
-\node[box, fill=ustred_1!15, right=of operator] (guard) {4. Risk Gating\\{\scriptsize guard + judge}};
-\draw[arrow] (compiler) -- (router);
-\draw[arrow] (router) -- (operator);
-\draw[arrow] (operator) -- (guard);
-\node[below=0.15cm of compiler, font=\scriptsize\itshape, text=gray] {No LLM};
-\node[below=0.15cm of router, font=\scriptsize\itshape, text=gray] {No LLM};
-\node[below=0.15cm of operator, font=\scriptsize\itshape, text=gray] {1 LLM call};
-\node[below=0.15cm of guard, font=\scriptsize\itshape, text=gray] {0--3 extra};
+\node[box, fill=ustblue!15] (observe) {Observe\\{\scriptsize files, schema, samples}};
+\node[box, fill=ustblue!15, right=of observe] (plan) {Plan\\{\scriptsize route + semantic plan}};
+\node[box, fill=ustgold_1!20, right=of plan] (act) {Act\\{\scriptsize SQL / Python / RAG tools}};
+\node[box, fill=ustred_1!15, right=of act] (verify) {Verify\\{\scriptsize guard + judge}};
+\node[box, fill=ustgold_1!16, below=0.55cm of act] (repair) {Repair / Replan\\{\scriptsize local patch + LLM retry}};
+\draw[arrow] (observe) -- (plan);
+\draw[arrow] (plan) -- (act);
+\draw[arrow] (act) -- (verify);
+\draw[arrow] (verify.south) |- (repair.east);
+\draw[arrow] (repair.west) -| (plan.south);
+\node[below=0.15cm of observe, font=\scriptsize\itshape, text=gray] {Task memory};
+\node[below=0.15cm of plan, font=\scriptsize\itshape, text=gray] {Controller};
+\node[above=0.15cm of act, font=\scriptsize\itshape, text=gray] {Tool calls};
+\node[below=0.15cm of verify, font=\scriptsize\itshape, text=gray] {Stop / retry};
 \end{tikzpicture}
 \end{center}
 
 \begin{block}{Design principle}
-\emph{Simple tasks pay minimal LLM cost; only suspicious answers escalate to expensive semantic verification.}
+\emph{The agent keeps a task trace, chooses tools, observes tool outputs, and only stops when the verifier accepts the answer. Simple tasks still pay minimal LLM cost.}
 \end{block}
 
 \end{frame}
 %---------------------------------------------------------
 
-\section{Pipeline \& Routing}
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{LangChain / LangGraph Positioning}
+
+\begin{columns}[T]
+\column{0.48\textwidth}
+\textbf{LangChain vocabulary}
+\begin{itemize}
+    \item Agent = model + tools + iterative loop
+    \item Runtime graph = model node, tool node, stop / retry edges
+    \item Middleware controls context, tool access, guardrails
+    \item LangSmith-style tracing is useful for debugging
+\end{itemize}
+
+\column{0.48\textwidth}
+\textbf{Our implementation}
+\begin{itemize}
+    \item \texttt{ModelAdapter} = provider abstraction
+    \item \texttt{ToolRegistry} = typed tool catalog
+    \item \texttt{ReActAgent} = model-tool loop
+    \item \texttt{Orchestrator} = planner-specialist-synthesizer DAG
+    \item \texttt{trace.json} = memory + audit trail
+\end{itemize}
+\end{columns}
+
+\vspace{0.4em}
+\begin{block}{Position}
+We use a lightweight LangGraph-style runtime instead of depending on LangChain directly. The architecture is compatible with a LangChain adapter: wrap \texttt{ToolRegistry} as LangChain tools, keep the same router, verifier, and answer validator.
+\end{block}
+
+\end{frame}
+%---------------------------------------------------------
+
+\section{Agent Loop \& Routing}
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{TaskCompiler \& Router --- Dispatch by Shape, Not Difficulty}
+\frametitle{Agent Controller --- Dispatch by Shape, Not Difficulty}
 
 \begin{columns}[T]
 \column{0.48\textwidth}
@@ -219,7 +255,7 @@ Primary + verifiers run in parallel; keep columns whose signatures agree $\geq$ 
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{Operator Pipeline --- 8 Stages}
+\frametitle{Data Agent Controller --- 8 Decision Points}
 
 \begin{center}
 \scriptsize
@@ -232,9 +268,9 @@ Primary + verifiers run in parallel; keep columns whose signatures agree $\geq$ 
 \node[stage, fill=ustblue!20] (s0) {\textbf{0. record\_text query classifier} : LLM labels question \texttt{aggregate} vs \texttt{read};};
 \node[stage, fill=ustblue!12, below=of s0] (s1) {1. ExecutionContext --- schema diagnostics computed once};
 \node[stage, fill=ustblue!12, below=of s1] (s2) {2. Semantic Analyst (plan) --- \textit{fast\_path\_skip for low-complexity tasks}};
-\node[stage, fill=ustgold_1!15, below=of s2] (s3) {3. CodegenDirectAgent --- one-shot Python/pandas/SQL + execute};
-\node[stage, fill=ustgold_1!15, below=of s3] (s4) {4. RepairCoordinator --- Static Check $\to$ Local Repair $\to$ Schema-retry};
-\node[stage, fill=ustgold_1!15, below=of s4] (s5) {5. Structured-doc fallback --- record\_text $\to$ synthesized CSV (skipped when verdict=\texttt{read})};
+\node[stage, fill=ustgold_1!15, below=of s2] (s3) {3. Act --- choose executable Python / pandas / SQL tool plan};
+\node[stage, fill=ustgold_1!15, below=of s3] (s4) {4. Observe error --- Static Check $\to$ Local Repair $\to$ Schema-retry};
+\node[stage, fill=ustgold_1!15, below=of s4] (s5) {5. Tool fallback --- record\_text $\to$ synthesized CSV (skipped when verdict=\texttt{read})};
 \node[stage, fill=ustred_1!12, below=of s5] (s6) {6. Cheap Semantic Guard --- non-LLM risk gate (lazy escalation)};
 \node[stage, fill=ustred_1!12, below=of s6] (s7) {7. Judge + Semantic Repair --- preflight $\to$ LLM judge $\to$ bounded repair};
 \foreach \i/\j in {s0/s1, s1/s2, s2/s3, s3/s4, s4/s5, s5/s6, s6/s7}
@@ -251,24 +287,25 @@ Every generated program emits \texttt{schema\_inspection}, \texttt{used\_columns
 %---------------------------------------------------------
 
 %---------------------------------------------------------
-\begin{frame}
+\begin{frame}[t]
 \frametitle{Schema Grounding + Static Checker + Local Repair}
+\scriptsize
 
 \begin{columns}[T]
 \column{0.32\textwidth}
 \textbf{Schema Grounding}\\
-{\scriptsize\textit{Tabular-source prompt hint}}
+{\textit{Tabular-source prompt hint}}
 \begin{itemize}
-    \item Levenshtein + value match + cardinality on real columns TOP-K to Prompt
-    \item \textbf{Per source-kind policy:}
+    \item Real-column TOP-K hints
+    \item \textbf{Per source-kind:}
         \item \textbf{CSV / SQLite} --- full scoring
-        \item \textbf{JSON} --- downgrade: inject sample + record\_fields into prompt (no Levenshtein)
+        \item \textbf{JSON} --- sample + record fields
         \item \textbf{text / image} --- skip
 \end{itemize}
 
 \column{0.32\textwidth}
 \textbf{Static Checker}\\
-{\scriptsize\textit{Pre-execution gate}}
+{\textit{Pre-execution gate}}
 \begin{itemize}
     \item Python AST + SQL scan
     \item \texttt{no\_such\_column}, \texttt{bad\_join\_key}, \texttt{\_x/\_y} suffixes
@@ -278,7 +315,7 @@ Every generated program emits \texttt{schema\_inspection}, \texttt{used\_columns
 
 \column{0.32\textwidth}
 \textbf{Local Repair (0 LLM)}\\
-{\scriptsize\textit{Deterministic patcher}}
+{\textit{Deterministic patcher}}
 \begin{itemize}
     \item 10+ deterministic patches
     \item Fuzzy column-name fix
@@ -288,9 +325,12 @@ Every generated program emits \texttt{schema\_inspection}, \texttt{used\_columns
 \end{itemize}
 \end{columns}
 
-\vspace{0.4em}
-\begin{alertblock}{Source-kind-agnostic defense (real safety net)}
-Grounding is a prompt optimization, not a universal guard. The \alert{actual per-source defense} lives downstream and works on \emph{every} source kind: \textbf{schema\_inspection} (codegen must dump \texttt{list(df.columns)} after load) $\to$ \textbf{static checker} $\to$ \textbf{cheap guard} (reads trace, not source) $\to$ \textbf{LLM judge}. All four read the same \texttt{SourceCapability} scan --- one audit trail, no drift.
+\vspace{0.25em}
+\begin{alertblock}{Runtime safety net}
+Grounding is only a prompt hint. The real defense is runtime evidence:
+\textbf{schema\_inspection} $\to$ \textbf{static checker} $\to$
+\textbf{cheap guard} $\to$ \textbf{LLM judge}. All read the same
+\texttt{SourceCapability} + \texttt{trace.json}, so the audit trail does not drift.
 \end{alertblock}
 
 \end{frame}
@@ -322,7 +362,7 @@ Grounding is a prompt optimization, not a universal guard. The \alert{actual per
 Execution & \texttt{execution\_failed / empty\_answer\_rows} & 1.0 / 0.75 & No/zero answer rows \\
 Repair & \texttt{suspicious\_fallback:schema\_retry} & 0.8 & Needed schema retry \\
 Trace & \texttt{trace\_missing:schema\_inspection} & 0.8 & No real-column check \\
-Trace & \texttt{zero\_intermediate\_count} & 0.8 & Mid-pipeline drops to 0 \\
+Trace & \texttt{zero\_intermediate\_count} & 0.8 & Intermediate count drops to 0 \\
 \textbf{Coverage} & \texttt{\textbf{field\_coverage\_mismatch}} & \textbf{0.75} & \textbf{Grounding candidate unused} \\
 Formula & \texttt{formula\_without\_trigger} & 0.75 & Unasked formula used \\
 \bottomrule
@@ -421,7 +461,7 @@ No suspicious answer ships unchecked: if guard escalates, judge \emph{will} run 
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{RAG Pipeline \& Multi-Agent Orchestrator}
+\frametitle{Retrieval Tools \& Multi-Agent Orchestrator}
 
 \begin{columns}[T]
 \column{0.55\textwidth}
@@ -613,7 +653,7 @@ Auditable, explainable, reproducible.
 \column{0.48\textwidth}
 \textbf{What we built:}
 \begin{itemize}
-    \item Tool-first Data Agent pipeline
+    \item Agentic controller with explicit tool actions
     \item Deterministic task profiling (zero LLM)
     \item Shape-based routing + failure-type cascade
     \item 10+ local repair rules (zero LLM)
@@ -626,7 +666,7 @@ Auditable, explainable, reproducible.
 
 \column{0.48\textwidth}
 \textbf{Observed performance (public):}\\
-Easy: $\sim$90 \quad Medium/Hard: $\sim$80
+Easy: $\sim$70 \quad Medium/Hard: $\sim$60
 
 \vspace{0.4em}
 \textbf{Future work:}

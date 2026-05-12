@@ -1,12 +1,13 @@
 # DataAgent-Bench Course Project
 
 这是一个面向 KDD Cup 2026 DataAgent-Bench 的课程项目工程。我们基于官方
-starter kit 做了完整的 agent pipeline 改造：从简单表格题的快速程序执行，到
-多源/中难题的 schema grounding、structured-doc extraction、repair、
-semantic guard 和可视化展示。
+starter kit 做了 agent 本体改造：从原始 ReAct 的自由工具调用，升级为
+`Plan -> Act -> Reflect -> Revise` 的数据智能体控制环。系统会先规划任务和工具，
+再执行 Python / SQL / RAG 动作，随后由 reflection critic 检查本轮行动是否真正
+满足题意，必要时带反馈重跑。
 
-本仓库不再只是原始 ReAct baseline，而是一个可运行、可评分、可展示推理过程的
-数据问答系统。
+Schema grounding、semantic guard、answer validation 不再是主贡献，而是服务于
+agent 控制环的记忆、证据和自检模块。
 
 > 给新队友交接或答辩准备时，建议直接看
 > [README.zh.md](README.zh.md) 里的“给小白队友看的系统设计详解”。那里按每一步
@@ -18,13 +19,13 @@ DataAgent-Bench 的任务输入是一个 `task.json` 和若干上下文文件，
 CSV、JSON、SQLite、Markdown/text 等数据源。系统需要读取问题，调用模型和工具，
 最终输出一个 `prediction.csv`。
 
-我们的目标是：
+我们的目标是优化 agent 行为本身：
 
-- 简单题尽量快：优先使用一次性代码生成和本地执行，不做多余 LLM judge。
-- 中难题尽量稳：加入 schema grounding、静态检查、执行修复、semantic guard。
-- 结果可审计：每个任务都写出 `trace.json`，记录 route、程序、执行结果和验证信息。
-- 置信度可解释：把 task profile、schema grounding、cheap guard 风险分和 judge
-  confidence 都写进 trace，方便复盘为什么快放行或升级。
+- 更会规划：`PlannerAgent` 先把问题拆成 schema / SQL / Python / document 等子任务。
+- 更会行动：`AgenticOperatorExecutor` 把 codegen、SQL/Python/RAG 执行和 repair 当作工具动作。
+- 更会反思：reflection critic 检查 plan、program、debug trace、answer shape 是否一致。
+- 更会修正：如果 critic 发现具体问题，agent 会把反馈注入下一轮工具行动并重跑一次。
+- 结果可审计：每个任务都写出 `trace.json`，记录 plan、action、reflection、repair 和最终答案。
 - 课堂可展示：提供 Streamlit 页面，输入 task id 后实时显示执行日志和最终推理摘要。
 
 ## 当前效果
@@ -42,22 +43,23 @@ CSV、JSON、SQLite、Markdown/text 等数据源。系统需要读取问题，�
 
 ## 我们做了什么
 
-### 1. Tool-first Operator Executor
+### 1. Agentic Operator Executor
 
-核心路径从“模型一步步 ReAct 调工具”改成更直接的程序执行：
+提交版核心路径从“准入/输出优化”改成“agent 控制环优化”：
 
 ```text
-schema/context inspect
--> codegen LLM 生成 Python / SQL / pandas 程序
--> static check
--> execute
--> answer validation
--> cheap semantic guard
--> 必要时 semantic plan + judge + repair
+PlannerAgent 生成任务级 plan
+-> OperatorExecutor 执行 Python / SQL / RAG 工具动作
+-> 程序输出 answer + debug_steps 作为观察结果
+-> Reflection critic 自检本轮行动
+-> 如有具体问题，带 revision_instruction 重跑一次
+-> semantic judge / answer validator 作为最终保险
 ```
 
 相关文件：
 
+- `src/data_agent_baseline/agents/agentic_operator.py`
+- `src/data_agent_baseline/agents/planner.py`
 - `src/data_agent_baseline/agents/operator_executor.py`
 - `src/data_agent_baseline/agents/tablellm_direct.py`
 - `src/data_agent_baseline/agents/static_checker.py`
@@ -128,8 +130,8 @@ semantic analyst
 ### 5. Router and Mixed-source Handling
 
 Router 不再简单按 difficulty 分配路线，而是结合 task type、context size、
-source shape、verifiability 和 operation complexity。多源任务会尽量走
-tool-first mixed path，再根据失败类型 fallback。
+source shape、verifiability 和 operation complexity。多源任务会优先走
+agentic mixed path，再根据失败类型 fallback。
 
 相关文件：
 
@@ -164,7 +166,7 @@ tool-first mixed path，再根据失败类型 fallback。
 │   ├── audit_route_flow.py          # 路由审计脚本
 │   └── run_full_public_eval.sh      # 全量 public eval 辅助脚本
 ├── src/data_agent_baseline/
-│   ├── agents/                      # router、operator、grounding、repair、guard
+│   ├── agents/                      # agent controller、router、operator、grounding、repair、guard
 │   ├── benchmark/                   # 数据集读取和 AnswerTable schema
 │   ├── eval/                        # 本地 column-match 评分和答案校验
 │   ├── run/                         # 单题/批量运行和 self-consistency
@@ -184,7 +186,8 @@ tool-first mixed path，再根据失败类型 fallback。
 | --- | --- |
 | `router.py` | 编译 task profile，选择 route，并在失败时 cascade fallback。 |
 | `task_compiler.py` | 扫描真实上下文，生成 source capabilities、operations、预算和基础置信度。 |
-| `operator_executor.py` | 主 tool-first pipeline：planning、codegen、repair、guard、judge。 |
+| `agentic_operator.py` | 提交版主 agent loop：plan、act、reflect、revise。 |
+| `operator_executor.py` | 工具行动执行器：codegen、repair、guard、judge。 |
 | `tablellm_direct.py` | 生成并执行 Python/pandas/SQL 程序。 |
 | `schema_grounding.py` | 将问题 concept 绑定到真实字段候选。 |
 | `semantic_guard.py` | 非 LLM cheap semantic risk gate。 |
@@ -294,7 +297,7 @@ UV_DEFAULT_INDEX=https://pypi.org/simple uv sync
 ### 2. 检查数据集
 
 ```bash
-uv run dabench status --config configs/router.deepseek.yaml
+uv run dabench status --config configs/agentic_router.example.yaml
 ```
 
 数据目录默认是：
@@ -307,7 +310,7 @@ data/public/output/
 ### 3. 跑单个任务
 
 ```bash
-uv run dabench run-task task_415 --config configs/router.deepseek.yaml
+uv run dabench run-task task_415 --config configs/agentic_router.example.yaml
 ```
 
 输出会写到：
@@ -321,13 +324,13 @@ artifacts/runs/<run_id>/<task_id>/
 ### 4. 跑一批任务
 
 ```bash
-uv run dabench run-benchmark --config configs/router.deepseek.yaml --limit 20
+uv run dabench run-benchmark --config configs/agentic_router.example.yaml --limit 20
 ```
 
 ### 5. 本地评分
 
 ```bash
-uv run dabench score-run artifacts/runs/<run_id> --config configs/router.deepseek.yaml
+uv run dabench score-run artifacts/runs/<run_id> --config configs/agentic_router.example.yaml
 ```
 
 评分使用官方列内容匹配逻辑：
@@ -347,7 +350,7 @@ UV_DEFAULT_INDEX=https://pypi.org/simple uv run streamlit run scripts/demo_app.p
 页面中输入：
 
 ```text
-Config: configs/router.deepseek.yaml
+Config: configs/agentic_router.example.yaml
 Task ID: task_415
 ```
 
@@ -365,7 +368,8 @@ Task ID: task_415
 
 | Config | 用途 |
 | --- | --- |
-| `configs/router.deepseek.yaml` | 当前主要实验配置，OpenAI-compatible API |
+| `configs/agentic_router.example.yaml` | 提交版 agent-first 路由模板，已脱敏 |
+| `configs/router.deepseek.yaml` | 本地实验配置，含个人 OpenAI-compatible endpoint/key，默认被 git 忽略 |
 | `configs/router.dashscope.yaml` | DashScope / Qwen API 配置 |
 | `configs/router.example.yaml` | 路由配置模板 |
 
@@ -375,7 +379,8 @@ Task ID: task_415
 
 | 路径 | 说明 |
 | --- | --- |
-| `src/data_agent_baseline/agents/operator_executor.py` | 主 tool-first 执行器 |
+| `src/data_agent_baseline/agents/agentic_operator.py` | 提交版主 agent：plan、act、reflect、revise |
+| `src/data_agent_baseline/agents/operator_executor.py` | 工具行动执行器 |
 | `src/data_agent_baseline/agents/tablellm_direct.py` | 代码生成 prompt 和执行封装 |
 | `src/data_agent_baseline/agents/schema_grounding.py` | 问题 concept 到真实 schema 的匹配 |
 | `src/data_agent_baseline/agents/semantic_guard.py` | 非 LLM 的 cheap semantic risk 检查 |
@@ -408,6 +413,6 @@ Task ID: task_415
 
 ## 结论
 
-对于课程提交，这已经不是一个简单 starter kit，而是一个有明确工程设计、
-可运行 pipeline、可视化展示和实验结果的完整项目。当前分数还有提升空间，
+对于课程提交，这已经不是一个简单 starter kit，而是一个有明确 agent 控制环、
+可运行系统、可视化展示和实验结果的完整项目。当前分数还有提升空间，
 但工作量和系统完整度是够提交的。

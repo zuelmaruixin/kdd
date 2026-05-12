@@ -1,12 +1,13 @@
 # DataAgent-Bench 课程项目
 
 这是一个面向 KDD Cup 2026 DataAgent-Bench 的课程项目工程。我们基于官方
-starter kit 做了完整的 agent pipeline 改造：从简单表格题的快速程序执行，到
-多源/中难题的 schema grounding、structured-doc extraction、repair、
-semantic guard 和可视化展示。
+starter kit 做了 agent 本体改造：从原始 ReAct 的自由工具调用，升级为
+`Plan -> Act -> Reflect -> Revise` 的数据智能体控制环。系统会先规划任务和工具，
+再执行 Python / SQL / RAG 动作，随后由 reflection critic 检查本轮行动是否真正
+满足题意，必要时带反馈重跑。
 
-本仓库不再只是原始 ReAct baseline，而是一个可运行、可评分、可展示推理过程的
-数据问答系统。
+Schema grounding、semantic guard、answer validation 不再是主贡献，而是服务于
+agent 控制环的记忆、证据和自检模块。
 
 ## 项目介绍
 
@@ -14,13 +15,13 @@ DataAgent-Bench 的任务输入是一个 `task.json` 和若干上下文文件，
 CSV、JSON、SQLite、Markdown/text 等数据源。系统需要读取问题，调用模型和工具，
 最终输出一个 `prediction.csv`。
 
-我们的设计目标是：
+我们的设计目标是优化 agent 行为本身：
 
-- 简单题尽量快：优先使用一次性代码生成和本地执行，不做多余 LLM judge。
-- 中难题尽量稳：加入 schema grounding、静态检查、执行修复、semantic guard。
-- 结果可审计：每个任务都写出 `trace.json`，记录 route、程序、执行结果和验证信息。
-- 置信度可解释：把 task profile、schema grounding、cheap guard 风险分和 judge
-  confidence 都写进 trace，方便复盘为什么快放行或升级。
+- 更会规划：`PlannerAgent` 先把问题拆成 schema / SQL / Python / document 等子任务。
+- 更会行动：`AgenticOperatorExecutor` 把 codegen、SQL/Python/RAG 执行和 repair 当作工具动作。
+- 更会反思：reflection critic 检查 plan、program、debug trace、answer shape 是否一致。
+- 更会修正：如果 critic 发现具体问题，agent 会把反馈注入下一轮工具行动并重跑一次。
+- 结果可审计：每个任务都写出 `trace.json`，记录 plan、action、reflection、repair 和最终答案。
 - 课堂可展示：提供 Streamlit 页面，输入 task id 后实时显示执行日志和最终推理摘要。
 
 按目前本地实验观察，简单题约 `70-80` 分，中等到困难题约 `60` 分左右。这不是官方
@@ -28,23 +29,22 @@ hidden test 结果，只是公开任务上的阶段性实验表现。作为课�
 闭环：能跑单题、批量跑、评分、保存 trace、解释过程，并且有针对错误模式的修复和
 guard。
 
-## Pipeline
+## Agent Loop
 
-核心路径从“模型一步步 ReAct 调工具”改成更直接的 tool-first 程序执行：
+提交版核心路径从“准入/输出优化”改成“agent 控制环优化”：
 
 ```text
-schema/context inspect
--> codegen LLM 生成 Python / SQL / pandas 程序
--> static check
--> execute
--> answer validation
--> cheap semantic guard
--> 必要时 semantic plan + judge + repair
+PlannerAgent 生成任务级 plan
+-> OperatorExecutor 执行 Python / SQL / RAG 工具动作
+-> 程序输出 answer + debug_steps 作为观察结果
+-> Reflection critic 自检本轮行动
+-> 如有具体问题，带 revision_instruction 重跑一次
+-> semantic judge / answer validator 作为最终保险
 ```
 
 主要能力：
 
-- `Tool-first Operator Executor`：优先生成可执行程序，减少多轮工具调用成本。
+- `Agentic Operator Executor`：plan、act、reflect、revise 的主 agent loop。
 - `Schema Grounding`：用真实 schema、列名、低基数字段样本和 dtype 给字段候选。
 - `Cheap Semantic Guard`：非 LLM 风险检查，低风险快放行，高风险升级。
 - `Semantic Consistency and Repair`：语义计划、程序对齐检查和语义修复。
@@ -125,7 +125,8 @@ artifacts/runs/<run_id>/<task_id>/
 
 | 路径 | 适合任务 | 说明 |
 | --- | --- | --- |
-| `operator_executor` | 大多数表格、混合、多源任务 | 主路径，生成程序并执行 |
+| `agentic_operator` | 大多数表格、混合、多源任务 | 主路径：规划、工具行动、反思、必要时重跑 |
+| `operator_executor` | 程序化工具行动 | 被 agentic operator 调用，负责 codegen / execute / repair |
 | `tablellm_direct` | 简单表格题或 legacy direct path | 更轻量的直接代码生成 |
 | `react` | 需要一步步工具调用的 fallback | 保留 starter kit 风格 |
 | `multi_agent` | 更复杂的规划/专家协作路径 | 保留可扩展空间 |
@@ -440,7 +441,8 @@ trace 用更直观的 Streamlit 页面展示出来。
 | --- | --- |
 | `router.py` | 编译 task profile，选择 route，并在失败时 cascade fallback。 |
 | `task_compiler.py` | 扫描真实上下文，生成 source capabilities、operations、预算和基础置信度。 |
-| `operator_executor.py` | 主 tool-first pipeline：planning、codegen、repair、guard、judge。 |
+| `agentic_operator.py` | 提交版主 agent loop：plan、act、reflect、revise。 |
+| `operator_executor.py` | 工具行动执行器：codegen、repair、guard、judge。 |
 | `tablellm_direct.py` | 生成并执行 Python/pandas/SQL 程序。 |
 | `schema_grounding.py` | 将问题 concept 绑定到真实字段候选。 |
 | `semantic_guard.py` | 非 LLM cheap semantic risk gate。 |
@@ -550,25 +552,25 @@ UV_DEFAULT_INDEX=https://pypi.org/simple uv sync
 检查数据集：
 
 ```bash
-uv run dabench status --config configs/router.deepseek.yaml
+uv run dabench status --config configs/agentic_router.example.yaml
 ```
 
 跑单个任务：
 
 ```bash
-uv run dabench run-task task_415 --config configs/router.deepseek.yaml
+uv run dabench run-task task_415 --config configs/agentic_router.example.yaml
 ```
 
 跑一批任务：
 
 ```bash
-uv run dabench run-benchmark --config configs/router.deepseek.yaml --limit 20
+uv run dabench run-benchmark --config configs/agentic_router.example.yaml --limit 20
 ```
 
 本地评分：
 
 ```bash
-uv run dabench score-run artifacts/runs/<run_id> --config configs/router.deepseek.yaml
+uv run dabench score-run artifacts/runs/<run_id> --config configs/agentic_router.example.yaml
 ```
 
 评分使用官方列内容匹配逻辑：
@@ -588,7 +590,7 @@ UV_DEFAULT_INDEX=https://pypi.org/simple uv run streamlit run scripts/demo_app.p
 页面中输入：
 
 ```text
-Config: configs/router.deepseek.yaml
+Config: configs/agentic_router.example.yaml
 Task ID: task_415
 ```
 
@@ -606,7 +608,8 @@ Task ID: task_415
 
 | Config | 用途 |
 | --- | --- |
-| `configs/router.deepseek.yaml` | 当前主要实验配置，OpenAI-compatible API |
+| `configs/agentic_router.example.yaml` | 提交版 agent-first 路由模板，已脱敏 |
+| `configs/router.deepseek.yaml` | 本地实验配置，含个人 OpenAI-compatible endpoint/key，默认被 git 忽略 |
 | `configs/router.dashscope.yaml` | DashScope / Qwen API 配置 |
 | `configs/router.example.yaml` | 路由配置模板 |
 
@@ -636,6 +639,6 @@ artifacts/runs/<run_id>/score_summary.json
 
 ## 结论
 
-对于课程提交，这已经不是一个简单 starter kit，而是一个有明确工程设计、
-可运行 pipeline、可视化展示和实验结果的完整项目。当前分数还有提升空间，
+对于课程提交，这已经不是一个简单 starter kit，而是一个有明确 agent 控制环、
+可运行系统、可视化展示和实验结果的完整项目。当前分数还有提升空间，
 但工作量和系统完整度已经可以支撑展示和答辩。
