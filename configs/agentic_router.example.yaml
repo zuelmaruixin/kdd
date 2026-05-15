@@ -69,8 +69,17 @@ agent:
         temperature: 0.0
         max_tokens: 4096
         request_timeout: 360
-        max_steps: 40
-        verification_rounds: 1
+        max_steps: 32
+        # Default 0: commit on first answer. The deterministic React
+        # answer guard (use_answer_guard) bumps to one verify round only
+        # when it finds concrete risk (knowledge.md not read, no
+        # computation, empty/invalid draft). Unconditional 2-round
+        # verification was found to regress accuracy + double wallclock
+        # (Huang et al. ICLR 2024 — intrinsic self-correction hurts
+        # without an external signal; CRITIC ICLR 2024 — only escalate
+        # on grounded checks).
+        verification_rounds: 0
+        use_answer_guard: true
         self_consistency:
           num_samples: 1
 
@@ -152,7 +161,7 @@ agent:
 run:
   output_dir: artifacts/runs
   max_workers: 1
-  task_timeout_seconds: 1500
+  task_timeout_seconds: 600
 
 scoring:
   redundancy_lambda: 0.5

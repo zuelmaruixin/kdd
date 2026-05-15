@@ -5,8 +5,9 @@ import re
 import subprocess
 import sys
 import time
-from html import escape
+from dataclasses import dataclass, field
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -24,480 +25,418 @@ _RESULT_PREFIX = "DEMO_RESULT_JSON="
 _EVENT_PREFIX = "__DEMO_EVENT__"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
+# Unicode separators — declared at module level because Python 3.11
+# disallows backslashes inside f-string expression parts, so we can't
+# write "\u00b7" inline in f-strings. (Py3.12 relaxes this.)
+_DOT = " \u00b7 "
+
+
+# ============================================================================
+# CSS — single-page theater layout
+# ============================================================================
 
 _APP_CSS = """
 <style>
 section[data-testid="stSidebar"] {
   background: linear-gradient(180deg, #f7fafc 0%, #edf2f7 100%);
 }
-.hero {
-  padding: 1.2rem 1.4rem;
-  border: 1px solid #d7e2ef;
-  border-radius: 10px;
-  background:
-    linear-gradient(120deg, rgba(8, 54, 93, 0.96), rgba(22, 89, 111, 0.92)),
-    linear-gradient(90deg, #08365d, #2a6f73);
-  color: white;
-  margin-bottom: 1rem;
-}
-.hero h1 {
-  margin: 0 0 .2rem 0;
-  font-size: 2.1rem;
-  letter-spacing: 0;
-}
-.hero p {
-  margin: 0;
-  color: #d8eef7;
-  font-size: .98rem;
-}
-.metric-grid {
+
+/* ====== Theater hero ====== */
+.theater-hero {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: .7rem;
-  margin: .5rem 0 1rem 0;
-}
-.metric-card {
-  padding: .78rem .88rem;
-  border: 1px solid #dde7f0;
-  border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, .05);
-}
-.metric-card .label {
-  color: #64748b;
-  font-size: .75rem;
-  text-transform: uppercase;
-  letter-spacing: .02em;
-}
-.metric-card .value {
-  color: #0f172a;
-  font-size: 1.25rem;
-  font-weight: 700;
-  margin-top: .15rem;
-  overflow-wrap: anywhere;
-}
-.agent-rail {
-  display: grid;
-  grid-template-columns: repeat(7, minmax(120px, 1fr));
-  gap: .65rem;
-  margin: .8rem 0 1rem 0;
-}
-.step-card {
-  position: relative;
-  min-height: 128px;
-  padding: .75rem .78rem;
-  border: 1px solid #dce7f3;
-  border-radius: 9px;
-  background: #ffffff;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, .06);
-}
-.step-card.ok { border-top: 5px solid #16856f; }
-.step-card.warn { border-top: 5px solid #c4821a; }
-.step-card.err { border-top: 5px solid #c2413a; }
-.step-card.idle { border-top: 5px solid #94a3b8; }
-.step-index {
-  font-size: .68rem;
-  font-weight: 800;
-  color: #64748b;
-  letter-spacing: .08em;
-}
-.step-title {
-  margin-top: .15rem;
-  color: #0f172a;
-  font-size: .98rem;
-  font-weight: 800;
-}
-.step-status {
-  display: inline-block;
-  margin-top: .45rem;
-  padding: .14rem .38rem;
-  border-radius: 999px;
-  font-size: .68rem;
-  font-weight: 800;
-  background: #eef2f7;
-  color: #334155;
-}
-.step-card.ok .step-status { background: #e7f7f2; color: #04705d; }
-.step-card.warn .step-status { background: #fff4de; color: #9a5b00; }
-.step-card.err .step-status { background: #fdeceb; color: #a92822; }
-.step-detail {
-  margin-top: .5rem;
-  color: #475569;
-  font-size: .78rem;
-  line-height: 1.25;
-  overflow-wrap: anywhere;
-}
-.panel {
-  border: 1px solid #dce7f3;
-  border-radius: 10px;
-  padding: .9rem 1rem;
-  background: #ffffff;
-  margin: .6rem 0;
-}
-.panel-title {
-  color: #0f172a;
-  font-weight: 800;
-  margin-bottom: .45rem;
-}
-.subtask {
-  border-left: 4px solid #2a6f73;
-  padding: .45rem .7rem;
-  background: #f8fbfd;
-  margin: .42rem 0;
-  border-radius: 6px;
-}
-.subtask .sid {
-  font-weight: 800;
-  color: #0f4f5f;
-}
-.tiny {
-  color: #64748b;
-  font-size: .76rem;
-}
-.dashboard-title {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
+  grid-template-columns: 1fr auto;
   gap: 1rem;
-  margin: .4rem 0 .8rem 0;
-}
-.dashboard-title h2 {
-  margin: 0;
-  color: #0f172a;
-  font-size: 1.35rem;
-  letter-spacing: 0;
-}
-.dashboard-title .path {
-  color: #64748b;
-  font-size: .78rem;
-  overflow-wrap: anywhere;
-  text-align: right;
-}
-.status-strip {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: .65rem;
-  margin: .6rem 0 1rem 0;
-}
-.status-card {
-  padding: .78rem .88rem;
-  border: 1px solid #dde7f0;
-  border-radius: 8px;
-  background: #ffffff;
-}
-.status-card.good { border-left: 5px solid #16856f; }
-.status-card.bad { border-left: 5px solid #c2413a; }
-.status-card.score { border-left: 5px solid #2f6fb3; }
-.status-card.warn { border-left: 5px solid #c4821a; }
-.status-card.neutral { border-left: 5px solid #64748b; }
-.status-card .label {
-  color: #64748b;
-  font-size: .72rem;
-  text-transform: uppercase;
-  letter-spacing: .02em;
-}
-.status-card .value {
-  color: #0f172a;
-  font-size: 1.2rem;
-  font-weight: 800;
-  margin-top: .15rem;
-}
-.record-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: .45rem;
-  margin: .2rem 0 .8rem 0;
-}
-.record-badge {
-  border: 1px solid #d8e3ee;
-  border-radius: 999px;
-  padding: .22rem .55rem;
-  background: #fff;
-  color: #334155;
-  font-size: .76rem;
-  font-weight: 700;
-}
-.record-badge.ok { background: #e7f7f2; border-color: #c5eadf; color: #04705d; }
-.record-badge.fail { background: #fdeceb; border-color: #f3c7c3; color: #a92822; }
-.record-badge.score { background: #eaf3ff; border-color: #c7def7; color: #1d5d9b; }
-@media (max-width: 1100px) {
-  .status-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .dashboard-title { display: block; }
-  .dashboard-title .path { text-align: left; margin-top: .2rem; }
-}
-@media (max-width: 1100px) {
-  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .agent-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-.live-hero {
-  display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: .9rem 1.1rem;
-  border: 1px solid #d7e2ef;
-  border-radius: 10px;
-  background: linear-gradient(120deg, rgba(8, 54, 93, .96), rgba(22, 89, 111, .92));
+  padding: 1rem 1.2rem;
+  background: linear-gradient(120deg, #08365d 0%, #2a6f73 100%);
   color: white;
-  margin-bottom: .6rem;
+  border-radius: 10px;
+  margin: 0 0 .8rem 0;
 }
-.live-hero .stage {
-  font-size: 1.05rem;
-  font-weight: 800;
-  letter-spacing: .02em;
+.theater-hero .th-task {
+  font-size: .76rem; font-weight: 800;
+  letter-spacing: .08em; text-transform: uppercase;
+  color: #c8e6f4;
 }
-.live-hero .meta {
-  color: #d8eef7;
-  font-size: .82rem;
+.theater-hero .th-question {
+  font-size: 1.04rem; line-height: 1.45; margin-top: .25rem;
+  color: #ffffff; font-weight: 600;
 }
-.live-hero .pulse {
-  display: inline-block;
-  width: .65rem;
-  height: .65rem;
-  border-radius: 50%;
-  margin-right: .55rem;
-  background: #ffd166;
+.theater-hero .th-meta {
+  font-size: .8rem; color: #d8eef7; margin-top: .35rem;
+}
+.theater-hero .th-state {
+  display: flex; align-items: center; gap: .6rem;
+  font-size: .82rem; font-weight: 800;
+  background: rgba(255,255,255,.12); border-radius: 8px;
+  padding: .55rem .85rem; align-self: start;
+  letter-spacing: .03em; white-space: nowrap;
+}
+.theater-hero .pulse {
+  display: inline-block; width: .68rem; height: .68rem;
+  border-radius: 50%; background: #ffd166;
   box-shadow: 0 0 0 0 rgba(255, 209, 102, .6);
   animation: livePulse 1.2s infinite;
 }
-.live-hero.complete .pulse {
-  background: #4ade80;
-  animation: none;
-}
-.live-hero.failed .pulse {
-  background: #f97373;
-  animation: none;
-}
+.theater-hero.complete .pulse { background: #4ade80; animation: none; }
+.theater-hero.failed   .pulse { background: #f97373; animation: none; }
+.theater-hero.replay   .pulse { background: #94a3b8; animation: none; }
+.theater-hero.idle     .pulse { background: #94a3b8; animation: none; }
 @keyframes livePulse {
   0%   { box-shadow: 0 0 0 0 rgba(255, 209, 102, .6); }
   60%  { box-shadow: 0 0 0 12px rgba(255, 209, 102, 0); }
   100% { box-shadow: 0 0 0 0 rgba(255, 209, 102, 0); }
 }
-.tl {
-  border: 1px solid #dce7f3;
-  border-radius: 10px;
-  background: #ffffff;
-  padding: .65rem .65rem;
-  max-height: 540px;
-  overflow-y: auto;
-}
-.tl-row {
+
+/* ====== Stage rail (7 pills) ====== */
+.stage-rail {
   display: grid;
-  grid-template-columns: 78px 1fr 70px;
-  gap: .6rem;
-  align-items: start;
-  padding: .42rem .55rem;
-  border-radius: 7px;
-  border-left: 3px solid #94a3b8;
-  background: #f8fbfd;
-  margin-bottom: .35rem;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: .35rem;
+  margin: .2rem 0 .9rem 0;
 }
-.tl-row.run { background: #fff7e0; border-left-color: #c4821a; }
-.tl-row.ok { background: #ecf8f3; border-left-color: #16856f; }
-.tl-row.warn { background: #fff4de; border-left-color: #c4821a; }
-.tl-row.err { background: #fdeceb; border-left-color: #c2413a; }
-.tl-row.info { background: #eef4fb; border-left-color: #2f6fb3; }
-.tl-tag {
-  font-size: .68rem;
-  font-weight: 800;
-  color: #334155;
-  letter-spacing: .04em;
-  text-transform: uppercase;
-  padding: .12rem .35rem;
-  background: #e2e8f0;
-  border-radius: 4px;
-  text-align: center;
-  white-space: nowrap;
+.stage-pill {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: .5rem .6rem;
+  display: flex; flex-direction: column; gap: .12rem;
+  min-height: 78px;
 }
-.tl-row.run .tl-tag { background: #fde8b8; color: #7a4d00; }
-.tl-row.ok .tl-tag { background: #cbe9dd; color: #04705d; }
-.tl-row.warn .tl-tag { background: #fde2b3; color: #7a4d00; }
-.tl-row.err .tl-tag { background: #fbcdc9; color: #a92822; }
-.tl-row.info .tl-tag { background: #cfdcf0; color: #1d5d9b; }
-.tl-body { color: #0f172a; font-size: .86rem; line-height: 1.35; }
-.tl-body .tl-head { font-weight: 800; }
-.tl-body .tl-detail { color: #475569; font-size: .8rem; margin-top: .12rem; overflow-wrap: anywhere; }
-.tl-body pre {
-  background: #f1f5f9;
-  border-radius: 4px;
-  padding: .35rem .45rem;
-  margin: .25rem 0 0 0;
-  font-size: .72rem;
-  line-height: 1.35;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 180px;
-  overflow-y: auto;
+.stage-pill .sp-title {
+  font-size: .66rem; font-weight: 800;
+  letter-spacing: .05em; text-transform: uppercase; color: #94a3b8;
 }
-.tl-time {
-  color: #64748b;
-  font-size: .72rem;
-  text-align: right;
+.stage-pill .sp-label {
+  font-size: .82rem; font-weight: 800; color: #0f172a;
+  overflow-wrap: anywhere;
+}
+.stage-pill .sp-detail {
+  font-size: .68rem; color: #64748b; line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.stage-pill.idle .sp-label, .stage-pill.idle .sp-detail { color: #cbd5e1; }
+.stage-pill.run  { background: #fff7e0; border-color: #fde8b8; }
+.stage-pill.run  .sp-title { color: #7a4d00; }
+.stage-pill.ok   { background: #ecf8f3; border-color: #c5eadf; }
+.stage-pill.ok   .sp-title { color: #04705d; }
+.stage-pill.warn { background: #fff4de; border-color: #fde8b8; }
+.stage-pill.warn .sp-title { color: #7a4d00; }
+.stage-pill.err  { background: #fdeceb; border-color: #f3c7c3; }
+.stage-pill.err  .sp-title { color: #a92822; }
+
+/* ====== Live stream of parsed cards ====== */
+.stream-title {
+  font-size: .72rem; font-weight: 800;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: #64748b; margin: .35rem 0 .3rem 0;
+}
+.stream {
+  display: flex; flex-direction: column; gap: .55rem;
+  padding: .45rem; border-radius: 10px;
+  border: 1px solid #dce7f3; background: #f7fbff;
+  max-height: 720px; overflow-y: auto;
+}
+.stream.empty { color: #94a3b8; font-style: italic; padding: 1.5rem; text-align: center; }
+.sr {
+  position: relative; background: #ffffff;
+  border: 1px solid #dce7f3; border-radius: 9px;
+  padding: .65rem .8rem .65rem 1.05rem;
+  display: flex; flex-direction: column; gap: .4rem;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+}
+.sr::before {
+  content: ""; position: absolute;
+  top: 0; left: 0; width: 5px; height: 100%;
+  background: #94a3b8; border-radius: 9px 0 0 9px;
+}
+.sr.ok::before   { background: #16856f; }
+.sr.warn::before { background: #c4821a; }
+.sr.err::before  { background: #c2413a; }
+.sr.run::before  { background: #2f6fb3; }
+.sr.info::before { background: #94a3b8; }
+.sr-head {
+  display: flex; align-items: center; gap: .55rem;
+}
+.sr-tag {
+  display: inline-block; padding: .16rem .45rem; border-radius: 5px;
+  background: #e2e8f0; color: #334155;
+  font-size: .66rem; font-weight: 800;
+  letter-spacing: .05em; text-transform: uppercase; flex-shrink: 0;
+}
+.sr.ok   .sr-tag { background: #cbe9dd; color: #04705d; }
+.sr.warn .sr-tag { background: #fde8b8; color: #7a4d00; }
+.sr.err  .sr-tag { background: #fbcdc9; color: #a92822; }
+.sr.run  .sr-tag { background: #cfdcf0; color: #1d5d9b; }
+.sr-title {
+  flex: 1; font-weight: 800; color: #0f172a; font-size: .92rem;
+  overflow-wrap: anywhere; line-height: 1.3;
+}
+.sr-meta {
+  font-size: .7rem; color: #64748b; flex-shrink: 0;
   font-variant-numeric: tabular-nums;
 }
-.live-side {
-  border: 1px solid #dce7f3;
-  border-radius: 10px;
-  padding: .65rem .8rem;
-  background: #ffffff;
+.sr-thought {
+  font-style: italic; color: #475569; font-size: .82rem;
+  border-left: 3px solid #cbd5e1; padding: .12rem .6rem;
+  line-height: 1.4; overflow-wrap: anywhere;
+}
+.sr-subtitle {
+  color: #1f2937; font-size: .84rem; line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.sr-code {
+  background: #0f172a; color: #e2e8f0; border-radius: 6px;
+  padding: .55rem .7rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .74rem; line-height: 1.45;
+  max-height: 280px; overflow: auto;
+  white-space: pre; word-break: normal; margin: 0;
+}
+.sr-code.sql { background: #1e293b; }
+.sr-obs {
+  background: #f1f5f9; border-radius: 6px; padding: .45rem .6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .74rem; line-height: 1.4; color: #1f2937;
+  max-height: 220px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word; margin: 0;
+}
+.sr-badges { display: flex; flex-wrap: wrap; gap: .28rem; }
+.sr-badge {
+  font-size: .66rem; font-weight: 700;
+  padding: .14rem .42rem; border-radius: 5px;
+  background: #f1f5f9; color: #334155; letter-spacing: .02em;
+}
+.sr-badge.good { background: #cbe9dd; color: #04705d; }
+.sr-badge.bad  { background: #fbcdc9; color: #a92822; }
+.sr-badge.info { background: #dbeafe; color: #1d4ed8; }
+
+/* ====== Side stats / file list / answer box ====== */
+.side-box {
+  border: 1px solid #dce7f3; border-radius: 10px;
+  padding: .65rem .85rem; background: #ffffff;
   margin-bottom: .55rem;
 }
-.live-side .ls-title {
-  font-size: .72rem;
-  text-transform: uppercase;
-  letter-spacing: .04em;
-  color: #64748b;
-  font-weight: 800;
-  margin-bottom: .35rem;
+.side-box .sb-title {
+  font-size: .68rem; font-weight: 800; letter-spacing: .06em;
+  text-transform: uppercase; color: #64748b;
+  margin-bottom: .45rem;
 }
-.live-side .ls-row {
+.side-box .sb-row {
+  display: flex; justify-content: space-between; gap: .55rem;
+  padding: .22rem 0; border-bottom: 1px dashed #e2e8f0;
   font-size: .82rem;
-  color: #0f172a;
-  padding: .18rem 0;
-  border-bottom: 1px dashed #e2e8f0;
 }
-.live-side .ls-row:last-child { border-bottom: none; }
-.live-side .ls-row b { color: #1d5d9b; }
-.live-side .ls-row .muted { color: #64748b; }
-.live-side.empty .ls-row { color: #94a3b8; font-style: italic; }
-.step-card.run {
-  border-top: 5px solid #c4821a;
-  background: linear-gradient(180deg, #fffaef 0%, #ffffff 100%);
+.side-box .sb-row:last-child { border-bottom: none; }
+.side-box .sb-row .label { color: #64748b; }
+.side-box .sb-row .value {
+  color: #0f172a; font-weight: 800;
+  font-variant-numeric: tabular-nums;
 }
-.step-card.run .step-status { background: #fde8b8; color: #7a4d00; }
+.side-box.empty { color: #94a3b8; font-style: italic; }
+.side-box .sb-answer-table {
+  width: 100%; border-collapse: collapse; font-size: .76rem;
+}
+.side-box .sb-answer-table th, .side-box .sb-answer-table td {
+  border-bottom: 1px solid #e2e8f0; padding: .25rem .35rem;
+  text-align: left; vertical-align: top;
+}
+.side-box .sb-answer-table th { color: #475569; font-weight: 800; }
+.side-box .sb-answer-table td { color: #0f172a; }
+.side-box .sb-file {
+  font-family: ui-monospace, monospace; font-size: .74rem;
+  color: #0f172a; padding: .2rem 0; word-break: break-all;
+}
+.side-box .sb-file .muted { color: #64748b; }
 
-/* ===== Run dashboard (history) card grid ===== */
+/* ====== Top hero (idle screen) ====== */
+.hero {
+  padding: 1.1rem 1.4rem;
+  border: 1px solid #d7e2ef;
+  border-radius: 10px;
+  background: linear-gradient(120deg, rgba(8, 54, 93, .96), rgba(22, 89, 111, .92));
+  color: white; margin-bottom: 1rem;
+}
+.hero h1 { margin: 0 0 .2rem 0; font-size: 2rem; }
+.hero p { margin: 0; color: #d8eef7; font-size: .96rem; }
+
+/* ====== Run dashboard summary cards ====== */
+.dashboard-title {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 1rem; margin: .4rem 0 .8rem 0;
+}
+.dashboard-title h2 { margin: 0; color: #0f172a; font-size: 1.35rem; }
+.dashboard-title .path { color: #64748b; font-size: .78rem; overflow-wrap: anywhere; text-align: right; }
+.status-strip {
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: .65rem; margin: .6rem 0 1rem 0;
+}
+.status-card {
+  padding: .78rem .88rem; border: 1px solid #dde7f0; border-radius: 8px;
+  background: #ffffff;
+}
+.status-card.good    { border-left: 5px solid #16856f; }
+.status-card.bad     { border-left: 5px solid #c2413a; }
+.status-card.score   { border-left: 5px solid #2f6fb3; }
+.status-card.warn    { border-left: 5px solid #c4821a; }
+.status-card.neutral { border-left: 5px solid #64748b; }
+.status-card .label {
+  color: #64748b; font-size: .72rem;
+  text-transform: uppercase; letter-spacing: .03em;
+}
+.status-card .value {
+  color: #0f172a; font-size: 1.2rem; font-weight: 800; margin-top: .15rem;
+}
+
+/* ====== Run dashboard (history) card grid ====== */
 .run-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: .85rem;
   margin: .6rem 0 1rem 0;
 }
+.run-card-link {
+  text-decoration: none; color: inherit; display: block;
+  border-radius: 10px;
+}
+.run-card-link:hover .run-card {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 14px rgba(15, 23, 42, .10);
+  border-color: #1d5d9b;
+}
 .run-card {
   background: #ffffff;
   border: 1px solid #dde7f0;
   border-radius: 10px;
   padding: .85rem .95rem;
-  display: flex;
-  flex-direction: column;
-  gap: .55rem;
+  display: flex; flex-direction: column; gap: .55rem;
   box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
-  position: relative;
-  overflow: hidden;
+  position: relative; overflow: hidden;
+  cursor: pointer;
+  transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
 }
 .run-card::before {
-  content: "";
-  position: absolute;
-  top: 0; left: 0;
-  width: 6px; height: 100%;
+  content: ""; position: absolute;
+  top: 0; left: 0; width: 6px; height: 100%;
   background: #94a3b8;
 }
-.run-card.ok::before    { background: #16856f; }
-.run-card.fail::before  { background: #c2413a; }
+.run-card.ok::before      { background: #16856f; }
+.run-card.fail::before    { background: #c2413a; }
 .run-card.perfect::before { background: #2f6fb3; }
 .run-card .rc-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: .5rem;
+  display: flex; align-items: center; justify-content: space-between; gap: .5rem;
 }
 .run-card .rc-task {
-  font-weight: 800;
-  font-size: .92rem;
-  color: #0f172a;
-  letter-spacing: .01em;
+  font-weight: 800; font-size: .92rem; color: #0f172a; letter-spacing: .01em;
 }
-.run-card .rc-run {
-  font-size: .68rem;
-  color: #64748b;
-  font-variant-numeric: tabular-nums;
-}
-.run-card .rc-score {
-  display: flex;
-  align-items: baseline;
-  gap: .55rem;
-}
+.run-card .rc-score { display: flex; align-items: baseline; gap: .55rem; }
 .run-card .rc-score .num {
-  font-size: 2rem;
-  font-weight: 800;
-  letter-spacing: -.02em;
-  font-variant-numeric: tabular-nums;
-  color: #0f172a;
+  font-size: 2rem; font-weight: 800; letter-spacing: -.02em;
+  font-variant-numeric: tabular-nums; color: #0f172a;
 }
-.run-card.ok .rc-score .num    { color: #04705d; }
-.run-card.fail .rc-score .num  { color: #a92822; }
+.run-card.ok      .rc-score .num { color: #04705d; }
+.run-card.fail    .rc-score .num { color: #a92822; }
 .run-card.perfect .rc-score .num { color: #1d5d9b; }
-.run-card .rc-score .sub {
-  font-size: .76rem;
-  color: #475569;
-  font-weight: 600;
-}
+.run-card .rc-score .sub { font-size: .76rem; color: #475569; font-weight: 600; }
 .run-card .rc-status-pill {
-  display: inline-block;
-  padding: .18rem .55rem;
-  border-radius: 999px;
-  font-size: .68rem;
-  font-weight: 800;
-  letter-spacing: .04em;
-  background: #e2e8f0;
-  color: #475569;
+  display: inline-block; padding: .18rem .55rem; border-radius: 999px;
+  font-size: .68rem; font-weight: 800; letter-spacing: .04em;
+  background: #e2e8f0; color: #475569;
 }
-.run-card.ok .rc-status-pill   { background: #c5eadf; color: #04705d; }
+.run-card.ok   .rc-status-pill { background: #c5eadf; color: #04705d; }
 .run-card.fail .rc-status-pill { background: #f3c7c3; color: #a92822; }
 .run-card .rc-question {
-  font-size: .82rem;
-  color: #1f2937;
-  line-height: 1.4;
-  max-height: 4.2em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
+  font-size: .82rem; color: #1f2937; line-height: 1.4;
+  max-height: 4.2em; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
 }
-.run-card .rc-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: .3rem;
-}
+.run-card .rc-badges { display: flex; flex-wrap: wrap; gap: .3rem; }
 .run-card .rc-badge {
-  background: #f1f5f9;
-  color: #334155;
-  font-size: .68rem;
-  font-weight: 700;
-  padding: .15rem .42rem;
-  border-radius: 6px;
-  letter-spacing: .02em;
-  text-transform: uppercase;
+  background: #f1f5f9; color: #334155;
+  font-size: .68rem; font-weight: 700;
+  padding: .15rem .42rem; border-radius: 6px;
+  letter-spacing: .02em; text-transform: uppercase;
 }
-.run-card .rc-badge.route { background: #dbeafe; color: #1d4ed8; }
-.run-card .rc-badge.gate-pass { background: #c5eadf; color: #04705d; }
-.run-card .rc-badge.gate-fail { background: #f3c7c3; color: #a92822; }
-.run-card .rc-badge.difficulty-easy { background: #d6eedb; color: #166534; }
+.run-card .rc-badge.route          { background: #dbeafe; color: #1d4ed8; }
+.run-card .rc-badge.gate-pass      { background: #c5eadf; color: #04705d; }
+.run-card .rc-badge.gate-fail      { background: #f3c7c3; color: #a92822; }
+.run-card .rc-badge.difficulty-easy   { background: #d6eedb; color: #166534; }
 .run-card .rc-badge.difficulty-medium { background: #fde9c5; color: #92400e; }
-.run-card .rc-badge.difficulty-hard { background: #f3d2cd; color: #991b1b; }
+.run-card .rc-badge.difficulty-hard   { background: #f3d2cd; color: #991b1b; }
 .run-card .rc-meta {
-  display: flex;
-  justify-content: space-between;
-  font-size: .68rem;
-  color: #64748b;
-  font-variant-numeric: tabular-nums;
+  display: flex; justify-content: space-between;
+  font-size: .68rem; color: #64748b; font-variant-numeric: tabular-nums;
 }
 .run-card .rc-failure {
-  background: #fff5f4;
-  border: 1px solid #f7d2cf;
-  border-radius: 6px;
-  padding: .35rem .55rem;
-  font-size: .72rem;
-  color: #a92822;
+  background: #fff5f4; border: 1px solid #f7d2cf; border-radius: 6px;
+  padding: .35rem .55rem; font-size: .72rem; color: #a92822;
   font-family: ui-monospace, monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.app-topbar {
+  background: linear-gradient(120deg, #08365d 0%, #2a6f73 100%);
+  color: #fff;
+  padding: .8rem 1.1rem;
+  border-radius: 10px;
+  margin: 0 0 .55rem 0;
+  display: flex; flex-direction: column; gap: .1rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,.10);
+}
+.app-topbar .tb-title {
+  font-size: 1.05rem; font-weight: 800; letter-spacing: .02em;
+}
+.app-topbar .tb-sub {
+  font-size: .76rem; color: #cfe6ee;
+}
+
+/* Top tabs: tighter, less busy. */
+.stTabs [data-baseweb="tab-list"] {
+  gap: .25rem;
+  border-bottom: 1px solid #dde7f0;
+}
+.stTabs [data-baseweb="tab"] {
+  padding: .45rem .95rem;
+  font-weight: 600;
+  font-size: .85rem;
+}
+
+.batch-progress {
+  position: sticky; top: 0; z-index: 50;
+  background: linear-gradient(120deg, #08365d 0%, #2a6f73 100%);
+  color: #fff; padding: .55rem .85rem; border-radius: 8px;
+  font-size: .82rem; margin: .6rem 0; box-shadow: 0 2px 8px rgba(0,0,0,.12);
+}
+.batch-progress code {
+  background: rgba(255,255,255,.18); padding: .05rem .35rem;
+  border-radius: 4px; color: #fff; font-size: .78rem;
+}
+.batch-task-header {
+  margin: 1.1rem 0 .35rem 0;
+  padding: .35rem .6rem;
+  background: #eef3f8; border-left: 3px solid #08365d;
+  border-radius: 4px;
+  font-size: .82rem; color: #1a3a5c; font-weight: 600;
+}
+.batch-task-header code {
+  background: #fff; padding: .05rem .3rem; border-radius: 3px;
+  font-size: .8rem; color: #08365d;
+}
+
+@media (max-width: 1100px) {
+  .stage-rail   { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .status-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dashboard-title { display: block; }
+  .dashboard-title .path { text-align: left; margin-top: .2rem; }
+  .theater-hero { grid-template-columns: 1fr; }
 }
 </style>
 """
 
+
+# ============================================================================
+# Subprocess runner (unchanged)
+# ============================================================================
 
 _SUBPROCESS_RUNNER = r"""
 import json
@@ -506,11 +445,6 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-# Force unbuffered stdout/stderr so structured events reach the parent
-# Streamlit process immediately. Without this the Rich console (stderr)
-# block-buffers when its destination is a pipe, which makes the live
-# timeline appear to "jump to the end" — events get held in OS buffers
-# until enough bytes accumulate to flush a block.
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 sys.stdout.reconfigure(line_buffering=True, write_through=True)
 sys.stderr.reconfigure(line_buffering=True, write_through=True)
@@ -522,17 +456,22 @@ from data_agent_baseline.run.runner import create_run_output_dir, run_single_tas
 task_id = sys.argv[1]
 config_path = Path(sys.argv[2])
 run_id = sys.argv[3]
+dataset_root_override = sys.argv[4] if len(sys.argv) > 4 else ""
+batch_run_dir_override = os.environ.get("DEMO_BATCH_RUN_DIR", "")
 
-# Surface a synthetic "booting" event right away so the timeline shows
-# the subprocess actually started, even before the agent emits its first
-# real progress event.
 print('__DEMO_EVENT__' + json.dumps({"type": "task_start", "task_id": task_id, "question": "(loading)", "difficulty": ""}, ensure_ascii=False), flush=True)
 
 config = load_app_config(config_path)
+if dataset_root_override:
+    config = replace(config, dataset=replace(config.dataset, root_path=Path(dataset_root_override)))
 config = replace(config, run=replace(config.run, run_id=run_id, max_workers=1))
 set_progress_logger(ProgressLogger(enabled=True, lang="zh", emit_demo_events=True))
 
-_, run_output_dir = create_run_output_dir(config.run.output_dir, run_id=config.run.run_id)
+if batch_run_dir_override:
+    run_output_dir = Path(batch_run_dir_override)
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+else:
+    _, run_output_dir = create_run_output_dir(config.run.output_dir, run_id=config.run.run_id)
 artifact = run_single_task(
     task_id=task_id,
     config=config,
@@ -540,6 +479,11 @@ artifact = run_single_task(
 )
 print("DEMO_RESULT_JSON=" + json.dumps(artifact.to_dict(), ensure_ascii=False), flush=True)
 """
+
+
+# ============================================================================
+# Trace / artifact lookup helpers
+# ============================================================================
 
 
 def _load_trace(path: Path) -> dict[str, Any]:
@@ -550,14 +494,14 @@ def _latest_trace_path() -> Path | None:
     candidates = list((PROJECT_ROOT / "artifacts" / "runs").glob("**/trace.json"))
     if not candidates:
         return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def _latest_run_dir() -> Path | None:
     traces = list((PROJECT_ROOT / "artifacts" / "runs").glob("*/task_*/trace.json"))
     if not traces:
         return None
-    latest_trace = max(traces, key=lambda path: path.stat().st_mtime)
+    latest_trace = max(traces, key=lambda p: p.stat().st_mtime)
     return latest_trace.parent.parent
 
 
@@ -610,719 +554,974 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
-def _tail_lines(lines: list[str], *, max_lines: int = 140) -> str:
-    return "".join(lines[-max_lines:]).strip() or "Starting..."
+def _clip(value: Any, limit: int = 140) -> str:
+    text = "" if value is None else str(value)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "\u2026"
 
 
-_STAGE_ORDER = ("observe", "plan", "act", "execute", "trace", "reflect", "verify")
+# ============================================================================
+# Stage rail (7 phases of the agent loop)
+# ============================================================================
+
+# Stage rail — mirrors the ReAct harness trajectory.
+# Each stage activates from a concrete event/action, so the rail walks
+# along the agent's actual path instead of skipping ahead with "(implicit)"
+# placeholders.
+_STAGE_ORDER = ("route", "discover", "inspect", "compute", "draft", "verify", "score")
 _STAGE_LABEL = {
-    "observe": "Observe",
-    "plan": "Plan",
-    "act": "Act",
-    "execute": "Execute",
-    "trace": "Observe Trace",
-    "reflect": "Reflect",
-    "verify": "Verify",
+    "route":    "Route",
+    "discover": "Discover",
+    "inspect":  "Inspect",
+    "compute":  "Compute",
+    "draft":    "Draft",
+    "verify":   "Verify",
+    "score":    "Score",
 }
 _STAGE_BY_EVENT = {
-    "router_decision": "observe",
-    "router_cascade": "observe",
-    "task_compiled": "observe",
-    "planner_done": "plan",
-    "structured_extract_start": "plan",
-    "structured_extract_done": "plan",
-    "codegen_program": "act",
-    # `react_step` is intentionally not in this map — it gets dispatched
-    # to the right stage in apply_event() based on its `action` field
-    # (list_context/read_* → observe, execute_* → act, first answer →
-    # reflect, second answer → verify).
-    "specialist_start": "act",
-    "specialist_done": "act",
-    "codegen_executed": "execute",
-    "synthesizer_done": "execute",
-    "codegen_debug": "trace",
-    "reflection_start": "reflect",
-    "reflection_done": "reflect",
-    "reasoner_repair_start": "reflect",
-    "reasoner_repair_done": "reflect",
-    "cross_verify_start": "verify",
-    "cross_verify_done": "verify",
-    "score": "verify",
+    "task_start":              "route",
+    "router_decision":         "route",
+    "router_cascade":          "route",
+    "task_compiled":           "route",
+    "budget_started":          "route",
+    # Multi-agent fallback events (agentic_operator route) — folded
+    # into the same rail so ablation runs still light up.
+    "planner_done":            "compute",
+    "structured_extract_start":"inspect",
+    "structured_extract_done": "inspect",
+    "codegen_program":         "compute",
+    "specialist_start":        "compute",
+    "specialist_done":         "compute",
+    "codegen_executed":        "compute",
+    "synthesizer_done":        "compute",
+    "codegen_debug":           "compute",
+    "reflection_start":        "verify",
+    "reflection_done":         "verify",
+    "reasoner_repair_start":   "verify",
+    "reasoner_repair_done":    "verify",
+    "cross_verify_start":      "verify",
+    "cross_verify_done":       "verify",
+    "score":                   "score",
 }
 
-# ReAct harness action → stage mapping. Used when event_type == "react_step".
-_REACT_OBSERVE_ACTIONS = frozenset({
-    "list_context", "read_csv", "read_json", "read_doc", "inspect_sqlite_schema",
+_REACT_DISCOVER_ACTIONS = frozenset({"list_context"})
+_REACT_INSPECT_ACTIONS = frozenset({
+    "read_csv", "read_json", "read_doc", "inspect_sqlite_schema",
 })
-_REACT_ACT_ACTIONS = frozenset({"execute_python", "execute_context_sql"})
+_REACT_COMPUTE_ACTIONS = frozenset({"execute_python", "execute_context_sql"})
+
+# Aliases for legacy call-sites that still bucket actions as
+# "observe vs act" for stats accounting.
+_REACT_OBSERVE_ACTIONS = _REACT_DISCOVER_ACTIONS | _REACT_INSPECT_ACTIONS
+_REACT_ACT_ACTIONS = _REACT_COMPUTE_ACTIONS
 
 
 def _stage_for_react_step(action: str, prior_answer_count: int) -> str:
-    if action in _REACT_OBSERVE_ACTIONS:
-        return "observe"
-    if action in _REACT_ACT_ACTIONS:
-        return "act"
+    if action in _REACT_DISCOVER_ACTIONS:
+        return "discover" if prior_answer_count == 0 else "verify"
+    if action in _REACT_INSPECT_ACTIONS:
+        return "inspect" if prior_answer_count == 0 else "verify"
+    if action in _REACT_COMPUTE_ACTIONS:
+        return "compute" if prior_answer_count == 0 else "verify"
     if action == "answer":
-        # First answer is the *draft* (self-verify reflection); second
-        # answer is the committed verification.
-        return "reflect" if prior_answer_count == 0 else "verify"
-    return "act"
-
-_EVENT_TAG = {
-    "task_start": ("START", "info"),
-    "task_end": ("END", "info"),
-    "router_decision": ("ROUTE", "info"),
-    "router_cascade": ("CASCADE", "warn"),
-    "task_compiled": ("COMPILE", "info"),
-    "budget_started": ("BUDGET", "info"),
-    "planner_done": ("PLAN", "info"),
-    "specialist_start": ("ACT", "info"),
-    "specialist_done": ("ACT", "ok"),
-    "synthesizer_done": ("SYNTH", "ok"),
-    "codegen_program": ("CODEGEN", "info"),
-    "codegen_executed": ("EXEC", "ok"),
-    "codegen_debug": ("DEBUG", "info"),
-    "structured_extract_start": ("EXTRACT", "info"),
-    "structured_extract_done": ("EXTRACT", "ok"),
-    "reflection_start": ("REFLECT", "run"),
-    "reflection_done": ("REFLECT", "ok"),
-    "reasoner_repair_start": ("REPAIR", "run"),
-    "reasoner_repair_done": ("REPAIR", "ok"),
-    "react_step": ("REACT", "ok"),
-    "cross_verify_start": ("VERIFY", "run"),
-    "cross_verify_done": ("VERIFY", "ok"),
-    "score": ("SCORE", "ok"),
-}
+        return "draft" if prior_answer_count == 0 else "verify"
+    return "compute"
 
 
 def _initial_stage_state() -> dict[str, dict[str, str]]:
     return {name: {"status": "idle", "label": "", "detail": ""} for name in _STAGE_ORDER}
 
 
-def _clip_text(value: Any, limit: int = 140) -> str:
-    text = "" if value is None else str(value)
-    text = " ".join(text.split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "..."
+# ============================================================================
+# ParsedStep — the single shape used by both live stream + replay
+# ============================================================================
+
+_KIND_TAG = {
+    "task":    "TASK",
+    "route":   "ROUTE",
+    "compile": "COMPILE",
+    "budget":  "BUDGET",
+    "plan":    "PLAN",
+    "tool":    "TOOL",
+    "code":    "CODE",
+    "sql":     "SQL",
+    "obs":     "OBS",
+    "draft":   "DRAFT",
+    "answer":  "ANSWER",
+    "reflect": "REFLECT",
+    "verify":  "VERIFY",
+    "score":   "SCORE",
+    "extract": "EXTRACT",
+    "info":    "INFO",
+    "warn":    "WARN",
+    "error":   "ERROR",
+}
 
 
-def _format_event_row(event: dict[str, Any]) -> dict[str, str]:
-    event_type = str(event.get("type") or "info")
-    tag, cls = _EVENT_TAG.get(event_type, (event_type.upper(), "info"))
-    elapsed = event.get("elapsed")
-    ts_text = f"{float(elapsed):.1f}s" if isinstance(elapsed, (int, float)) else ""
-    head, detail = _summarize_event(event)
-    return {"tag": tag, "cls": cls, "head": head, "detail": detail, "time": ts_text}
+@dataclass
+class ParsedStep:
+    """Unified card model — live stream and replay both render from this."""
+    kind: str
+    title: str
+    subtitle: str = ""
+    status: str = "info"   # ok / warn / err / run / info
+    thought: str = ""
+    code: str = ""
+    code_lang: str = "python"
+    observation: str = ""
+    badges: list[tuple[str, str]] = field(default_factory=list)
+    elapsed: float | None = None
+    step_index: int | None = None
+    stage: str = ""
+
+    @property
+    def tag(self) -> str:
+        return _KIND_TAG.get(self.kind, self.kind.upper())
 
 
-def _summarize_event(event: dict[str, Any]) -> tuple[str, str]:
+# ============================================================================
+# Event → ParsedStep parsing
+# ============================================================================
+
+
+def _format_observation_summary(obs: Any) -> str:
+    """Compact summary of a tool observation for the obs box."""
+    if obs is None:
+        return ""
+    if isinstance(obs, str):
+        return _clip(obs, 600)
+    if not isinstance(obs, dict):
+        try:
+            return _clip(json.dumps(obs, ensure_ascii=False, default=str), 600)
+        except (TypeError, ValueError):
+            return _clip(str(obs), 600)
+    if "error" in obs and obs.get("error"):
+        return "error: " + _clip(str(obs["error"]), 500)
+    if "stdout" in obs and obs.get("stdout"):
+        return _clip(str(obs["stdout"]), 600)
+    if "files" in obs and isinstance(obs.get("files"), list):
+        files = obs["files"]
+        head = ", ".join(str(f) for f in files[:8])
+        return f"{len(files)} entry: {head}"
+    if "tables" in obs and isinstance(obs.get("tables"), list):
+        tables = obs["tables"]
+        names = []
+        for t in tables[:6]:
+            if isinstance(t, dict):
+                names.append(str(t.get("name") or t.get("table") or "?"))
+            else:
+                names.append(str(t))
+        return f"{len(tables)} table(s): {', '.join(names)}"
+    if isinstance(obs.get("columns"), list) and isinstance(obs.get("rows"), list):
+        cols = obs["columns"]
+        rows = obs["rows"]
+        sample = ""
+        if rows:
+            first = rows[0]
+            if isinstance(first, list):
+                sample = " \u00b7 sample: " + ", ".join(str(c)[:24] for c in first[:6])
+        return f"{len(cols)} column(s) \u00d7 {len(rows)} row(s){sample}"
+    if isinstance(obs.get("schema"), (dict, list)):
+        return _clip(json.dumps(obs["schema"], ensure_ascii=False, default=str), 600)
+    if obs.get("text"):
+        return _clip(str(obs["text"]), 600)
+    try:
+        return _clip(json.dumps(obs, ensure_ascii=False, default=str), 600)
+    except (TypeError, ValueError):
+        return _clip(str(obs), 600)
+
+
+def _to_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_react_action(
+    *,
+    action: str,
+    action_input: Any,
+    step_index: Any,
+    ok: bool,
+    cached: bool,
+    elapsed: float | None,
+    prior_answer_count: int,
+    thought: str = "",
+    observation: Any = None,
+) -> ParsedStep:
+    """Turn one ReAct step into a ParsedStep."""
+    ai = action_input if isinstance(action_input, dict) else {}
+    obs_text = _format_observation_summary(observation) if observation is not None else ""
+
+    if action == "execute_python":
+        code = str(ai.get("code") or "")
+        return ParsedStep(
+            kind="code", title="execute_python",
+            step_index=_to_int(step_index),
+            code=code, code_lang="python",
+            status="ok" if ok else "err",
+            elapsed=elapsed, thought=thought, observation=obs_text,
+            badges=[("info", "cached")] if cached else [],
+            stage="verify" if prior_answer_count > 0 else "compute",
+        )
+    if action == "execute_context_sql":
+        sql = str(ai.get("sql") or "")
+        return ParsedStep(
+            kind="sql", title="execute_context_sql",
+            step_index=_to_int(step_index),
+            code=sql, code_lang="sql",
+            status="ok" if ok else "err",
+            elapsed=elapsed, thought=thought, observation=obs_text,
+            badges=[("info", "cached")] if cached else [],
+            stage="verify" if prior_answer_count > 0 else "compute",
+        )
+    if action in _REACT_OBSERVE_ACTIONS:
+        hint = ""
+        if ai.get("path"):
+            hint = str(ai["path"])
+        elif ai.get("max_depth") is not None:
+            hint = f"depth={ai['max_depth']}"
+        ps_stage = "discover" if action in _REACT_DISCOVER_ACTIONS else "inspect"
+        if prior_answer_count > 0:
+            ps_stage = "verify"
+        return ParsedStep(
+            kind="tool", title=action, subtitle=hint,
+            step_index=_to_int(step_index),
+            status="ok" if ok else "warn",
+            elapsed=elapsed, thought=thought, observation=obs_text,
+            badges=[("info", "cached")] if cached else [],
+            stage=ps_stage,
+        )
+    if action == "answer":
+        cols = ai.get("columns") if isinstance(ai, dict) else None
+        rows = ai.get("rows") if isinstance(ai, dict) else None
+        n_cols = len(cols) if isinstance(cols, list) else 0
+        n_rows = len(rows) if isinstance(rows, list) else 0
+        is_draft = prior_answer_count == 0
+        return ParsedStep(
+            kind="draft" if is_draft else "answer",
+            title="draft answer \u00b7 self-verify" if is_draft else "final answer committed",
+            subtitle=f"{n_cols} column(s) \u00d7 {n_rows} row(s)",
+            step_index=_to_int(step_index),
+            status="run" if is_draft else "ok",
+            elapsed=elapsed, thought=thought,
+            badges=[("info", str(c)[:24]) for c in (cols or [])[:6]],
+            stage="draft" if is_draft else "verify",
+        )
+    # Unknown action
+    try:
+        args_text = json.dumps(ai, ensure_ascii=False)
+    except (TypeError, ValueError):
+        args_text = str(ai)
+    return ParsedStep(
+        kind="info", title=action or "react step",
+        subtitle=_clip(args_text, 220),
+        step_index=_to_int(step_index),
+        status="ok" if ok else "warn",
+        elapsed=elapsed, thought=thought, observation=obs_text,
+        stage="compute",
+    )
+
+
+def _parse_event(event: dict[str, Any], *, prior_answer_count: int) -> ParsedStep | None:
+    """Convert one streamed __DEMO_EVENT__ into a ParsedStep (or None to skip)."""
     et = event.get("type")
+    elapsed = event.get("elapsed")
+    try:
+        elapsed_f = float(elapsed) if elapsed is not None else None
+    except (TypeError, ValueError):
+        elapsed_f = None
+
     if et == "task_start":
-        return (
-            f"Task {event.get('task_id') or '?'}",
-            f"difficulty={event.get('difficulty') or '?'} · {_clip_text(event.get('question'), 220)}",
+        return ParsedStep(
+            kind="task",
+            title=f"Task {event.get('task_id') or '?'} \u00b7 starting",
+            subtitle=_clip(event.get("question") or "(loading)", 500),
+            status="run", elapsed=elapsed_f,
+            badges=[("info", f"difficulty {event.get('difficulty') or '-'}")],
+            stage="route",
         )
     if et == "task_end":
-        ok = event.get("succeeded")
-        reason = event.get("failure_reason")
-        head = "Run completed" if ok else "Run failed"
-        return head, _clip_text(reason or ("answer ready" if ok else "see logs"), 220)
-    if et == "router_decision":
-        head = f"route → {event.get('route_name') or '?'}"
-        detail = (
-            f"kind={event.get('kind') or '-'} · model={event.get('model') or '-'} · "
-            f"type={event.get('task_type') or '-'} · difficulty={event.get('difficulty') or '-'}"
+        ok = bool(event.get("succeeded"))
+        return ParsedStep(
+            kind="task",
+            title="Run completed" if ok else "Run failed",
+            subtitle=_clip(event.get("failure_reason") or ("Answer ready" if ok else "see logs"), 300),
+            status="ok" if ok else "err", elapsed=elapsed_f,
+            stage="verify" if ok else "compute",
         )
-        return head, detail
+    if et == "router_decision":
+        return ParsedStep(
+            kind="route",
+            title=f"route \u2192 {event.get('route_name') or '?'}",
+            subtitle=f"kind={event.get('kind') or '-'} \u00b7 model={event.get('model') or '-'} \u00b7 task_type={event.get('task_type') or '-'}",
+            status="info", elapsed=elapsed_f,
+            badges=[("info", f"difficulty {event.get('difficulty') or '-'}")],
+            stage="route",
+        )
     if et == "router_cascade":
-        return (
-            f"cascade {event.get('from_route')} → {event.get('to_route')}",
-            _clip_text(event.get("reason"), 200),
+        return ParsedStep(
+            kind="route", title=f"cascade \u2192 {event.get('to_route') or '?'}",
+            subtitle=_clip(event.get("reason") or "", 220),
+            status="warn", elapsed=elapsed_f,
+            badges=[("bad", f"from {event.get('from_route') or '-'}")],
+            stage="route",
         )
     if et == "task_compiled":
-        ops = ", ".join(event.get("operations") or []) or "-"
-        return (
-            f"compiled type={event.get('task_type') or '-'}",
-            f"answer={event.get('answer_type') or '-'} · ops={ops} · sources={event.get('data_source_count') or 0}",
+        ops = event.get("operations") or []
+        return ParsedStep(
+            kind="compile",
+            title=f"task type \u2192 {event.get('task_type') or '-'}",
+            subtitle=f"answer={event.get('answer_type') or '-'} \u00b7 sources={event.get('data_source_count') or 0}",
+            status="info", elapsed=elapsed_f,
+            badges=[("info", op) for op in ops[:6]],
+            stage="route",
         )
     if et == "budget_started":
-        return "budget", f"llm≤{event.get('max_llm_calls')} · tools≤{event.get('max_tool_calls')} · {event.get('max_seconds') or 0}s"
+        return ParsedStep(
+            kind="budget", title="Budget",
+            subtitle=f"llm \u2264 {event.get('max_llm_calls')} \u00b7 tools \u2264 {event.get('max_tool_calls')} \u00b7 {int(float(event.get('max_seconds') or 0))}s wall",
+            status="info", elapsed=elapsed_f, stage="route",
+        )
     if et == "planner_done":
         subtasks = event.get("subtasks") or []
-        return f"planner produced {len(subtasks)} subtask(s)", _clip_text(event.get("rationale"), 220)
+        badges = []
+        for s in subtasks[:6]:
+            if isinstance(s, dict):
+                badges.append(("info", f"{s.get('id') or '?'}:{s.get('specialist') or '?'}"))
+        return ParsedStep(
+            kind="plan", title=f"planner \u00b7 {len(subtasks)} subtask(s)",
+            subtitle=_clip(event.get("rationale") or "", 240),
+            status="ok", elapsed=elapsed_f,
+            badges=badges, stage="compute",
+        )
     if et == "specialist_start":
-        return (
-            f"{event.get('subtask_id') or '?'} · {event.get('kind') or '-'}",
-            _clip_text(event.get("instruction"), 200),
+        return ParsedStep(
+            kind="info",
+            title=f"specialist \u00b7 {event.get('subtask_id') or '?'} \u00b7 {event.get('kind') or '-'}",
+            subtitle=_clip(event.get("instruction") or "", 240),
+            status="run", elapsed=elapsed_f, stage="compute",
         )
     if et == "specialist_done":
-        ok = event.get("succeeded")
-        head = f"{event.get('subtask_id')} · {event.get('kind')}" + (" ok" if ok else " failed")
-        return head, _clip_text(event.get("summary"), 220)
+        ok = bool(event.get("succeeded"))
+        return ParsedStep(
+            kind="info",
+            title=f"specialist done \u00b7 {event.get('subtask_id') or '?'}",
+            subtitle=_clip(event.get("summary") or "", 240),
+            status="ok" if ok else "err", elapsed=elapsed_f, stage="compute",
+        )
     if et == "synthesizer_done":
-        return f"synthesizer wrote {event.get('row_count') or 0} row(s)", ", ".join(event.get("columns") or [])
+        cols = event.get("columns") or []
+        return ParsedStep(
+            kind="answer",
+            title=f"synthesizer \u00b7 {event.get('row_count') or 0} row(s)",
+            subtitle=f"columns: {', '.join(cols)}",
+            status="ok", elapsed=elapsed_f, stage="compute",
+        )
     if et == "codegen_program":
-        return (
-            f"codegen {event.get('label') or 'operator'}",
-            f"program ready · {event.get('program_chars') or 0} chars · {_clip_text(event.get('manifest_summary'), 200)}",
+        return ParsedStep(
+            kind="code",
+            title=f"codegen \u00b7 {event.get('label') or 'operator'}",
+            subtitle=_clip(event.get("manifest_summary") or "", 220),
+            code=str(event.get("program") or ""), code_lang="python",
+            status="info", elapsed=elapsed_f, stage="compute",
         )
     if et == "codegen_executed":
-        ok = event.get("succeeded")
+        ok = bool(event.get("succeeded"))
         shape = event.get("shape") or []
-        if ok:
-            shape_text = f"shape={tuple(shape)}" if shape else "shape=?"
-            return "execution ok", shape_text
-        return "execution failed", _clip_text(event.get("failure_reason"), 220)
+        sub = f"shape={tuple(shape)}" if ok and shape else (_clip(event.get("failure_reason") or "", 240) if not ok else "answer ready")
+        return ParsedStep(
+            kind="obs",
+            title="execution ok" if ok else "execution failed",
+            subtitle=sub,
+            status="ok" if ok else "err",
+            elapsed=elapsed_f, stage="compute",
+        )
     if et == "codegen_debug":
         debug = event.get("debug") or {}
-        if isinstance(debug, dict):
-            keys = list(debug.keys())[:6]
-            return f"debug steps ({len(debug)} keys)", ", ".join(keys)
-        return "debug steps", ""
+        keys = list(debug.keys())[:6] if isinstance(debug, dict) else []
+        try:
+            preview = json.dumps(debug, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            preview = str(debug)
+        return ParsedStep(
+            kind="obs", title="codegen debug",
+            subtitle=", ".join(keys),
+            observation=_clip(preview, 800),
+            status="info", elapsed=elapsed_f, stage="compute",
+        )
     if et == "structured_extract_start":
-        return "record extraction start", ", ".join(event.get("files") or [])
+        files = event.get("files") or []
+        return ParsedStep(
+            kind="extract", title="record extract \u00b7 start",
+            subtitle=_clip(", ".join(str(f) for f in files), 240),
+            status="run", elapsed=elapsed_f, stage="inspect",
+        )
     if et == "structured_extract_done":
         synth = event.get("synthesized_csvs") or {}
-        return f"record extraction done ({len(synth)} file(s))", ", ".join(f"{k}→{v}" for k, v in synth.items())
+        return ParsedStep(
+            kind="extract", title=f"record extract \u00b7 {len(synth)} file(s)",
+            subtitle=_clip(", ".join(f"{k}\u2192{v}" for k, v in synth.items()), 240),
+            status="ok" if synth else "warn", elapsed=elapsed_f, stage="inspect",
+        )
     if et == "reflection_start":
-        return "reflection running", "checking plan vs action"
+        return ParsedStep(
+            kind="reflect", title="reflection \u00b7 checking plan vs action",
+            status="run", elapsed=elapsed_f, stage="verify",
+        )
     if et == "reflection_done":
         verdict = event.get("verdict") or "-"
-        issues = "; ".join(event.get("issues") or [])
-        detail = f"confidence={event.get('confidence') or '-'} · {issues or 'no concrete issue'}"
-        return f"reflection {verdict}", _clip_text(detail, 220)
+        issues = "; ".join(event.get("issues") or []) or "no concrete issue"
+        revision = event.get("revision_instruction") or ""
+        sub = issues
+        if revision:
+            sub += " \u00b7 retry: " + _clip(revision, 160)
+        return ParsedStep(
+            kind="reflect", title=f"reflection \u00b7 {verdict}",
+            subtitle=_clip(sub, 320),
+            status="ok" if verdict == "accept" else "warn",
+            elapsed=elapsed_f,
+            badges=[("info", f"confidence {event.get('confidence') or '-'}")],
+            stage="verify",
+        )
     if et == "reasoner_repair_start":
-        return "reasoner repair", _clip_text(event.get("failure_reason"), 220)
+        return ParsedStep(
+            kind="reflect", title="reasoner repair",
+            subtitle=_clip(event.get("failure_reason") or "", 240),
+            status="run", elapsed=elapsed_f, stage="verify",
+        )
     if et == "reasoner_repair_done":
-        ok = event.get("succeeded")
-        return ("reasoner repair ok" if ok else "reasoner repair failed"), _clip_text(event.get("failure_reason"), 220)
-    if et == "react_step":
-        action = event.get("action") or "?"
-        args = event.get("action_input") or {}
-        try:
-            args_text = json.dumps(args, ensure_ascii=False)
-        except (TypeError, ValueError):
-            args_text = str(args)
-        cached = " · cached" if event.get("cached") else ""
-        ok = "ok" if event.get("ok") else "failed"
-        return (
-            f"react step #{event.get('step_index')} · {action} · {ok}{cached}",
-            _clip_text(args_text, 220),
+        ok = bool(event.get("succeeded"))
+        return ParsedStep(
+            kind="reflect", title="reasoner repair \u00b7 ok" if ok else "reasoner repair \u00b7 failed",
+            subtitle=_clip(event.get("failure_reason") or "", 240),
+            status="ok" if ok else "err", elapsed=elapsed_f, stage="verify",
         )
     if et == "cross_verify_start":
-        return "cross-verify start", ", ".join(event.get("verifier_names") or [])
+        names = event.get("verifier_names") or []
+        return ParsedStep(
+            kind="verify", title="cross-verify start",
+            subtitle=", ".join(names),
+            status="run", elapsed=elapsed_f, stage="verify",
+        )
     if et == "cross_verify_done":
         outcome = event.get("outcome") or "-"
-        return f"cross-verify {outcome}", f"kept {event.get('kept') or 0}/{event.get('total') or 0} columns"
-    if et == "score":
-        return (
-            f"score {float(event.get('score') or 0):.3f}",
-            f"recall={float(event.get('recall') or 0):.3f} · penalty={float(event.get('penalty') or 0):.3f}",
+        return ParsedStep(
+            kind="verify", title=f"cross-verify \u00b7 {outcome}",
+            subtitle=f"kept {event.get('kept') or 0}/{event.get('total') or 0} columns",
+            status="ok" if "agreement" in outcome else "warn",
+            elapsed=elapsed_f, stage="verify",
         )
-    return str(et or "event"), _clip_text(json.dumps(event, ensure_ascii=False, default=str), 220)
+    if et == "score":
+        try:
+            score = float(event.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        recall = _coerce_float(event.get("recall")) or 0.0
+        penalty = _coerce_float(event.get("penalty")) or 0.0
+        return ParsedStep(
+            kind="score", title=f"local score = {score:.3f}",
+            subtitle=f"recall={recall:.3f} \u00b7 penalty={penalty:.3f}",
+            status="ok" if score >= 0.95 else ("warn" if score >= 0.5 else "err"),
+            elapsed=elapsed_f, stage="score",
+        )
+    if et == "react_step":
+        return _parse_react_action(
+            action=str(event.get("action") or ""),
+            action_input=event.get("action_input") or {},
+            step_index=event.get("step_index"),
+            ok=bool(event.get("ok", True)),
+            cached=bool(event.get("cached")),
+            elapsed=elapsed_f,
+            prior_answer_count=prior_answer_count,
+        )
+    return None
 
 
-class _LiveRenderer:
-    """Renders the live agent dashboard from streamed __DEMO_EVENT__ records."""
+# ============================================================================
+# Render a ParsedStep into HTML card
+# ============================================================================
 
-    def __init__(self, *, task_id: str) -> None:
+
+def _render_step_html(step: ParsedStep) -> str:
+    title_text = step.title
+    if step.step_index is not None:
+        title_text = f"#{step.step_index} \u00b7 {title_text}"
+
+    meta_bits: list[str] = []
+    if step.elapsed is not None:
+        try:
+            meta_bits.append(f"{float(step.elapsed):.1f}s")
+        except (TypeError, ValueError):
+            pass
+
+    head = (
+        "<div class='sr-head'>"
+        f"<span class='sr-tag'>{escape(step.tag)}</span>"
+        f"<span class='sr-title'>{escape(title_text)}</span>"
+        + (f"<span class='sr-meta'>{escape(_DOT.join(meta_bits))}</span>" if meta_bits else "")
+        + "</div>"
+    )
+
+    body_bits: list[str] = []
+    if step.thought:
+        body_bits.append(f"<div class='sr-thought'>{escape(step.thought)}</div>")
+    if step.subtitle:
+        body_bits.append(f"<div class='sr-subtitle'>{escape(step.subtitle)}</div>")
+    if step.code:
+        code_preview = step.code if len(step.code) <= 2400 else step.code[:2400] + "\n\u2026(truncated)\u2026"
+        cls = "sr-code" + (" sql" if step.code_lang == "sql" else "")
+        body_bits.append(f"<pre class='{cls}'>{escape(code_preview)}</pre>")
+    if step.observation:
+        body_bits.append(f"<pre class='sr-obs'>{escape(step.observation)}</pre>")
+    if step.badges:
+        chips = "".join(
+            f"<span class='sr-badge {escape(str(cls))}'>{escape(str(text))}</span>"
+            for cls, text in step.badges
+        )
+        body_bits.append(f"<div class='sr-badges'>{chips}</div>")
+
+    return f"<div class='sr {escape(step.status)}'>{head}{''.join(body_bits)}</div>"
+
+
+# ============================================================================
+# _StreamView — the unified live/replay view (hero + rail + stream + sidebar)
+# ============================================================================
+
+
+class _StreamView:
+    """Streamlit view: hero + stage rail + parsed-step stream + side stats.
+
+    Used identically for live runs (events arrive one-by-one) and replay
+    (all ParsedSteps are injected at once). This is the single UI language
+    for both modes.
+    """
+
+    def __init__(self, *, task_id: str, mode: str = "live") -> None:
         self.task_id = task_id
+        self.mode = mode  # "live" | "replay"
         self.start_time = time.time()
         self.stages: dict[str, dict[str, str]] = _initial_stage_state()
-        self.events: list[dict[str, Any]] = []
-        self.planner: dict[str, Any] | None = None
-        self.reflection: dict[str, Any] | None = None
-        self.program_text: str | None = None
-        self.score_event: dict[str, Any] | None = None
-        self.task_meta: dict[str, Any] = {"task_id": task_id, "question": "", "difficulty": ""}
+        self.stages["route"]["status"] = "run"
+        self.stages["route"]["label"] = "starting"
+        self.stages["route"]["detail"] = "booting agent runtime"
+        self.steps: list[ParsedStep] = []
+        self.task_meta: dict[str, Any] = {
+            "task_id": task_id, "question": "", "difficulty": "",
+        }
         self.complete: bool = False
         self.succeeded: bool | None = None
         self.failure_reason: str | None = None
-        self.current_stage: str | None = "observe"
-        self.raw_lines: list[str] = []
-        # Self-verify accounting for the ReAct harness: count of `answer`
-        # calls seen so the first → reflect stage and second → verify stage.
         self.answer_count: int = 0
-        # Cache of the last draft answer summary (cols + row count) so the
-        # reflect/verify panels can show what the model is checking.
-        self.draft_summary: dict[str, Any] | None = None
-        # Mark first stage as running so the rail isn't all-idle pre-event.
-        self.stages["observe"]["status"] = "run"
-        self.stages["observe"]["label"] = "starting"
-        self.stages["observe"]["detail"] = "booting agent runtime"
+        self.event_count: int = 0
+        self.tool_call_count: int = 0
+        self.code_call_count: int = 0
+        self.current_stage: str | None = "route"
+        self.score: dict[str, Any] | None = None
+        self.latest_answer: dict[str, Any] | None = None
+        self.context_files: list[str] = []
+        self.raw_lines: list[str] = []
 
-        # Streamlit placeholders, all built up-front.
+        # Layout: hero + rail at top; left column stream, right column stats.
         self.hero_ph = st.empty()
         self.rail_ph = st.empty()
-
-        left_col, right_col = st.columns([1.3, 1.0])
+        left_col, right_col = st.columns([1.7, 1.0])
         with left_col:
-            st.markdown("<div class='live-side ls-title' style='margin-bottom:.3rem;'>Event Timeline</div>", unsafe_allow_html=True)
-            self.timeline_ph = st.empty()
+            st.markdown("<div class='stream-title'>Live Parsing Stream \u00b7 newest first</div>", unsafe_allow_html=True)
+            self.stream_ph = st.empty()
         with right_col:
-            self.planner_ph = st.empty()
-            self.reflection_ph = st.empty()
-            self.program_ph = st.empty()
+            self.stats_ph = st.empty()
+            self.files_ph = st.empty()
+            self.answer_ph = st.empty()
             self.score_ph = st.empty()
-
-        with st.expander("Raw agent log (rich output)", expanded=False):
+        with st.expander("Raw agent log (rich console output)", expanded=False):
             self.log_ph = st.empty()
 
-        self._render_hero()
-        self._render_rail()
-        self._render_timeline()
-        self._render_side_panels()
+        self._render_all()
 
-    # ----- event handling -----
+    # --- public ingestion (live mode) ---
 
     def apply_event(self, event: dict[str, Any]) -> None:
         if not isinstance(event, dict):
             return
-        event_type = event.get("type")
-        self.events.append(event)
-        if event_type == "react_step":
-            action = str(event.get("action") or "")
-            prior = self.answer_count
-            stage = _stage_for_react_step(action, prior)
-            if action == "answer":
-                self.answer_count += 1
-                # Capture draft answer shape so the side panel can show it
-                # while the model self-verifies.
-                ai = event.get("action_input") or {}
-                cols = ai.get("columns") if isinstance(ai, dict) else None
-                rows = ai.get("rows") if isinstance(ai, dict) else None
-                self.draft_summary = {
-                    "columns": list(cols) if isinstance(cols, list) else [],
-                    "row_count": len(rows) if isinstance(rows, list) else 0,
-                    "is_final": prior >= 1,
-                }
-        else:
-            stage = _STAGE_BY_EVENT.get(event_type or "")
-        if stage:
-            self._advance_stage_to(stage)
-            self._update_stage_from_event(stage, event)
-        if event_type == "task_start":
+        self.event_count += 1
+        et = event.get("type")
+
+        # Sticky bookkeeping
+        if et == "task_start":
             self.task_meta.update(
                 task_id=event.get("task_id") or self.task_id,
                 question=event.get("question") or "",
                 difficulty=event.get("difficulty") or "",
             )
-        elif event_type == "planner_done":
-            self.planner = {
-                "rationale": event.get("rationale") or "",
-                "subtasks": event.get("subtasks") or [],
-            }
-        elif event_type == "reflection_done":
-            self.reflection = {
-                "verdict": event.get("verdict") or "-",
-                "confidence": event.get("confidence") or "-",
-                "issues": event.get("issues") or [],
-                "revision_instruction": event.get("revision_instruction") or "",
-            }
-        elif event_type == "codegen_program":
-            self.program_text = event.get("program") or ""
-        elif event_type == "score":
-            self.score_event = {
-                "score": event.get("score"),
-                "recall": event.get("recall"),
-                "penalty": event.get("penalty"),
-            }
-        elif event_type == "task_end":
+        elif et == "task_end":
             self.complete = True
             self.succeeded = bool(event.get("succeeded"))
             self.failure_reason = event.get("failure_reason")
-            self._finalize_remaining_stages()
-        self._render_all()
-
-    def _advance_stage_to(self, target: str) -> None:
-        try:
-            target_idx = _STAGE_ORDER.index(target)
-        except ValueError:
-            return
-        for idx, name in enumerate(_STAGE_ORDER):
-            if idx < target_idx and self.stages[name]["status"] in {"idle", "run"}:
-                self.stages[name]["status"] = "ok"
-                # ReAct skips through some stages without a dedicated
-                # event (e.g. "plan" / "trace"). Don't leave their cards
-                # empty — annotate them so the demo reads coherently.
-                if not self.stages[name].get("label"):
-                    self.stages[name]["label"] = "(implicit)"
-                    self.stages[name]["detail"] = "covered inline by ReAct reasoning"
-            elif idx == target_idx and self.stages[name]["status"] == "idle":
-                self.stages[name]["status"] = "run"
-        self.current_stage = target
-
-    def _update_stage_from_event(self, stage: str, event: dict[str, Any]) -> None:
-        et = event.get("type")
-        if et == "router_decision":
-            self.stages[stage]["label"] = event.get("route_name") or "-"
-            self.stages[stage]["detail"] = f"kind={event.get('kind') or '-'}"
-        elif et == "task_compiled":
-            self.stages[stage]["label"] = event.get("task_type") or "-"
-            ops = ", ".join(event.get("operations") or [])
-            self.stages[stage]["detail"] = f"ops={ops or '-'} · sources={event.get('data_source_count') or 0}"
-            if self.stages[stage]["status"] == "run":
-                self.stages[stage]["status"] = "ok"
-        elif et == "planner_done":
-            count = len(event.get("subtasks") or [])
-            self.stages[stage]["label"] = f"{count} subtask(s)"
-            self.stages[stage]["detail"] = _clip_text(event.get("rationale"), 140)
-            self.stages[stage]["status"] = "ok"
-        elif et == "codegen_program":
-            self.stages[stage]["label"] = event.get("label") or "codegen"
-            self.stages[stage]["detail"] = f"{event.get('program_chars') or 0} chars · {_clip_text(event.get('manifest_summary'), 100)}"
-        elif et == "codegen_executed":
-            ok = event.get("succeeded")
-            self.stages[stage]["status"] = "ok" if ok else "err"
-            shape = event.get("shape") or []
-            self.stages[stage]["label"] = "ok" if ok else "failed"
-            if ok:
-                self.stages[stage]["detail"] = f"shape={tuple(shape)}" if shape else "answer ready"
-            else:
-                self.stages[stage]["detail"] = _clip_text(event.get("failure_reason"), 140)
-        elif et == "codegen_debug":
-            debug = event.get("debug") or {}
-            count = len(debug) if isinstance(debug, dict) else 0
-            self.stages[stage]["label"] = f"{count} key(s)"
-            self.stages[stage]["detail"] = ", ".join(list(debug.keys())[:5]) if isinstance(debug, dict) else ""
-            self.stages[stage]["status"] = "ok"
-        elif et == "reflection_start":
-            self.stages[stage]["label"] = "running"
-            self.stages[stage]["detail"] = "checking plan vs action"
-        elif et == "reflection_done":
-            verdict = event.get("verdict") or "-"
-            self.stages[stage]["label"] = verdict
-            self.stages[stage]["detail"] = "; ".join(event.get("issues") or []) or "no concrete issue"
-            self.stages[stage]["status"] = "ok" if verdict == "accept" else "warn"
+        elif et == "score":
+            self.score = {
+                "score": _coerce_float(event.get("score")),
+                "recall": _coerce_float(event.get("recall")),
+                "penalty": _coerce_float(event.get("penalty")),
+            }
         elif et == "react_step":
             action = str(event.get("action") or "")
-            step_index = event.get("step_index")
-            ai = event.get("action_input") or {}
-            ok = bool(event.get("ok", True))
-            cached = bool(event.get("cached"))
-            tag = "cached " if cached else ""
-            # Compose human-friendly detail per action.
-            # Only flip status if the stage is the active one — don't
-            # downgrade an already-passed stage when the model briefly
-            # revisits an earlier tool (e.g. re-reads a CSV after acting).
-            prior_status = self.stages[stage].get("status")
-            allow_status_update = prior_status in {"idle", "run", "warn"}
-            if action in _REACT_OBSERVE_ACTIONS:
-                hint = ""
-                if isinstance(ai, dict):
-                    if ai.get("path"):
-                        hint = str(ai.get("path"))
-                    elif ai.get("max_depth") is not None:
-                        hint = f"depth={ai.get('max_depth')}"
-                self.stages[stage]["label"] = f"{tag}{action}"
-                self.stages[stage]["detail"] = (
-                    f"step #{step_index} · {hint}" if hint else f"step #{step_index}"
-                )
-                if allow_status_update:
-                    self.stages[stage]["status"] = "run" if ok else "warn"
-            elif action in _REACT_ACT_ACTIONS:
-                hint = ""
-                if isinstance(ai, dict):
-                    if ai.get("code"):
-                        hint = _clip_text(ai.get("code"), 100)
-                    elif ai.get("sql"):
-                        hint = _clip_text(ai.get("sql"), 100)
-                self.stages[stage]["label"] = action
-                self.stages[stage]["detail"] = f"step #{step_index} · {hint}" if hint else f"step #{step_index}"
-                if allow_status_update:
-                    self.stages[stage]["status"] = "run" if ok else "warn"
-            elif action == "answer":
-                cols = ai.get("columns") if isinstance(ai, dict) else None
-                rows = ai.get("rows") if isinstance(ai, dict) else None
-                col_count = len(cols) if isinstance(cols, list) else 0
-                row_count = len(rows) if isinstance(rows, list) else 0
-                if stage == "reflect":
-                    self.stages[stage]["label"] = "draft submitted"
-                    self.stages[stage]["detail"] = (
-                        f"{col_count} col(s) × {row_count} row(s) · running self-verify"
-                    )
-                    self.stages[stage]["status"] = "run"
-                    # Surface in the side reflection panel.
-                    self.reflection = {
-                        "verdict": "self-verify",
-                        "confidence": "-",
-                        "issues": [
-                            f"Draft: {col_count} col(s) × {row_count} row(s)",
-                            "Model is now re-checking columns + values before final commit.",
-                        ],
-                        "revision_instruction": (
-                            "Re-running computations and re-confirming requested answer type."
-                        ),
-                    }
-                else:  # verify
-                    self.stages[stage]["label"] = "final answer"
-                    self.stages[stage]["detail"] = f"{col_count} col(s) × {row_count} row(s) committed"
-                    self.stages[stage]["status"] = "ok"
-            else:
-                self.stages[stage]["label"] = action or "react step"
-                self.stages[stage]["detail"] = f"step #{step_index}"
-        elif et == "score":
-            self.stages[stage]["status"] = "ok"
-            self.stages[stage]["label"] = f"{float(event.get('score') or 0):.3f}"
-            self.stages[stage]["detail"] = f"recall={float(event.get('recall') or 0):.3f}"
-        elif et == "cross_verify_done":
-            outcome = event.get("outcome") or "-"
-            self.stages[stage]["label"] = outcome
-            self.stages[stage]["detail"] = f"kept {event.get('kept') or 0}/{event.get('total') or 0}"
-            self.stages[stage]["status"] = "ok" if "agreement" in outcome else "warn"
-        elif et == "router_cascade":
-            self.stages[stage]["status"] = "warn"
-            self.stages[stage]["detail"] = f"→ {event.get('to_route') or '?'}"
+            ai = event.get("action_input") if isinstance(event.get("action_input"), dict) else {}
+            if action in _REACT_ACT_ACTIONS:
+                self.code_call_count += 1
+            elif action in _REACT_OBSERVE_ACTIONS:
+                self.tool_call_count += 1
+            if action == "answer" and isinstance(ai, dict):
+                cols = ai.get("columns") or []
+                rows = ai.get("rows") or []
+                self.latest_answer = {
+                    "columns": list(cols),
+                    "rows": [list(r) for r in rows][:8],
+                    "row_count": len(rows),
+                    "is_draft": (self.answer_count == 0),
+                }
 
-    def _finalize_remaining_stages(self) -> None:
-        for name in _STAGE_ORDER:
-            if self.stages[name]["status"] == "run":
-                self.stages[name]["status"] = "ok" if self.succeeded else "err"
-            elif self.stages[name]["status"] == "idle":
-                self.stages[name]["status"] = "ok" if self.succeeded else "idle"
+        # Stage rail update
+        if et == "react_step":
+            stage = _stage_for_react_step(str(event.get("action") or ""), self.answer_count)
+        else:
+            stage = _STAGE_BY_EVENT.get(et or "")
+        if stage:
+            self._advance_stage_to(stage)
+            self._update_stage_from_event(stage, event)
+
+        # Parse event into a card
+        step = _parse_event(event, prior_answer_count=self.answer_count)
+        if step is not None:
+            self.steps.append(step)
+
+        # Increment answer counter AFTER parsing
+        if et == "react_step" and str(event.get("action") or "") == "answer":
+            self.answer_count += 1
+
+        if et == "task_end":
+            self._finalize_remaining_stages()
+
+        self._render_all()
 
     def append_log_line(self, line: str) -> None:
         self.raw_lines.append(line)
         plain = _ANSI_RE.sub("", "".join(self.raw_lines[-180:])).strip() or "Booting agent runtime..."
         self.log_ph.code(plain, language="text")
 
-    # ----- rendering -----
+    # --- stage rail logic ---
+
+    def _advance_stage_to(self, target: str) -> None:
+        """Walk the rail to ``target`` without faking activity.
+
+        Stages strictly before ``target`` only roll up to ``ok`` if they
+        were genuinely ``run`` (active); ``idle`` stages stay ``idle`` so
+        the user can see which legs of the route were actually walked.
+        """
+        try:
+            target_idx = _STAGE_ORDER.index(target)
+        except ValueError:
+            return
+        for idx, name in enumerate(_STAGE_ORDER):
+            if idx < target_idx and self.stages[name]["status"] == "run":
+                self.stages[name]["status"] = "ok"
+            elif idx == target_idx and self.stages[name]["status"] == "idle":
+                self.stages[name]["status"] = "run"
+        self.current_stage = target
+
+    def _update_stage_from_event(self, stage: str, event: dict[str, Any]) -> None:
+        et = event.get("type")
+        slot = self.stages[stage]
+        prior_status = slot.get("status")
+
+        if et == "router_decision":
+            slot["label"] = event.get("route_name") or "-"
+            slot["detail"] = f"kind={event.get('kind') or '-'} \u00b7 model={event.get('model') or '-'}"
+        elif et == "router_cascade":
+            slot["status"] = "warn"
+            slot["detail"] = f"\u2192 {event.get('to_route') or '?'}"
+        elif et == "task_compiled":
+            slot["label"] = event.get("task_type") or "-"
+            ops = ", ".join(event.get("operations") or [])
+            slot["detail"] = f"ops={ops or '-'} \u00b7 sources={event.get('data_source_count') or 0}"
+            if prior_status == "run":
+                slot["status"] = "ok"
+        elif et == "planner_done":
+            count = len(event.get("subtasks") or [])
+            slot["label"] = f"{count} subtask(s)"
+            slot["detail"] = _clip(event.get("rationale") or "", 140)
+            slot["status"] = "ok"
+        elif et == "codegen_program":
+            slot["label"] = event.get("label") or "codegen"
+            slot["detail"] = f"{event.get('program_chars') or 0} chars"
+        elif et == "codegen_executed":
+            ok = bool(event.get("succeeded"))
+            slot["status"] = "ok" if ok else "err"
+            shape = event.get("shape") or []
+            slot["label"] = "ok" if ok else "failed"
+            slot["detail"] = (f"shape={tuple(shape)}" if shape else "answer ready") if ok else _clip(event.get("failure_reason") or "", 140)
+        elif et == "codegen_debug":
+            debug = event.get("debug") or {}
+            count = len(debug) if isinstance(debug, dict) else 0
+            slot["label"] = f"{count} key(s)"
+            slot["detail"] = ", ".join(list(debug.keys())[:5]) if isinstance(debug, dict) else ""
+            slot["status"] = "ok"
+        elif et == "reflection_start":
+            slot["label"] = "running"
+            slot["detail"] = "checking plan vs action"
+        elif et == "reflection_done":
+            verdict = event.get("verdict") or "-"
+            slot["label"] = verdict
+            slot["detail"] = "; ".join(event.get("issues") or []) or "no concrete issue"
+            slot["status"] = "ok" if verdict == "accept" else "warn"
+        elif et == "react_step":
+            action = str(event.get("action") or "")
+            step_index = event.get("step_index")
+            ai = event.get("action_input") if isinstance(event.get("action_input"), dict) else {}
+            ok = bool(event.get("ok", True))
+            cached = bool(event.get("cached"))
+            tag = "cached " if cached else ""
+            allow_update = prior_status in {"idle", "run", "warn"}
+            if action in _REACT_OBSERVE_ACTIONS:
+                hint = str(ai.get("path") or "") or (f"depth={ai.get('max_depth')}" if ai.get("max_depth") is not None else "")
+                slot["label"] = f"{tag}{action}"
+                slot["detail"] = f"step #{step_index} \u00b7 {hint}" if hint else f"step #{step_index}"
+                if allow_update:
+                    slot["status"] = "run" if ok else "warn"
+            elif action in _REACT_ACT_ACTIONS:
+                hint = _clip(str(ai.get("code") or ai.get("sql") or ""), 100)
+                slot["label"] = action
+                slot["detail"] = f"step #{step_index} \u00b7 {hint}" if hint else f"step #{step_index}"
+                if allow_update:
+                    slot["status"] = "run" if ok else "warn"
+            elif action == "answer":
+                cols = ai.get("columns") if isinstance(ai, dict) else None
+                rows = ai.get("rows") if isinstance(ai, dict) else None
+                c = len(cols) if isinstance(cols, list) else 0
+                r = len(rows) if isinstance(rows, list) else 0
+                if stage == "draft":
+                    slot["label"] = "draft submitted"
+                    slot["detail"] = f"{c} col(s) \u00d7 {r} row(s) \u00b7 self-verify"
+                    slot["status"] = "run"
+                else:
+                    slot["label"] = "final answer"
+                    slot["detail"] = f"{c} col(s) \u00d7 {r} row(s) committed"
+                    slot["status"] = "ok"
+        elif et == "score":
+            slot["status"] = "ok"
+            slot["label"] = f"{float(event.get('score') or 0):.3f}"
+            slot["detail"] = f"recall={float(event.get('recall') or 0):.3f}"
+        elif et == "cross_verify_done":
+            outcome = event.get("outcome") or "-"
+            slot["label"] = outcome
+            slot["detail"] = f"kept {event.get('kept') or 0}/{event.get('total') or 0}"
+            slot["status"] = "ok" if "agreement" in outcome else "warn"
+
+    def _finalize_remaining_stages(self) -> None:
+        for name in _STAGE_ORDER:
+            slot = self.stages[name]
+            if slot["status"] == "run":
+                slot["status"] = "ok" if self.succeeded else "err"
+            # idle stages stay idle — honesty about what wasn't walked.
+
+    # --- rendering ---
 
     def _render_all(self) -> None:
         self._render_hero()
         self._render_rail()
-        self._render_timeline()
-        self._render_side_panels()
+        self._render_stream()
+        self._render_stats()
+        self._render_files()
+        self._render_answer()
+        self._render_score()
 
     def _render_hero(self) -> None:
         if self.complete:
-            if self.succeeded:
-                hero_class = "complete"
-                stage_label = f"Run finished · {self.task_meta.get('task_id') or self.task_id}"
-                meta = f"elapsed {time.time() - self.start_time:.1f}s · answer ready"
-            else:
-                hero_class = "failed"
-                stage_label = f"Run failed · {self.task_meta.get('task_id') or self.task_id}"
-                meta = _clip_text(self.failure_reason or "see logs", 220)
-        else:
-            current = self.current_stage or "observe"
-            hero_class = ""
-            stage_label = f"Running · {_STAGE_LABEL.get(current, current)}"
+            cls = "complete" if self.succeeded else "failed"
+            stage_text = f"Run finished \u00b7 {self.task_meta.get('task_id') or self.task_id}"
             meta = (
-                f"task={self.task_meta.get('task_id') or self.task_id} · "
-                f"difficulty={self.task_meta.get('difficulty') or '-'} · "
-                f"elapsed {time.time() - self.start_time:.1f}s · "
-                f"{len(self.events)} event(s)"
+                _clip(self.failure_reason or "Answer ready", 280)
+                if not self.succeeded else
+                f"elapsed {time.time() - self.start_time:.1f}s \u00b7 {self.event_count} event(s)"
             )
+        elif self.mode == "replay":
+            cls = "replay"
+            stage_text = f"Replay \u00b7 {self.task_meta.get('task_id') or self.task_id}"
+            meta = f"{len(self.steps)} step card(s)"
+        else:
+            cls = "idle" if not self.steps else ""
+            stage = self.current_stage or "observe"
+            stage_text = f"Running \u00b7 {_STAGE_LABEL.get(stage, stage)}"
+            meta = (
+                f"elapsed {time.time() - self.start_time:.1f}s \u00b7 "
+                f"{self.event_count} event(s) \u00b7 "
+                f"{self.tool_call_count} tool \u00b7 {self.code_call_count} exec"
+            )
+        question = _clip(self.task_meta.get("question") or "", 320)
+        difficulty = self.task_meta.get("difficulty") or "-"
+        task_id = self.task_meta.get("task_id") or self.task_id
         html = (
-            f"<div class='live-hero {hero_class}'>"
-            "<div><span class='pulse'></span>"
-            f"<span class='stage'>{escape(stage_label)}</span></div>"
-            f"<div class='meta'>{escape(meta)}</div>"
+            f"<div class='theater-hero {cls}'>"
+            "<div>"
+            f"<div class='th-task'>Task \u00b7 {escape(str(task_id))} \u00b7 difficulty {escape(str(difficulty))}</div>"
+            f"<div class='th-question'>{escape(question or '(no question)')}</div>"
+            f"<div class='th-meta'>{escape(meta)}</div>"
+            "</div>"
+            "<div class='th-state'>"
+            "<span class='pulse'></span>"
+            f"<span>{escape(stage_text)}</span>"
+            "</div>"
             "</div>"
         )
         self.hero_ph.markdown(html, unsafe_allow_html=True)
 
     def _render_rail(self) -> None:
-        cards = []
+        pills: list[str] = []
         for idx, name in enumerate(_STAGE_ORDER, start=1):
-            stage = self.stages[name]
-            status = stage["status"]
-            cls_map = {"idle": "idle", "run": "run", "ok": "ok", "warn": "warn", "err": "err"}
-            cls = cls_map.get(status, "idle")
-            label = stage.get("label") or "-"
-            detail = stage.get("detail") or ""
-            status_text = "RUNNING" if status == "run" else status.upper()
-            cards.append(
-                f"<div class='step-card {cls}'>"
-                f"<div class='step-index'>STEP {idx:02d}</div>"
-                f"<div class='step-title'>{escape(_STAGE_LABEL[name])}</div>"
-                f"<div class='step-status'>{escape(status_text)}</div>"
-                f"<div class='step-detail'><b>{escape(str(label))}</b><br>{escape(str(detail))}</div>"
+            slot = self.stages[name]
+            status = slot["status"]
+            cls = {"idle": "idle", "run": "run", "ok": "ok", "warn": "warn", "err": "err"}.get(status, "idle")
+            label = slot.get("label") or "\u2014"
+            detail = slot.get("detail") or ""
+            title = f"{idx:02d} \u00b7 {_STAGE_LABEL[name]}"
+            pills.append(
+                f"<div class='stage-pill {cls}'>"
+                f"<div class='sp-title'>{escape(title)}</div>"
+                f"<div class='sp-label'>{escape(str(label))}</div>"
+                f"<div class='sp-detail'>{escape(str(detail))}</div>"
                 "</div>"
             )
-        self.rail_ph.markdown("<div class='agent-rail'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+        self.rail_ph.markdown("<div class='stage-rail'>" + "".join(pills) + "</div>", unsafe_allow_html=True)
 
-    def _render_timeline(self) -> None:
-        if not self.events:
-            html = "<div class='tl'><div class='tl-row info'><div class='tl-tag'>WAIT</div>" \
-                "<div class='tl-body'><div class='tl-head'>Waiting for the agent's first event</div>" \
-                "<div class='tl-detail'>The runtime is booting. Structured events will appear here as they arrive.</div></div>" \
-                "<div class='tl-time'>0.0s</div></div></div>"
-            self.timeline_ph.markdown(html, unsafe_allow_html=True)
+    def _render_stream(self) -> None:
+        if not self.steps:
+            self.stream_ph.markdown(
+                "<div class='stream empty'>Waiting for the agent's first event\u2026</div>",
+                unsafe_allow_html=True,
+            )
             return
-        rows = []
-        # Newest first so users always see the most recent event at the top.
-        for event in reversed(self.events[-200:]):
-            row = _format_event_row(event)
-            extra_html = ""
-            if event.get("type") == "codegen_program" and event.get("program"):
-                program_preview = str(event.get("program"))
-                if len(program_preview) > 1200:
-                    program_preview = program_preview[:1200] + "\n…(truncated)…"
-                extra_html = f"<pre>{escape(program_preview)}</pre>"
-            rows.append(
-                f"<div class='tl-row {row['cls']}'>"
-                f"<div class='tl-tag'>{escape(row['tag'])}</div>"
-                f"<div class='tl-body'>"
-                f"<div class='tl-head'>{escape(row['head'])}</div>"
-                f"<div class='tl-detail'>{escape(row['detail'])}</div>"
-                f"{extra_html}"
-                "</div>"
-                f"<div class='tl-time'>{escape(row['time'])}</div>"
-                "</div>"
-            )
-        self.timeline_ph.markdown("<div class='tl'>" + "".join(rows) + "</div>", unsafe_allow_html=True)
+        cards = [_render_step_html(step) for step in reversed(self.steps[-220:])]
+        self.stream_ph.markdown(
+            "<div class='stream'>" + "".join(cards) + "</div>",
+            unsafe_allow_html=True,
+        )
 
-    def _render_side_panels(self) -> None:
-        # Planner subtasks (only fires on the multi_agent route).
-        if self.planner and self.planner.get("subtasks"):
-            rows = [
-                f"<div class='ls-row'><b>{escape(str(item.get('id') or '-'))}</b> "
-                f"· <span class='muted'>{escape(str(item.get('specialist') or '-'))}</span><br>"
-                f"{escape(_clip_text(item.get('instruction'), 200))}</div>"
-                for item in self.planner.get("subtasks") or []
-            ]
-            html = (
-                "<div class='live-side'>"
-                "<div class='ls-title'>Planner Subtasks</div>"
-                f"<div class='ls-row muted'>{escape(_clip_text(self.planner.get('rationale'), 220))}</div>"
-                + "".join(rows)
-                + "</div>"
-            )
-        else:
-            # On the ReAct harness route there is no planner — show the
-            # live tool-call trace instead so the panel is not empty.
-            react_events = [e for e in self.events if e.get("type") == "react_step"]
-            if react_events:
-                rows = []
-                for evt in react_events[-12:]:
-                    action = str(evt.get("action") or "")
-                    step_index = evt.get("step_index")
-                    ai = evt.get("action_input") or {}
-                    hint = ""
-                    if isinstance(ai, dict):
-                        if ai.get("path"):
-                            hint = str(ai.get("path"))
-                        elif ai.get("code"):
-                            hint = _clip_text(ai.get("code"), 80)
-                        elif ai.get("sql"):
-                            hint = _clip_text(ai.get("sql"), 80)
-                        elif ai.get("columns"):
-                            cols = ai.get("columns") or []
-                            rows_ai = ai.get("rows") or []
-                            n_cols = len(cols) if isinstance(cols, list) else 0
-                            n_rows = len(rows_ai) if isinstance(rows_ai, list) else 0
-                            hint = f"{n_cols} col(s) × {n_rows} row(s)"
-                    ok_glyph = "·" if evt.get("ok", True) else "✗"
-                    rows.append(
-                        f"<div class='ls-row'><b>#{escape(str(step_index))}</b> "
-                        f"<code>{escape(action)}</code> {ok_glyph} "
-                        f"<span class='muted'>{escape(hint)}</span></div>"
-                    )
-                html = (
-                    "<div class='live-side'>"
-                    "<div class='ls-title'>ReAct Tool Trace</div>"
-                    + "".join(rows)
-                    + "</div>"
-                )
-            else:
-                html = (
-                    "<div class='live-side empty'>"
-                    "<div class='ls-title'>ReAct Tool Trace</div>"
-                    "<div class='ls-row'>Agent has not invoked a tool yet.</div>"
-                    "</div>"
-                )
-        self.planner_ph.markdown(html, unsafe_allow_html=True)
+    def _render_stats(self) -> None:
+        elapsed_s = time.time() - self.start_time if self.mode == "live" else None
+        rows: list[tuple[str, str]] = [
+            ("status", "complete" if self.complete else ("replay" if self.mode == "replay" else "running")),
+            ("stage", _STAGE_LABEL.get(self.current_stage or "observe", "-")),
+            ("events", str(self.event_count)),
+            ("tool calls", str(self.tool_call_count)),
+            ("code/sql runs", str(self.code_call_count)),
+            ("answer drafts", str(self.answer_count)),
+        ]
+        if elapsed_s is not None:
+            rows.append(("elapsed", f"{elapsed_s:.1f}s"))
+        body = "".join(
+            f"<div class='sb-row'><span class='label'>{escape(k)}</span><span class='value'>{escape(v)}</span></div>"
+            for k, v in rows
+        )
+        self.stats_ph.markdown(
+            "<div class='side-box'><div class='sb-title'>Run Stats</div>" + body + "</div>",
+            unsafe_allow_html=True,
+        )
 
-        # Reflection.
-        if self.reflection:
-            verdict = self.reflection.get("verdict") or "-"
-            confidence = self.reflection.get("confidence") or "-"
-            issues = "; ".join(self.reflection.get("issues") or []) or "no concrete issue"
-            revision = self.reflection.get("revision_instruction") or ""
-            extra = f"<div class='ls-row muted'>retry: {escape(_clip_text(revision, 220))}</div>" if revision else ""
-            html = (
-                "<div class='live-side'>"
-                "<div class='ls-title'>Reflection</div>"
-                f"<div class='ls-row'><b>verdict:</b> {escape(verdict)} · "
-                f"<b>confidence:</b> {escape(confidence)}</div>"
-                f"<div class='ls-row'>{escape(_clip_text(issues, 220))}</div>"
-                + extra
-                + "</div>"
+    def _render_files(self) -> None:
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        for step in self.steps:
+            if step.kind == "tool" and step.subtitle:
+                path = step.subtitle
+                if path and path not in seen_set:
+                    seen.append(path)
+                    seen_set.add(path)
+        if not seen:
+            self.files_ph.markdown(
+                "<div class='side-box empty'><div class='sb-title'>Files Touched</div>"
+                "<div class='sb-row'>No files inspected yet.</div></div>",
+                unsafe_allow_html=True,
             )
-        else:
-            html = (
-                "<div class='live-side empty'>"
-                "<div class='ls-title'>Reflection</div>"
-                "<div class='ls-row'>Reflection critic has not run yet.</div>"
-                "</div>"
-            )
-        self.reflection_ph.markdown(html, unsafe_allow_html=True)
+            return
+        rows = "".join(f"<div class='sb-file'>{escape(p)}</div>" for p in seen[:24])
+        self.files_ph.markdown(
+            "<div class='side-box'><div class='sb-title'>Files Touched</div>" + rows + "</div>",
+            unsafe_allow_html=True,
+        )
 
-        # Program preview. On agentic_operator routes this is the codegen
-        # program. On the ReAct harness it's the most recent execute_python
-        # or execute_context_sql payload.
-        preview_title = "Generated Program (preview)"
-        preview_text: str | None = self.program_text
-        if not preview_text:
-            for evt in reversed(self.events):
-                if evt.get("type") != "react_step":
-                    continue
-                action = evt.get("action")
-                ai = evt.get("action_input") or {}
-                if action == "execute_python" and isinstance(ai, dict) and ai.get("code"):
-                    preview_text = str(ai.get("code"))
-                    preview_title = f"Latest execute_python (step #{evt.get('step_index')})"
-                    break
-                if action == "execute_context_sql" and isinstance(ai, dict) and ai.get("sql"):
-                    preview_text = str(ai.get("sql"))
-                    preview_title = f"Latest SQL (step #{evt.get('step_index')})"
-                    break
-        if preview_text:
-            preview = preview_text
-            if len(preview) > 1600:
-                preview = preview[:1600] + "\n…(truncated)…"
-            html = (
-                "<div class='live-side'>"
-                f"<div class='ls-title'>{escape(preview_title)}</div>"
-                f"<pre style='margin:0; max-height:240px; overflow:auto; background:#f1f5f9; "
-                f"padding:.5rem; border-radius:6px; font-size:.72rem;'>{escape(preview)}</pre>"
-                "</div>"
-            )
-        else:
-            html = (
-                "<div class='live-side empty'>"
-                f"<div class='ls-title'>{escape(preview_title)}</div>"
-                "<div class='ls-row'>No code or SQL has been executed yet.</div>"
-                "</div>"
-            )
-        self.program_ph.markdown(html, unsafe_allow_html=True)
+    def _render_answer(self) -> None:
+        if not self.latest_answer:
+            self.answer_ph.markdown("", unsafe_allow_html=True)
+            return
+        cols = self.latest_answer.get("columns") or []
+        rows = self.latest_answer.get("rows") or []
+        row_count = self.latest_answer.get("row_count") or len(rows)
+        is_draft = bool(self.latest_answer.get("is_draft"))
+        title = "Draft Answer (self-verify)" if is_draft else "Final Answer"
+        head_html = "".join(f"<th>{escape(str(c))}</th>" for c in cols[:8])
+        body_html = ""
+        for r in rows[:5]:
+            if not isinstance(r, (list, tuple)):
+                continue
+            body_html += "<tr>" + "".join(f"<td>{escape(str(v))[:80]}</td>" for v in r[:8]) + "</tr>"
+        more = f"<div class='sb-row'><span class='label'>showing</span><span class='value'>{min(5, len(rows))}/{row_count}</span></div>" if rows else ""
+        self.answer_ph.markdown(
+            "<div class='side-box'>"
+            f"<div class='sb-title'>{escape(title)}</div>"
+            + more
+            + f"<table class='sb-answer-table'><thead><tr>{head_html}</tr></thead><tbody>{body_html}</tbody></table>"
+            + "</div>",
+            unsafe_allow_html=True,
+        )
 
-        # Score (if available).
-        if self.score_event and self.score_event.get("score") is not None:
-            html = (
-                "<div class='live-side'>"
-                "<div class='ls-title'>Local Score</div>"
-                f"<div class='ls-row'><b>score:</b> {float(self.score_event['score'] or 0):.3f}</div>"
-                f"<div class='ls-row muted'>recall={float(self.score_event.get('recall') or 0):.3f} · "
-                f"penalty={float(self.score_event.get('penalty') or 0):.3f}</div>"
-                "</div>"
-            )
-            self.score_ph.markdown(html, unsafe_allow_html=True)
+    def _render_score(self) -> None:
+        if not self.score or self.score.get("score") is None:
+            self.score_ph.markdown("", unsafe_allow_html=True)
+            return
+        score = self.score.get("score") or 0.0
+        recall = self.score.get("recall") or 0.0
+        penalty = self.score.get("penalty") or 0.0
+        rows = [
+            ("score", f"{score:.3f}"),
+            ("recall", f"{recall:.3f}"),
+            ("penalty", f"{penalty:.3f}"),
+        ]
+        body = "".join(
+            f"<div class='sb-row'><span class='label'>{escape(k)}</span><span class='value'>{escape(v)}</span></div>"
+            for k, v in rows
+        )
+        self.score_ph.markdown(
+            "<div class='side-box'><div class='sb-title'>Local Score</div>" + body + "</div>",
+            unsafe_allow_html=True,
+        )
 
 
-def _run_task_live(*, task_id: str, config_path: Path, run_id: str) -> tuple[dict[str, Any], Path]:
+# ============================================================================
+# Live run: subprocess pipe → _StreamView
+# ============================================================================
+
+
+def _run_task_live(
+    *,
+    task_id: str,
+    config_path: Path,
+    run_id: str,
+    dataset_root: Path | None = None,
+    batch_run_dir: Path | None = None,
+    view: "_StreamView | None" = None,
+) -> tuple[dict[str, Any], Path]:
     command = [
-        sys.executable,
-        "-u",
-        "-c",
-        _SUBPROCESS_RUNNER,
-        task_id,
-        str(config_path),
-        run_id,
+        sys.executable, "-u", "-c", _SUBPROCESS_RUNNER,
+        task_id, str(config_path), run_id,
+        str(dataset_root) if dataset_root else "",
     ]
+    env = None
+    if batch_run_dir is not None:
+        import os as _os
+        env = {**_os.environ, "DEMO_BATCH_RUN_DIR": str(batch_run_dir)}
     process = subprocess.Popen(
         command,
         cwd=str(PROJECT_ROOT),
@@ -1330,18 +1529,14 @@ def _run_task_live(*, task_id: str, config_path: Path, run_id: str) -> tuple[dic
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=env,
     )
 
-    renderer = _LiveRenderer(task_id=task_id)
+    if view is None:
+        view = _StreamView(task_id=task_id, mode="live")
     result_payload: dict[str, Any] | None = None
 
     assert process.stdout is not None
-    # Use readline()-based iteration rather than `for line in pipe`. The
-    # implicit iterator on a subprocess stdout pipe holds onto chunks
-    # until its internal buffer fills, which is exactly the source of
-    # the "timeline only updates at the very end" bug. readline() in a
-    # line-buffered pipe returns each line as soon as the child flushes
-    # it, so live progress events render incrementally.
     for line in iter(process.stdout.readline, ""):
         if line.startswith(_RESULT_PREFIX):
             try:
@@ -1356,20 +1551,15 @@ def _run_task_live(*, task_id: str, config_path: Path, run_id: str) -> tuple[dic
             try:
                 event = json.loads(payload_str)
             except json.JSONDecodeError:
-                renderer.append_log_line(line)
+                view.append_log_line(line)
                 continue
-            renderer.apply_event(event)
-            # Yield to Streamlit's runtime so the placeholders we just
-            # mutated actually get pushed over the WebSocket before we
-            # block on the next readline(). Without this yield, several
-            # events can be applied in a microsecond burst and only the
-            # final DOM state shows up to the user.
+            view.apply_event(event)
             time.sleep(0)
             continue
-        renderer.append_log_line(line)
+        view.append_log_line(line)
 
     return_code = process.wait()
-    renderer.append_log_line("")  # force final flush
+    view.append_log_line("")
 
     if return_code != 0:
         raise RuntimeError(f"subprocess exited with code {return_code}")
@@ -1380,30 +1570,100 @@ def _run_task_live(*, task_id: str, config_path: Path, run_id: str) -> tuple[dic
     return result_payload, trace_path
 
 
-def _answer_frame(answer: dict[str, Any] | None) -> pd.DataFrame | None:
-    if not isinstance(answer, dict):
-        return None
-    columns = list(answer.get("columns") or [])
-    rows = [list(row) for row in (answer.get("rows") or [])]
-    if not columns:
-        return None
-    return pd.DataFrame(rows, columns=columns)
+def _run_batch(
+    *,
+    task_ids: list[str],
+    config_path: Path,
+    dataset_root: Path | None,
+) -> dict[str, Any]:
+    """Run a list of tasks sequentially under one shared batch run directory.
 
+    Each task gets its own _StreamView container so the theater pans down the
+    page as the batch progresses, while a sticky progress banner shows
+    cumulative i/N · OK/FAIL counts above the theater.
+    """
+    total = len(task_ids)
+    base_run_id = "batch-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    batch_run_dir = PROJECT_ROOT / "artifacts" / "runs" / base_run_id
+    batch_run_dir.mkdir(parents=True, exist_ok=True)
 
-def _route_summary(trace: dict[str, Any]) -> dict[str, Any]:
-    decision = trace.get("router_decision") or {}
-    compiled = trace.get("compiled_task") or decision.get("compiled_task") or {}
-    validation = trace.get("answer_validation") or {}
+    progress_ph = st.empty()
+    summary_ph = st.empty()
+
+    ok_count = 0
+    fail_count = 0
+    outcomes: list[dict[str, Any]] = []
+    last_trace: Path | None = None
+
+    def _render_progress(current: str, done_idx: int, *, finished: bool = False) -> None:
+        label = "Batch complete" if finished else "Batch progress"
+        cur = "-" if not current else current
+        progress_ph.markdown(
+            "<div class='batch-progress'>"
+            f"<b>{escape(label)}</b> {done_idx}/{total} · "
+            f"current <code>{escape(cur)}</code> · "
+            f"OK <b>{ok_count}</b> · FAIL <b>{fail_count}</b>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    _render_progress(task_ids[0] if task_ids else "", 0)
+
+    for i, tid in enumerate(task_ids, start=1):
+        _render_progress(tid, i - 1)
+        st.markdown(
+            f"<div class='batch-task-header'>Task {i} / {total} · "
+            f"<code>{escape(tid)}</code></div>",
+            unsafe_allow_html=True,
+        )
+        slot = st.container()
+        with slot:
+            view = _StreamView(task_id=tid, mode="live")
+        try:
+            payload, trace_path = _run_task_live(
+                task_id=tid,
+                config_path=config_path,
+                run_id=f"{base_run_id}-{tid}",
+                dataset_root=dataset_root,
+                batch_run_dir=batch_run_dir,
+                view=view,
+            )
+            succeeded = bool(payload.get("succeeded"))
+            outcomes.append({
+                "task_id": tid,
+                "ok": succeeded,
+                "trace_path": str(trace_path),
+            })
+            last_trace = trace_path
+            if succeeded:
+                ok_count += 1
+            else:
+                fail_count += 1
+        except Exception as exc:  # noqa: BLE001
+            outcomes.append({"task_id": tid, "ok": False, "error": str(exc)})
+            fail_count += 1
+            slot.error(f"Task {tid} failed: {exc}")
+        _render_progress(tid, i)
+
+    _render_progress(task_ids[-1] if task_ids else "", total, finished=True)
+    summary_ph.success(
+        f"Batch saved → {batch_run_dir} · OK {ok_count} / FAIL {fail_count}"
+    )
+
+    if last_trace is not None:
+        st.session_state["dashboard_scope"] = str(batch_run_dir)
+
     return {
-        "succeeded": trace.get("succeeded"),
-        "route": decision.get("route_name"),
-        "kind": decision.get("kind"),
-        "model": decision.get("model"),
-        "task_type": compiled.get("task_type"),
-        "operations": ", ".join(compiled.get("operations") or []),
-        "answer_valid": validation.get("valid"),
-        "elapsed_seconds": trace.get("e2e_elapsed_seconds"),
+        "batch_run_dir": str(batch_run_dir),
+        "ok": ok_count,
+        "fail": fail_count,
+        "outcomes": outcomes,
     }
+
+
+# ============================================================================
+# Replay: trace.json → ParsedStep list → _StreamView
+# ============================================================================
 
 
 def _get_operator_block(trace: dict[str, Any]) -> dict[str, Any]:
@@ -1423,14 +1683,6 @@ def _get_operator_block(trace: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _clip(value: Any, limit: int = 140) -> str:
-    text = "" if value is None else str(value)
-    text = " ".join(text.split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "..."
-
-
 def _iter_manifest(trace: dict[str, Any]) -> list[dict[str, Any]]:
     operator = _get_operator_block(trace)
     return [item for item in (operator.get("context_manifest") or []) if isinstance(item, dict)]
@@ -1448,47 +1700,6 @@ def _agentic_trace(trace: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _semantic_plan(trace: dict[str, Any]) -> dict[str, Any]:
-    value = _manifest_value(trace, "semantic_plan")
-    return value if isinstance(value, dict) else {}
-
-
-def _semantic_consistency(trace: dict[str, Any]) -> dict[str, Any]:
-    value = _manifest_value(trace, "semantic_consistency")
-    return value if isinstance(value, dict) else {}
-
-
-def _cheap_guard(trace: dict[str, Any]) -> dict[str, Any]:
-    value = _manifest_value(trace, "cheap_semantic_assessment")
-    return value if isinstance(value, dict) else {}
-
-
-def _debug_steps(trace: dict[str, Any]) -> dict[str, Any]:
-    stdout = str(_get_operator_block(trace).get("exec_stdout") or "")
-    for line in stdout.splitlines():
-        if line.startswith("OPERATOR_CODEGEN_DEBUG="):
-            payload = line.removeprefix("OPERATOR_CODEGEN_DEBUG=").strip()
-        elif line.startswith("TABLELLM_DEBUG="):
-            payload = line.removeprefix("TABLELLM_DEBUG=").strip()
-        else:
-            continue
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError:
-            return {"raw": payload}
-        return parsed if isinstance(parsed, dict) else {"value": parsed}
-    return {}
-
-
-def _answer_shape(trace: dict[str, Any]) -> str:
-    answer = trace.get("answer")
-    if not isinstance(answer, dict):
-        return "no answer"
-    cols = answer.get("columns") or []
-    rows = answer.get("rows") or []
-    return f"{len(rows)} row(s) x {len(cols)} column(s)"
-
-
 def _operator_kind(trace: dict[str, Any]) -> str:
     for key in ("agentic_operator", "operator_executor", "tablellm_direct"):
         if isinstance(trace.get(key), dict):
@@ -1502,6 +1713,258 @@ def _reflection_verdict(trace: dict[str, Any]) -> str:
         decision = rounds[0].get("decision") or {}
         return str(decision.get("verdict") or "-")
     return "-"
+
+
+def _trace_to_parsed_steps(trace: dict[str, Any]) -> list[ParsedStep]:
+    """Convert a full trace.json into a list of ParsedSteps for replay."""
+    steps: list[ParsedStep] = []
+
+    task_id = trace.get("task_id") or "-"
+    succeeded = bool(trace.get("succeeded"))
+    elapsed_total = _coerce_float(trace.get("e2e_elapsed_seconds"))
+
+    decision = trace.get("router_decision") or {}
+    compiled = trace.get("compiled_task") or decision.get("compiled_task") or {}
+
+    # 1. Task start
+    steps.append(ParsedStep(
+        kind="task",
+        title=f"Task {task_id} \u00b7 {trace.get('agent_mode') or 'agent'}",
+        subtitle="(question not stored in trace.json \u2014 see history card)",
+        status="run", stage="route",
+        badges=[("info", f"agent {trace.get('agent_mode') or '-'}")],
+    ))
+
+    # 2. Router decision
+    if decision:
+        steps.append(ParsedStep(
+            kind="route",
+            title=f"route \u2192 {decision.get('route_name') or '?'}",
+            subtitle=f"kind={decision.get('kind') or '-'} \u00b7 model={decision.get('model') or '-'}",
+            status="info", stage="route",
+            badges=[("info", f"difficulty {decision.get('difficulty') or '-'}")],
+        ))
+
+    # 3. Compiled task
+    if compiled:
+        ops = compiled.get("operations") or []
+        steps.append(ParsedStep(
+            kind="compile",
+            title=f"task type \u2192 {compiled.get('task_type') or '-'}",
+            subtitle=f"answer={compiled.get('answer_type') or '-'} \u00b7 {len(compiled.get('source_capabilities') or [])} source(s)",
+            badges=[("info", op) for op in ops[:6]],
+            status="info", stage="route",
+        ))
+
+    # 4. Budget snapshot
+    budget = trace.get("budget") or {}
+    if budget:
+        steps.append(ParsedStep(
+            kind="budget", title="Budget consumed",
+            subtitle=(
+                f"llm={budget.get('llm_calls') or 0} \u00b7 tools={budget.get('tool_calls') or 0} \u00b7 "
+                f"repairs={budget.get('local_repairs') or 0} \u00b7 reasoner={budget.get('reasoner_repairs') or 0}"
+            ),
+            status="info", stage="route",
+        ))
+
+    # 5. Planner subtasks
+    agentic = _agentic_trace(trace)
+    planner = (agentic.get("planner") or {}).get("plan") if isinstance(agentic.get("planner"), dict) else None
+    if planner:
+        subtasks = planner.get("subtasks") or []
+        steps.append(ParsedStep(
+            kind="plan", title=f"planner \u00b7 {len(subtasks)} subtask(s)",
+            subtitle=_clip(planner.get("rationale") or "", 240),
+            status="ok", stage="compute",
+            badges=[("info", f"{s.get('id')}:{s.get('specialist')}") for s in subtasks[:6] if isinstance(s, dict)],
+        ))
+
+    # 6. ReAct step-by-step replay
+    react_steps = trace.get("steps") or []
+    answer_count = 0
+    for raw in react_steps:
+        if not isinstance(raw, dict):
+            continue
+        action = str(raw.get("action") or "")
+        ps = _parse_react_action(
+            action=action,
+            action_input=raw.get("action_input") or {},
+            step_index=raw.get("step_index"),
+            ok=bool(raw.get("ok", True)),
+            cached=False,
+            elapsed=None,
+            prior_answer_count=answer_count,
+            thought=_clip(raw.get("thought") or "", 400),
+            observation=raw.get("observation"),
+        )
+        steps.append(ps)
+        if action == "answer":
+            answer_count += 1
+
+    # 7. Codegen operator (non-React routes)
+    operator = _get_operator_block(trace)
+    if operator.get("program") and not react_steps:
+        steps.append(ParsedStep(
+            kind="code",
+            title="codegen operator \u00b7 program",
+            subtitle=_clip(", ".join(item.get("path") or "" for item in _iter_manifest(trace) if isinstance(item, dict))[:300], 240),
+            code=str(operator.get("program") or ""), code_lang="python",
+            status="info", stage="compute",
+        ))
+        if operator.get("succeeded") is not None:
+            ok = bool(operator.get("succeeded"))
+            steps.append(ParsedStep(
+                kind="obs",
+                title="execution ok" if ok else "execution failed",
+                subtitle=_clip(operator.get("failure_reason") or "", 240),
+                status="ok" if ok else "err", stage="compute",
+            ))
+        stdout_tail = str(operator.get("exec_stdout") or "")[-2400:]
+        if stdout_tail:
+            steps.append(ParsedStep(
+                kind="obs", title="stdout tail",
+                observation=stdout_tail, status="info", stage="compute",
+            ))
+
+    # 8. Reflection rounds
+    for rd in agentic.get("reflection_rounds") or []:
+        if not isinstance(rd, dict):
+            continue
+        decision_obj = rd.get("decision") or {}
+        verdict = decision_obj.get("verdict") or "-"
+        issues = "; ".join(decision_obj.get("issues") or []) or "no concrete issue"
+        revision = decision_obj.get("revision_instruction") or ""
+        sub = issues + (f" \u00b7 retry: {_clip(revision, 200)}" if revision else "")
+        steps.append(ParsedStep(
+            kind="reflect",
+            title=f"reflection round {rd.get('round', 0)} \u00b7 {verdict}",
+            subtitle=_clip(sub, 320),
+            status="ok" if verdict == "accept" else "warn",
+            badges=[("info", f"confidence {decision_obj.get('confidence') or '-'}")],
+            stage="verify",
+        ))
+
+    # 9. Cross-verify / semantic consistency
+    audit = trace.get("semantic_consistency_audit") or {}
+    if audit:
+        gate = audit.get("final_gate") or "-"
+        steps.append(ParsedStep(
+            kind="verify", title=f"semantic gate \u00b7 {gate}",
+            subtitle=f"judge_attempts={audit.get('judge_attempts') or 0} \u00b7 plan_ran={audit.get('plan_ran')}",
+            status="ok" if gate in {"plan+judge", "escalated+judge", "ok", "pass"} else "warn",
+            stage="verify",
+        ))
+    cmv = trace.get("cross_model_verify") or {}
+    if cmv.get("applied"):
+        outcome = cmv.get("outcome") or "-"
+        verifiers = cmv.get("verifiers") or []
+        steps.append(ParsedStep(
+            kind="verify", title=f"cross-model verify \u00b7 {outcome}",
+            subtitle=f"verifiers: {', '.join(verifiers)}",
+            status="ok" if "agreement" in str(outcome) else "warn",
+            stage="verify",
+        ))
+
+    # 10. Local score
+    local_score = trace.get("local_score") or {}
+    if local_score.get("score") is not None:
+        score = float(local_score["score"])
+        recall = _coerce_float(local_score.get("recall")) or 0.0
+        penalty = _coerce_float(local_score.get("penalty")) or 0.0
+        steps.append(ParsedStep(
+            kind="score", title=f"local score = {score:.3f}",
+            subtitle=f"recall={recall:.3f} \u00b7 penalty={penalty:.3f}",
+            status="ok" if score >= 0.95 else ("warn" if score >= 0.5 else "err"),
+            stage="score",
+        ))
+
+    # 11. Final answer card
+    answer = trace.get("answer")
+    if isinstance(answer, dict) and (answer.get("columns") or answer.get("rows")):
+        cols = answer.get("columns") or []
+        rows = answer.get("rows") or []
+        steps.append(ParsedStep(
+            kind="answer",
+            title=f"final answer \u00b7 {len(cols)} col(s) \u00d7 {len(rows)} row(s)",
+            subtitle=", ".join(str(c) for c in cols[:8]),
+            badges=[("info", str(c)[:24]) for c in cols[:6]],
+            status="ok" if succeeded else "warn", stage="verify",
+        ))
+
+    # 12. Task end
+    steps.append(ParsedStep(
+        kind="task",
+        title="Run completed" if succeeded else "Run failed",
+        subtitle=_clip(trace.get("failure_reason") or "", 300) if not succeeded else (f"elapsed {elapsed_total:.1f}s" if elapsed_total else "answer ready"),
+        status="ok" if succeeded else "err",
+        stage="verify" if succeeded else "compute",
+    ))
+    return steps
+
+
+def _render_replay_view(trace: dict[str, Any], trace_path: Path, *, question: str = "") -> None:
+    """Render a saved trace.json using the same _StreamView used for live runs."""
+    task_id = str(trace.get("task_id") or trace_path.parent.name)
+    view = _StreamView(task_id=task_id, mode="replay")
+    view.task_meta["question"] = question or ""
+    decision = trace.get("router_decision") or {}
+    view.task_meta["difficulty"] = (
+        (trace.get("compiled_task") or decision.get("compiled_task") or {}).get("difficulty") or "-"
+    )
+
+    parsed_steps = _trace_to_parsed_steps(trace)
+    view.steps = parsed_steps
+
+    # Sticky counters
+    view.tool_call_count = sum(1 for s in parsed_steps if s.kind == "tool")
+    view.code_call_count = sum(1 for s in parsed_steps if s.kind in {"code", "sql"})
+    view.answer_count = sum(1 for s in parsed_steps if s.kind in {"draft", "answer"})
+    view.event_count = len(parsed_steps)
+    local = trace.get("local_score") or {}
+    if local.get("score") is not None:
+        view.score = {
+            "score": _coerce_float(local.get("score")),
+            "recall": _coerce_float(local.get("recall")),
+            "penalty": _coerce_float(local.get("penalty")),
+        }
+    answer = trace.get("answer")
+    if isinstance(answer, dict) and (answer.get("columns") or answer.get("rows")):
+        view.latest_answer = {
+            "columns": list(answer.get("columns") or []),
+            "rows": [list(r) for r in (answer.get("rows") or [])[:8]],
+            "row_count": len(answer.get("rows") or []),
+            "is_draft": False,
+        }
+    view.complete = True
+    view.succeeded = bool(trace.get("succeeded"))
+    view.failure_reason = trace.get("failure_reason")
+    # Mark stages from replayed steps
+    for s in parsed_steps:
+        if not s.stage:
+            continue
+        slot = view.stages.get(s.stage)
+        if not slot:
+            continue
+        if s.status in {"ok", "warn", "err"}:
+            slot["status"] = s.status
+        elif slot["status"] == "idle":
+            slot["status"] = "ok"
+        if s.title:
+            slot["label"] = _clip(s.title, 40)
+        if s.subtitle and not slot.get("detail"):
+            slot["detail"] = _clip(s.subtitle, 80)
+    view.current_stage = "verify" if view.succeeded else "execute"
+
+    view._render_all()
+    with st.expander("Raw trace.json", expanded=False):
+        st.caption(str(trace_path))
+        st.json(trace)
+
+
+# ============================================================================
+# History grid — _render_run_dashboard (bottom section, always visible)
+# ============================================================================
 
 
 def _score_for_trace(
@@ -1523,10 +1986,8 @@ def _score_for_trace(
             "gold_col_count": local_score.get("gold_col_count"),
             "error": local_score.get("error"),
         }
-
     if task_id in score_summary:
         return score_summary[task_id]
-
     pred_csv = trace_path.parent / "prediction.csv"
     gold_csv = app_config.dataset.gold_root / task_id / "gold.csv"
     try:
@@ -1561,12 +2022,9 @@ def _record_for_trace(
     answer_columns = answer.get("columns") or []
     answer_rows = answer.get("rows") or []
     score_info = _score_for_trace(
-        trace_path=trace_path,
-        trace=trace,
-        app_config=app_config,
-        score_summary=score_summary,
+        trace_path=trace_path, trace=trace,
+        app_config=app_config, score_summary=score_summary,
     )
-
     try:
         task = dataset.get_task(task_id)
         difficulty = task.difficulty
@@ -1636,18 +2094,10 @@ def _build_run_records(
                 "Run": run_dir.name,
                 "Task": trace_path.parent.name,
                 "Status": "FAIL",
-                "Score": None,
-                "Recall": None,
-                "Penalty": None,
-                "Matched": "",
-                "Difficulty": "-",
-                "Route": "-",
-                "Agent": "-",
-                "Task Type": "-",
-                "Gate": "-",
-                "Reflect": "-",
-                "Answer": "0x0",
-                "Elapsed": None,
+                "Score": None, "Recall": None, "Penalty": None,
+                "Matched": "", "Difficulty": "-", "Route": "-",
+                "Agent": "-", "Task Type": "-", "Gate": "-",
+                "Reflect": "-", "Answer": "0x0", "Elapsed": None,
                 "Failure / Score Error": f"trace_read_error:{exc}",
                 "Question": "",
                 "Trace": _relative_artifact_path(trace_path),
@@ -1658,10 +2108,8 @@ def _build_run_records(
             continue
         records.append(
             _record_for_trace(
-                trace_path=trace_path,
-                trace=trace,
-                app_config=app_config,
-                dataset=dataset,
+                trace_path=trace_path, trace=trace,
+                app_config=app_config, dataset=dataset,
                 score_summary=score_summaries[run_dir],
             )
         )
@@ -1693,25 +2141,6 @@ def _render_dashboard_cards(records: list[dict[str, Any]], filtered_count: int) 
             "</div>"
         )
     st.markdown("<div class='status-strip'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
-
-
-def _render_selected_record_badges(row: pd.Series) -> None:
-    status_cls = "ok" if row.get("Status") == "OK" else "fail"
-    score = row.get("Score")
-    score_text = "-" if pd.isna(score) else f"{float(score):.3f}"
-    badges = [
-        (status_cls, str(row.get("Status") or "-")),
-        ("score", f"score {score_text}"),
-        ("", f"route {row.get('Route') or '-'}"),
-        ("", f"gate {row.get('Gate') or '-'}"),
-        ("", f"reflect {row.get('Reflect') or '-'}"),
-        ("", f"answer {row.get('Answer') or '-'}"),
-    ]
-    html = "".join(
-        f"<span class='record-badge {cls}'>{escape(text)}</span>"
-        for cls, text in badges
-    )
-    st.markdown(f"<div class='record-badges'>{html}</div>", unsafe_allow_html=True)
 
 
 def _record_card_html(record: dict[str, Any]) -> str:
@@ -1751,14 +2180,12 @@ def _record_card_html(record: dict[str, Any]) -> str:
         score_sub_parts.append(f"recall {float(recall):.2f}")
     if matched:
         score_sub_parts.append(f"matched {matched}")
-    score_sub = " · ".join(score_sub_parts) or "no score"
+    score_sub = " \u00b7 ".join(score_sub_parts) or "no score"
 
     badges_html: list[str] = []
     if difficulty and difficulty != "-":
         diff_cls = f"difficulty-{difficulty}" if difficulty in {"easy", "medium", "hard"} else ""
-        badges_html.append(
-            f"<span class='rc-badge {diff_cls}'>{escape(difficulty)}</span>"
-        )
+        badges_html.append(f"<span class='rc-badge {diff_cls}'>{escape(difficulty)}</span>")
     if route and route != "-":
         badges_html.append(f"<span class='rc-badge route'>{escape(route)}</span>")
     if agent and agent not in {"-", route}:
@@ -1767,9 +2194,7 @@ def _record_card_html(record: dict[str, Any]) -> str:
         gate_cls = "gate-pass" if gate in {"ok", "pass", "accept"} else (
             "gate-fail" if gate in {"failed", "fail", "error"} else ""
         )
-        badges_html.append(
-            f"<span class='rc-badge {gate_cls}'>gate {escape(gate)}</span>"
-        )
+        badges_html.append(f"<span class='rc-badge {gate_cls}'>gate {escape(gate)}</span>")
     if reflect and reflect != "-":
         badges_html.append(f"<span class='rc-badge'>reflect {escape(reflect)}</span>")
     if answer_shape and answer_shape != "-":
@@ -1795,7 +2220,7 @@ def _record_card_html(record: dict[str, Any]) -> str:
         f"<div class='rc-badges'>{''.join(badges_html)}</div>"
         f"{failure_block}"
         f"<div class='rc-meta'>"
-        f"<span>{escape(run_name)} · {escape(elapsed_text)}</span>"
+        f"<span>{escape(run_name)} \u00b7 {escape(elapsed_text)}</span>"
         f"<span>{escape(modified)}</span>"
         f"</div>"
         f"</div>"
@@ -1808,16 +2233,17 @@ def _render_run_dashboard(
     app_config: Any,
     dataset: DABenchPublicDataset,
 ) -> None:
+    """Render the history grid with filters, sort, and replay button."""
     records = _build_run_records(scope=scope, app_config=app_config, dataset=dataset)
     st.markdown(
         "<div class='dashboard-title'>"
-        "<h2>Run Dashboard</h2>"
+        "<h2>Run History</h2>"
         f"<div class='path'>{escape(_relative_artifact_path(scope))}</div>"
         "</div>",
         unsafe_allow_html=True,
     )
     if not records:
-        st.warning("No trace.json files found for this scope.")
+        st.info("No trace.json files found for this scope yet \u2014 run a task first.")
         return
 
     frame = pd.DataFrame(records)
@@ -1846,11 +2272,9 @@ def _render_run_dashboard(
     if search_text.strip():
         needle = search_text.strip().lower()
         haystack = (
-            filtered["Task"].astype(str)
-            + " "
-            + filtered["Question"].astype(str)
-            + " "
-            + filtered["Failure / Score Error"].astype(str)
+            filtered["Task"].astype(str) + " " +
+            filtered["Question"].astype(str) + " " +
+            filtered["Failure / Score Error"].astype(str)
         ).str.lower()
         filtered = filtered[haystack.str.contains(needle, regex=False)]
 
@@ -1863,7 +2287,7 @@ def _render_run_dashboard(
     sort_col1, sort_col2 = st.columns([1.0, 0.4])
     sort_key = sort_col1.selectbox(
         "Sort by",
-        ["Most recent", "Score (low → high)", "Score (high → low)", "Status (FAIL first)", "Elapsed (slow → fast)"],
+        ["Most recent", "Score (low \u2192 high)", "Score (high \u2192 low)", "Status (FAIL first)", "Elapsed (slow \u2192 fast)"],
         key="dashboard_sort",
     )
     page_size = sort_col2.selectbox("Per page", [12, 24, 48, 96, 240], index=1, key="dashboard_page_size")
@@ -1871,330 +2295,143 @@ def _render_run_dashboard(
     sorted_df = filtered.copy()
     if sort_key == "Most recent":
         sorted_df = sorted_df.sort_values("_modified_ts", ascending=False)
-    elif sort_key == "Score (low → high)":
+    elif sort_key == "Score (low \u2192 high)":
         sorted_df = sorted_df.sort_values("Score", ascending=True, na_position="first")
-    elif sort_key == "Score (high → low)":
+    elif sort_key == "Score (high \u2192 low)":
         sorted_df = sorted_df.sort_values("Score", ascending=False, na_position="last")
     elif sort_key == "Status (FAIL first)":
         sorted_df = sorted_df.assign(_fail_first=(sorted_df["Status"] != "OK").astype(int))
         sorted_df = sorted_df.sort_values(["_fail_first", "_modified_ts"], ascending=[False, False])
         sorted_df = sorted_df.drop(columns=["_fail_first"])
-    elif sort_key == "Elapsed (slow → fast)":
+    elif sort_key == "Elapsed (slow \u2192 fast)":
         sorted_df = sorted_df.sort_values("Elapsed", ascending=False, na_position="last")
 
     visible_df = sorted_df.head(int(page_size))
-    cards_html = "".join(_record_card_html(row) for row in visible_df.to_dict(orient="records"))
     if len(sorted_df) > len(visible_df):
         st.caption(f"Showing {len(visible_df)} of {len(sorted_df)} filtered records. Increase 'Per page' to see more.")
-    st.markdown(f"<div class='run-grid'>{cards_html}</div>", unsafe_allow_html=True)
 
-    inspect_options = list(visible_df["_trace_path"])
-    default_index = 0
-    failures = visible_df.index[visible_df["Status"] == "FAIL"].tolist()
-    if failures:
-        first_failure = failures[0]
-        default_index = list(visible_df.index).index(first_failure)
-
-    def _inspect_label(path: str) -> str:
-        row = visible_df[visible_df["_trace_path"] == path].iloc[0]
-        score = row.get("Score")
-        score_text = "-" if pd.isna(score) else f"{float(score):.3f}"
-        return f"{row['Task']} · {row['Run']} · {row['Status']} · score={score_text}"
-
-    selected = st.selectbox(
-        "Inspect",
-        inspect_options,
-        index=default_index,
-        format_func=_inspect_label,
-        key="dashboard_inspect",
-    )
-    selected_row = visible_df[visible_df["_trace_path"] == selected].iloc[0]
-    _render_selected_record_badges(selected_row)
-    if st.checkbox("Show selected trace", value=False, key="dashboard_show_trace"):
-        selected_path = Path(str(selected))
-        _render_trace(_load_trace(selected_path), selected_path)
-
-
-def _status_class(status: str) -> str:
-    return {
-        "ok": "ok",
-        "pass": "ok",
-        "accept": "ok",
-        "warn": "warn",
-        "revise": "warn",
-        "skip": "idle",
-        "idle": "idle",
-        "fail": "err",
-        "error": "err",
-    }.get(status, "idle")
-
-
-def _build_agent_steps(trace: dict[str, Any]) -> list[dict[str, str]]:
-    decision = trace.get("router_decision") or {}
-    compiled = trace.get("compiled_task") or decision.get("compiled_task") or {}
-    operator = _get_operator_block(trace)
-    validation = trace.get("answer_validation") or {}
-    agentic = _agentic_trace(trace)
-    plan = (agentic.get("planner") or {}).get("plan") or _semantic_plan(trace)
-    debug = _debug_steps(trace)
-    reflection_rounds = agentic.get("reflection_rounds") or []
-    reflection = {}
-    if reflection_rounds and isinstance(reflection_rounds[0], dict):
-        reflection = reflection_rounds[0].get("decision") or {}
-    audit = trace.get("semantic_consistency_audit") or {}
-    gate = str(audit.get("final_gate") or "")
-
-    execute_succeeded = operator.get("succeeded")
-    if execute_succeeded is None and not operator:
-        execute_succeeded = bool(trace.get("succeeded"))
-    answer_valid = validation.get("valid")
-
-    plan_status = "ok" if plan else "skip"
-    reflect_verdict = str(reflection.get("verdict") or "skip")
-    verify_status = "ok"
-    if gate in {"cheap_guard_only"}:
-        verify_status = "warn"
-    if answer_valid is False or gate in {"failed", "error"}:
-        verify_status = "fail"
-
-    return [
-        {
-            "title": "Observe",
-            "status": "ok" if compiled else "warn",
-            "label": f"{len(compiled.get('source_capabilities') or [])} source(s)",
-            "detail": f"type={compiled.get('task_type') or '-'}; ops={', '.join(compiled.get('operations') or []) or '-'}",
-        },
-        {
-            "title": "Plan",
-            "status": plan_status,
-            "label": "planner" if agentic.get("planner") else "semantic plan",
-            "detail": _clip((plan or {}).get("rationale") or (plan or {}).get("confidence") or "fast path"),
-        },
-        {
-            "title": "Act",
-            "status": "ok" if operator.get("program") else "warn",
-            "label": _operator_kind(trace),
-            "detail": f"route={decision.get('route_name') or '-'}; model={decision.get('model') or '-'}",
-        },
-        {
-            "title": "Execute",
-            "status": "ok" if execute_succeeded else "fail",
-            "label": "tool run",
-            "detail": _clip(operator.get("failure_reason") or _answer_shape(trace)),
-        },
-        {
-            "title": "Observe Trace",
-            "status": "ok" if debug or answer_valid else "warn",
-            "label": "debug + validation",
-            "detail": f"debug_keys={len(debug)}; answer_valid={answer_valid}",
-        },
-        {
-            "title": "Reflect",
-            "status": reflect_verdict if reflect_verdict in {"accept", "revise"} else "skip",
-            "label": f"confidence={reflection.get('confidence') or '-'}",
-            "detail": _clip("; ".join(reflection.get("issues") or []) or reflection.get("revision_instruction") or "no concrete issue"),
-        },
-        {
-            "title": "Verify",
-            "status": verify_status,
-            "label": gate or "validation",
-            "detail": f"judge_attempts={audit.get('judge_attempts') or 0}; answer={_answer_shape(trace)}",
-        },
-    ]
-
-
-def _render_metric_grid(trace: dict[str, Any]) -> None:
-    summary = _route_summary(trace)
-    local_score = trace.get("local_score") or {}
-    score_value = local_score.get("score")
-    result = "OK" if summary["succeeded"] else "FAIL"
-    if score_value is not None:
-        result = f"{result} / {score_value:.2f}"
-    values = [
-        ("Result", result),
-        ("Route", summary["route"] or "-"),
-        ("Agent Kind", summary["kind"] or _operator_kind(trace)),
-        ("Elapsed", f"{summary['elapsed_seconds'] or 0}s"),
-    ]
-    cards = []
-    for label, value in values:
-        cards.append(
-            "<div class='metric-card'>"
-            f"<div class='label'>{escape(str(label))}</div>"
-            f"<div class='value'>{escape(str(value))}</div>"
-            "</div>"
-        )
-    st.markdown("<div class='metric-grid'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
-
-
-def _render_agent_rail(trace: dict[str, Any]) -> None:
-    cards = []
-    for idx, step in enumerate(_build_agent_steps(trace), start=1):
-        cls = _status_class(step["status"])
-        cards.append(
-            f"<div class='step-card {cls}'>"
-            f"<div class='step-index'>STEP {idx:02d}</div>"
-            f"<div class='step-title'>{escape(step['title'])}</div>"
-            f"<div class='step-status'>{escape(step['status'].upper())}</div>"
-            f"<div class='step-detail'><b>{escape(step['label'])}</b><br>{escape(step['detail'])}</div>"
-            "</div>"
-        )
-    st.markdown("<div class='agent-rail'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
-
-
-def _render_planner_panel(trace: dict[str, Any]) -> None:
-    agentic = _agentic_trace(trace)
-    planner = agentic.get("planner") or {}
-    plan = planner.get("plan") or {}
-    if not plan:
-        st.info("No agentic planner plan was recorded for this run.")
-        return
-    st.markdown(
-        "<div class='panel'><div class='panel-title'>Planner Decomposition</div>"
-        f"<div class='tiny'>{escape(plan.get('rationale') or '')}</div></div>",
-        unsafe_allow_html=True,
-    )
-    for subtask in plan.get("subtasks") or []:
-        deps = ", ".join(subtask.get("depends_on") or []) or "none"
-        st.markdown(
-            "<div class='subtask'>"
-            f"<span class='sid'>{escape(subtask.get('id') or '-')}</span>"
-            f" · {escape(subtask.get('specialist') or '-')}"
-            f"<div>{escape(subtask.get('instruction') or '')}</div>"
-            f"<div class='tiny'>depends_on={escape(deps)} · expected={escape(subtask.get('expected_output') or '-')}</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-
-def _render_reflection_panel(trace: dict[str, Any]) -> None:
-    agentic = _agentic_trace(trace)
-    rounds = agentic.get("reflection_rounds") or []
-    if not rounds:
-        st.info("No reflection round was recorded.")
-        return
-    for item in rounds:
-        decision = item.get("decision") or {}
-        st.markdown(
-            "<div class='panel'>"
-            f"<div class='panel-title'>Reflection Round {escape(str(item.get('round', 0)))}</div>"
-            f"<div><b>verdict:</b> {escape(decision.get('verdict') or '-')} · "
-            f"<b>confidence:</b> {escape(decision.get('confidence') or '-')}</div>"
-            f"<div class='tiny'>issues: {escape('; '.join(decision.get('issues') or []) or 'none')}</div>"
-            f"<div class='tiny'>revision: {escape(decision.get('revision_instruction') or 'none')}</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-
-def _render_verification_panel(trace: dict[str, Any]) -> None:
-    audit = trace.get("semantic_consistency_audit") or {}
-    guard = _cheap_guard(trace)
-    judge = _semantic_consistency(trace)
-    cols = st.columns(3)
-    cols[0].metric("Final Gate", audit.get("final_gate") or "-")
-    cols[1].metric("Judge Attempts", audit.get("judge_attempts") or 0)
-    cols[2].metric("Answer Valid", str((trace.get("answer_validation") or {}).get("valid")))
-    if guard:
-        st.write("Cheap guard")
-        st.json(guard, expanded=False)
-    if judge:
-        st.write("Consistency judge")
-        st.json(judge, expanded=False)
-
-
-def _render_trace(trace: dict[str, Any], trace_path: Path) -> None:
-    summary = _route_summary(trace)
-    st.markdown(
-        "<div class='hero'>"
-        "<h1>Data Agent Run</h1>"
-        f"<p>{escape(str(trace.get('task_id') or '-'))} · "
-        f"{escape(str(summary.get('task_type') or '-'))} · "
-        f"{escape(str(summary.get('operations') or '-'))}</p>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    _render_metric_grid(trace)
-    _render_agent_rail(trace)
-
-    tab_agent, tab_evidence, tab_program, tab_trace = st.tabs(
-        ["Agent Steps", "Evidence", "Program", "Trace"]
-    )
-    operator = _get_operator_block(trace)
-
-    with tab_agent:
-        left, right = st.columns([1.15, 0.85])
-        with left:
-            _render_planner_panel(trace)
-        with right:
-            _render_reflection_panel(trace)
-        st.subheader("Final Answer")
-        frame = _answer_frame(trace.get("answer"))
-        if frame is None:
-            st.warning("No answer table was produced.")
+    # Each card is wrapped in an anchor with `?replay=<trace_path>` so the
+    # whole card is clickable. main() consumes the query param at the top
+    # of the run and routes it into st.session_state["replay_trace_path"].
+    import urllib.parse as _ulib
+    parts: list[str] = []
+    for row in visible_df.to_dict(orient="records"):
+        trace_path = str(row.get("_trace_path") or "")
+        card_html = _record_card_html(row)
+        if trace_path:
+            href = "?replay=" + _ulib.quote(trace_path, safe="")
+            parts.append(
+                f"<a class='run-card-link' href='{href}' target='_self'>{card_html}</a>"
+            )
         else:
-            st.dataframe(frame, width="stretch", hide_index=True)
+            parts.append(card_html)
+    st.markdown(f"<div class='run-grid'>{''.join(parts)}</div>", unsafe_allow_html=True)
 
-    with tab_evidence:
-        st.subheader("Verification")
-        _render_verification_panel(trace)
-        st.subheader("Observed Debug Steps")
-        debug = _debug_steps(trace)
-        if debug:
-            st.json(debug, expanded=False)
-        else:
-            st.info("No structured debug_steps were found in stdout.")
-        st.subheader("Context Manifest")
-        manifest_rows = []
-        for item in _iter_manifest(trace):
-            if item.get("path"):
-                manifest_rows.append({
-                    "path": item.get("path"),
-                    "kind": item.get("kind"),
-                    "rows": str(item.get("row_count") or item.get("record_count") or ""),
-                    "columns": ", ".join(item.get("columns") or [])[:180],
-                })
-        if manifest_rows:
-            st.dataframe(pd.DataFrame(manifest_rows), width="stretch", hide_index=True)
-        else:
-            st.info("No file manifest entries were recorded.")
 
-    with tab_program:
-        st.subheader("Generated Tool Program")
-        st.code(operator.get("program") or "(no program)", language="python")
-        stdout = str(operator.get("exec_stdout") or "")
-        stderr = str(operator.get("exec_stderr") or "")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.caption("stdout tail")
-            st.code(stdout[-8000:] or "(empty stdout)", language="text")
-        with c2:
-            st.caption("stderr tail")
-            st.code(stderr[-8000:] or "(empty stderr)", language="text")
 
-    with tab_trace:
-        st.caption(str(trace_path))
-        st.json(trace)
+# ============================================================================
+# Main — single-page flow: stream at top, history at bottom, no tabs
+# ============================================================================
 
 
 def main() -> None:
-    st.set_page_config(page_title="DABench Demo", layout="wide")
+    st.set_page_config(
+        page_title="DABench Demo \u00b7 Theater",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     st.markdown(_APP_CSS, unsafe_allow_html=True)
-    st.title("DABench Agent Theater")
-    st.caption("A step-by-step view of how the data agent observes, plans, acts, reflects, verifies, and submits.")
 
-    with st.sidebar:
-        st.header("Agent Run")
-        config_text = st.text_input("Config", value=str(DEFAULT_CONFIG))
-        task_id = st.text_input("Task ID", value="")
-        trace_text = st.text_input("Trace JSON (optional)", value="")
-        run_dir_text = st.text_input("Run Directory", value=str(PROJECT_ROOT / "artifacts" / "runs"))
-        show_task = st.checkbox("Show task context summary", value=True)
-        run_clicked = st.button("Run Agent", type="primary", width="stretch")
-        load_dashboard_clicked = st.button("Load Run Dashboard", width="stretch")
-        latest_run_dashboard_clicked = st.button("Load Latest Run Dashboard", width="stretch")
-        load_trace_clicked = st.button("Load Trace", width="stretch")
-        latest_trace_clicked = st.button("Load Latest Trace", width="stretch")
+    # ---- Clickable history cards: consume ?replay= from the URL into
+    # session state. Anchor links inside the dashboard grid set this
+    # query param so the whole card behaves like a button.
+    qp = st.query_params
+    qp_replay = qp.get("replay")
+    if qp_replay:
+        st.session_state["replay_trace_path"] = str(qp_replay)
+        try:
+            del st.query_params["replay"]
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---- Top control strip (replaces left sidebar) ----
+    st.markdown(
+        "<div class='app-topbar'>"
+        "<div class='tb-title'>Data Agent Theater</div>"
+        "<div class='tb-sub'>One-click runs \u00b7 live trace stream \u00b7 replayable history</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    settings_tab, single_tab, batch_tab = st.tabs([
+        "\u2699 Settings", "\u25b6 Single Task", "\u23f5 Batch (Run All)",
+    ])
+
+    with settings_tab:
+        cfg_col, root_col = st.columns([1.0, 1.0])
+        config_text = cfg_col.text_input(
+            "Config",
+            value=str(DEFAULT_CONFIG),
+            key="topbar_config",
+        )
+        # Resolve config first so the Tasks-folder input can default to the
+        # inherited dataset root.
+        config_path_preview = Path(config_text).expanduser()
+        if not config_path_preview.is_absolute():
+            config_path_preview = (PROJECT_ROOT / config_path_preview).resolve()
+        default_tasks_root = ""
+        try:
+            _preview_config = load_app_config(config_path_preview)
+            default_tasks_root = str(_preview_config.dataset.root_path)
+        except Exception:  # noqa: BLE001
+            pass
+        tasks_root_text = root_col.text_input(
+            "Tasks folder (overrides config dataset root)",
+            value=default_tasks_root,
+            key="sidebar_tasks_root",
+            help="A folder that contains task_* subdirectories.",
+        )
+        run_dir_text = st.text_input(
+            "History run directory",
+            value=str(PROJECT_ROOT / "artifacts" / "runs"),
+            key="sidebar_run_dir",
+        )
+        if st.button("Reset View"):
+            for key in ("replay_trace_path", "dashboard_scope"):
+                st.session_state.pop(key, None)
+            st.rerun()
+
+    with single_tab:
+        single_id_col, single_btn_col = st.columns([3.0, 1.0])
+        task_id = single_id_col.text_input(
+            "Task ID", value="", key="sidebar_task_id"
+        )
+        single_btn_col.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
+        run_clicked = single_btn_col.button(
+            "Run Agent", type="primary", use_container_width=True,
+            key="topbar_run_single",
+        )
+
+    with batch_tab:
+        diff_col, limit_col, batch_btn_col = st.columns([2.0, 1.0, 1.0])
+        difficulty_options = ["easy", "medium", "hard"]
+        difficulty_pick = diff_col.multiselect(
+            "Difficulty filter",
+            difficulty_options,
+            default=[],
+            help="Empty = include all difficulties.",
+            key="sidebar_batch_difficulty",
+        )
+        batch_limit = limit_col.number_input(
+            "Limit (0 = no cap)",
+            min_value=0, max_value=10000, value=0, step=1,
+            key="sidebar_batch_limit",
+        )
+        batch_btn_col.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
+        run_all_clicked = batch_btn_col.button(
+            "Run All Tasks", type="primary", use_container_width=True,
+            key="sidebar_run_all",
+        )
 
     config_path = Path(config_text).expanduser()
     if not config_path.is_absolute():
@@ -2202,103 +2439,140 @@ def main() -> None:
 
     try:
         app_config = load_app_config(config_path)
-        dataset = DABenchPublicDataset(app_config.dataset.root_path)
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not load config/dataset: {exc}")
+        st.error(f"Could not load config: {exc}")
         return
 
-    if load_dashboard_clicked or latest_run_dashboard_clicked:
-        if latest_run_dashboard_clicked:
-            dashboard_scope = _latest_run_dir()
-            if dashboard_scope is None:
-                st.error("No run directories with trace.json files found under artifacts/runs.")
-                return
+    # Resolve effective dataset root: sidebar override wins if non-empty.
+    effective_root = app_config.dataset.root_path
+    dataset_root_override: Path | None = None
+    if tasks_root_text.strip():
+        candidate = Path(tasks_root_text.strip()).expanduser()
+        if not candidate.is_absolute():
+            candidate = (PROJECT_ROOT / candidate).resolve()
+        if candidate != app_config.dataset.root_path:
+            dataset_root_override = candidate
+            effective_root = candidate
+
+    dataset = DABenchPublicDataset(effective_root)
+    if not dataset.exists:
+        st.error(
+            f"Tasks folder does not exist or has no task_* dirs: {effective_root}"
+        )
+        return
+
+    # ---- Determine history scope (always shown at bottom) ----
+    scope_path: Path | None = None
+    scope_raw = st.session_state.get("dashboard_scope")
+    if scope_raw:
+        scope_path = Path(str(scope_raw))
+    else:
+        scope_input = Path(run_dir_text).expanduser()
+        if not scope_input.is_absolute():
+            scope_input = (PROJECT_ROOT / scope_input).resolve()
+        if scope_input.exists():
+            scope_path = scope_input
         else:
-            dashboard_scope = Path(run_dir_text).expanduser()
-            if not dashboard_scope.is_absolute():
-                dashboard_scope = (PROJECT_ROOT / dashboard_scope).resolve()
-        if not dashboard_scope.exists():
-            st.error(f"Run scope does not exist: {dashboard_scope}")
-            return
-        st.session_state["view_mode"] = "dashboard"
-        st.session_state["dashboard_scope"] = str(dashboard_scope)
+            scope_path = _latest_run_dir()
 
-    if load_trace_clicked or latest_trace_clicked:
-        if latest_trace_clicked:
-            trace_path = _latest_trace_path()
-            if trace_path is None:
-                st.error("No trace.json files found under artifacts/runs.")
-                return
-        elif not trace_text.strip():
-            st.error("Please provide a trace.json path.")
-            return
+    # ==================================================================
+    # TOP SECTION: Live run OR Replay OR Idle hero
+    # ==================================================================
+
+    if run_all_clicked:
+        # --- Batch: Run All ---
+        all_ids = dataset.list_task_ids()
+        if difficulty_pick:
+            picked = set(difficulty_pick)
+            tasks = dataset.iter_tasks(difficulties=list(picked))
+            selected_ids = [t.task_id for t in tasks]
         else:
-            trace_path = Path(trace_text).expanduser()
-            if not trace_path.is_absolute():
-                trace_path = (PROJECT_ROOT / trace_path).resolve()
-        st.session_state["view_mode"] = "trace"
-        st.session_state["trace_path"] = str(trace_path)
-
-    if not run_clicked:
-        view_mode = st.session_state.get("view_mode")
-        if view_mode == "dashboard":
-            dashboard_scope = Path(str(st.session_state.get("dashboard_scope") or ""))
-            if not dashboard_scope.exists():
-                st.error(f"Run scope does not exist: {dashboard_scope}")
-                return
-            _render_run_dashboard(scope=dashboard_scope, app_config=app_config, dataset=dataset)
+            selected_ids = list(all_ids)
+        if batch_limit and batch_limit > 0:
+            selected_ids = selected_ids[: int(batch_limit)]
+        if not selected_ids:
+            st.warning(
+                "No tasks selected. Check the Tasks folder path and the "
+                "Difficulty filter."
+            )
             return
-        if view_mode == "trace":
-            trace_path = Path(str(st.session_state.get("trace_path") or ""))
-            try:
-                trace = _load_trace(trace_path)
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Could not load trace: {exc}")
-                return
-            _render_trace(trace, trace_path)
-            return
-
-    if show_task and task_id:
+        st.session_state.pop("replay_trace_path", None)
         try:
-            task = dataset.get_task(task_id)
-            st.markdown(
-                "<div class='panel'>"
-                f"<div class='panel-title'>{escape(task.task_id)} · {escape(task.difficulty)}</div>"
-                f"<div>{escape(task.question)}</div>"
-                "</div>",
-                unsafe_allow_html=True,
+            _run_batch(
+                task_ids=selected_ids,
+                config_path=config_path,
+                dataset_root=dataset_root_override,
             )
         except Exception as exc:  # noqa: BLE001
-            st.warning(f"Task preview failed: {exc}")
+            st.error(f"Batch failed: {exc}")
+            return
+        # _run_batch sets dashboard_scope itself; fall through to history.
 
-    if not run_clicked:
+    elif run_clicked:
+        # --- Live run ---
+        if not task_id.strip():
+            st.error("Please enter a task id.")
+            return
+        run_id = "demo-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            artifact_payload, trace_path = _run_task_live(
+                task_id=task_id.strip(),
+                config_path=config_path,
+                run_id=run_id,
+                dataset_root=dataset_root_override,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Run failed: {exc}")
+            return
+        st.success(f"Run saved \u2192 {artifact_payload.get('task_output_dir')}")
+        st.session_state["replay_trace_path"] = str(trace_path)
+        st.session_state["dashboard_scope"] = str(_run_dir_for_trace(trace_path))
+        # Fall through to render history below
+
+    elif st.session_state.get("replay_trace_path"):
+        # --- Replay (from history card click or previous run) ---
+        trace_path = Path(str(st.session_state["replay_trace_path"]))
+        try:
+            trace = _load_trace(trace_path)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not load trace: {exc}")
+            st.session_state.pop("replay_trace_path", None)
+        else:
+            question_text = ""
+            try:
+                question_text = dataset.get_task(
+                    str(trace.get("task_id") or trace_path.parent.name)
+                ).question
+            except Exception:  # noqa: BLE001
+                pass
+            _render_replay_view(trace, trace_path, question=question_text)
+            # Update scope to the run that owns this trace
+            if not scope_path or not scope_path.exists():
+                scope_path = _run_dir_for_trace(trace_path)
+                st.session_state["dashboard_scope"] = str(scope_path)
+    else:
+        # --- Idle state ---
         st.markdown(
-            "<div class='hero'><h1>Ready</h1>"
-            "<p>Pick a task, then watch the agent move through each decision point.</p></div>",
+            "<div class='hero'><h1>Data Agent Theater</h1>"
+            "<p>Real-time parsing of the agent's thought / action / observation stream. "
+            "Pick a task and click <b>Run Agent</b>, or click a history card below to replay it.</p></div>",
             unsafe_allow_html=True,
         )
-        return
 
-    if not task_id.strip():
-        st.error("Please enter a task id.")
-        return
+    # ==================================================================
+    # BOTTOM SECTION: History grid (always visible)
+    # ==================================================================
 
-    run_id = "demo-" + datetime.now().strftime("%Y%m%d-%H%M%S")
-    try:
-        artifact_payload, trace_path = _run_task_live(
-            task_id=task_id.strip(),
-            config_path=config_path,
-            run_id=run_id,
-        )
-        trace = _load_trace(trace_path)
-        st.session_state["view_mode"] = "trace"
-        st.session_state["trace_path"] = str(trace_path)
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Run failed: {exc}")
-        return
+    st.divider()
 
-    st.success(f"Run saved to {artifact_payload.get('task_output_dir')}")
-    _render_trace(trace, trace_path)
+    if scope_path and scope_path.exists():
+        _render_run_dashboard(scope=scope_path, app_config=app_config, dataset=dataset)
+    else:
+        fallback = _latest_run_dir()
+        if fallback:
+            _render_run_dashboard(scope=fallback, app_config=app_config, dataset=dataset)
+        else:
+            st.info("No past runs found yet. Use the sidebar to start a task.")
 
 
 if __name__ == "__main__":

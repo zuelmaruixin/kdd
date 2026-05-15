@@ -1052,6 +1052,7 @@ def _run_react_pass_for_route(
             sample_seed=sample_seed,
             cache_tool_results=cache_tool_results,
             verification_rounds=route.verification_rounds,
+            use_answer_guard=route.use_answer_guard,
         ),
     )
     payload = agent.run(task).to_dict()

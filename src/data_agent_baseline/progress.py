@@ -599,6 +599,44 @@ class ProgressLogger:
             column_decisions=list(column_decisions or []),
         )
 
+    # ---- react answer guard (cheap deterministic gate) ----------------------
+
+    def react_answer_guard(
+        self,
+        *,
+        prefix: str,
+        step_index: int,
+        verdict: str,
+        score: float,
+        risk_codes: list[str],
+        top_risk: dict[str, Any] | None = None,
+    ) -> None:
+        """Log a cheap-guard verdict on a React draft answer.
+
+        ``verdict`` is one of ``"pass"`` (commit first answer directly),
+        ``"escalate"`` (force a self-verify round). ``risk_codes`` is the
+        list of cheap-guard signals that fired.
+        """
+        color = "green" if verdict == "pass" else "yellow"
+        body = (
+            f"score={score:.2f}"
+            + (f" risks={','.join(risk_codes[:4])}" if risk_codes else " risks=none")
+        )
+        self._line(
+            f"[bold {color}]react-guard[/bold {color}] {prefix}#{step_index} "
+            f"[{color}]{verdict}[/{color}]",
+            body,
+        )
+        self._emit_event(
+            "react_answer_guard",
+            prefix=prefix,
+            step_index=step_index,
+            verdict=verdict,
+            score=score,
+            risk_codes=list(risk_codes or []),
+            top_risk=top_risk,
+        )
+
     # ---- score (from local evaluator if available) -------------------------
 
     def score(self, *, score: float, recall: float, penalty: float) -> None:

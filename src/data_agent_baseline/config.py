@@ -137,8 +137,15 @@ class RouteConfig:
     # ReAct-only knob.
     max_steps: int = 16
     # ReAct-only: how many extra `answer` rounds to require for
-    # self-verification. 0 = legacy behavior (commit on first answer).
-    verification_rounds: int = 1
+    # self-verification. 0 = commit on first answer unless the cheap
+    # React answer guard flags concrete risk; in that case the guard
+    # forces ONE conditional verification round on a per-task basis.
+    verification_rounds: int = 0
+    # ReAct-only: enable the deterministic cheap guard that may bump
+    # verification_rounds by one when it detects concrete risk in a
+    # draft answer (knowledge.md not read, no computation, empty rows,
+    # shape vs question mismatch). Disable to get pure legacy behavior.
+    use_answer_guard: bool = True
     # codegen_direct / operator_executor knobs. The tablellm_* field
     # names are kept for config compatibility; YAML may use codegen_*.
     tablellm_max_table_rows: int = 50
@@ -444,7 +451,8 @@ def _load_route(name: str, payload: dict, agent_defaults: "AgentConfig") -> Rout
         max_retries=int(payload.get("max_retries", -1)),
         retry_backoff_seconds=float(payload.get("retry_backoff_seconds", -1.0)),
         max_steps=int(payload.get("max_steps", agent_defaults.max_steps)),
-        verification_rounds=int(payload.get("verification_rounds", 1)),
+        verification_rounds=int(payload.get("verification_rounds", 0)),
+        use_answer_guard=_bool_value(payload.get("use_answer_guard"), True),
         tablellm_max_table_rows=int(payload.get("codegen_max_table_rows", payload.get("tablellm_max_table_rows", 50))),
         tablellm_max_input_chars=int(payload.get("codegen_max_input_chars", payload.get("tablellm_max_input_chars", 12000))),
         tablellm_python_timeout=int(payload.get("codegen_python_timeout", payload.get("tablellm_python_timeout", 30))),

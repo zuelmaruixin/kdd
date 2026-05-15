@@ -31,8 +31,14 @@ class ReActAgentConfig:
     # don't terminate — we feed back a verification prompt and require the
     # model to call `answer` again. `verification_rounds=1` means one
     # extra answer call (i.e. total 2). Set to 0 to terminate on first
-    # answer (legacy behavior).
-    verification_rounds: int = 1
+    # answer (the cheap React guard still runs and may escalate one
+    # conditional round when it sees concrete evidence of risk).
+    verification_rounds: int = 0
+    # When True, run the deterministic React answer guard on the first
+    # `answer` and force one self-verify round if the guard flags risk.
+    # Independent of ``verification_rounds`` — even with rounds=0 we
+    # still benefit from a conditional check when it's warranted.
+    use_answer_guard: bool = True
 
 
 # Tools that are pure functions of (task.context_dir, action_input) and
@@ -220,7 +226,10 @@ class ReActAgent:
         # Self-verify accounting: how many `answer` calls have we let
         # through, and how many we need before we terminate.
         answers_seen = 0
+        # Baseline rounds from config. The cheap guard may bump this
+        # for THIS task only if the first draft answer looks risky.
         required_answers = max(0, self.config.verification_rounds) + 1
+        guard_escalated = False
         # Most recent draft answer, retained so we can fall back to it if
         # the model fails to call answer again after self-verify reflection.
         pending_answer = None
@@ -302,6 +311,56 @@ class ReActAgent:
                     if is_answer_call:
                         answers_seen += 1
                         pending_answer = tool_result.answer
+                        # On the FIRST answer with rounds=0, consult the
+                        # cheap deterministic guard. Only escalate when
+                        # it finds concrete risk — otherwise commit now.
+                        # See agents/react_answer_guard.py for signals.
+                        if (
+                            self.config.use_answer_guard
+                            and answers_seen == 1
+                            and not guard_escalated
+                            and required_answers == 1
+                        ):
+                            from data_agent_baseline.agents.react_answer_guard import (
+                                assess_react_answer_risk,
+                                summarize_assessment,
+                            )
+                            # Build the step list as the guard will see it
+                            # (the current answer step is recorded below,
+                            # so include it explicitly).
+                            preview_step = StepRecord(
+                                step_index=step_index,
+                                thought=model_step.thought,
+                                action=model_step.action,
+                                action_input=model_step.action_input,
+                                raw_response=raw_response,
+                                observation={
+                                    "ok": True,
+                                    "tool": "answer",
+                                    "content": {"draft": True},
+                                },
+                                ok=True,
+                            )
+                            assessment = assess_react_answer_risk(
+                                task=task,
+                                draft=tool_result.answer,
+                                steps=list(state.steps) + [preview_step],
+                            )
+                            summary = summarize_assessment(assessment)
+                            from data_agent_baseline.progress import get_progress_logger
+                            logger = get_progress_logger()
+                            if logger is not None:
+                                logger.react_answer_guard(
+                                    prefix=self.stream_label_prefix,
+                                    step_index=step_index,
+                                    verdict="escalate" if assessment.should_escalate else "pass",
+                                    score=summary["score"],
+                                    risk_codes=summary["risk_codes"],
+                                    top_risk=summary["top_risk"],
+                                )
+                            if assessment.should_escalate:
+                                required_answers = 2
+                                guard_escalated = True
                         final_answer_call = answers_seen >= required_answers
 
                     if is_answer_call and not final_answer_call:
