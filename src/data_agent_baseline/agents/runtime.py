@@ -15,6 +15,11 @@ class StepRecord:
     raw_response: str
     observation: dict[str, Any]
     ok: bool
+    # When the step came from a native tool call we keep the id so the
+    # next turn can replay (assistant tool_call → tool result) for the
+    # OpenAI Chat Completions API. ``None`` in text-mode runs and in
+    # error rows where no tool_call was emitted.
+    tool_call_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -25,6 +30,10 @@ class AgentRuntimeState:
     steps: list[StepRecord] = field(default_factory=list)
     answer: AnswerTable | None = None
     failure_reason: str | None = None
+    # Pre-loop planner sketch (advisory). ``None`` means no plan was
+    # attempted; a dict with an "error" key means planning was attempted
+    # but failed gracefully.
+    plan: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +42,7 @@ class AgentRunResult:
     answer: AnswerTable | None
     steps: list[StepRecord]
     failure_reason: str | None
+    plan: dict[str, Any] | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -44,5 +54,6 @@ class AgentRunResult:
             "answer": self.answer.to_dict() if self.answer is not None else None,
             "steps": [step.to_dict() for step in self.steps],
             "failure_reason": self.failure_reason,
+            "plan": self.plan,
             "succeeded": self.succeeded,
         }

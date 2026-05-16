@@ -666,6 +666,31 @@ def _build_reasoner_repair_adapter(
     )
 
 
+def _build_helper_model_adapter(
+    route: RouteConfig,
+    agent_config: AgentConfig,
+) -> OpenAIModelAdapter:
+    """Adapter for the knowledge helper model.
+
+    Empty model/endpoint/key fall back to the current route, so the
+    helper is by default the same model as the loop. Configure
+    agent.helper_model.model/api_* to a stronger tier (e.g. qwen-max)
+    when you want the helper to actually outperform the React loop.
+    """
+    helper = agent_config.helper_model
+    return OpenAIModelAdapter(
+        model=helper.model or route.model,
+        api_base=helper.api_base or route.api_base,
+        api_key=helper.api_key or route.api_key,
+        temperature=helper.temperature,
+        max_tokens=helper.max_tokens,
+        request_timeout=helper.request_timeout or route.request_timeout,
+        max_retries=helper.max_retries,
+        retry_backoff_seconds=agent_config.retry_backoff_seconds,
+        retry_backoff_max_seconds=agent_config.retry_backoff_max_seconds,
+    )
+
+
 def _budget_limit(configured: int, compiled_value: int) -> int:
     if configured is None or configured < 0:
         return compiled_value
@@ -1043,6 +1068,7 @@ def _run_react_pass_for_route(
     sample_seed: int | None,
 ) -> dict[str, Any]:
     tools = create_default_tool_registry()
+    from data_agent_baseline.agents.react_planner import PlannerConfig
     agent = ReActAgent(
         model=adapter,
         tools=tools,
@@ -1053,6 +1079,14 @@ def _run_react_pass_for_route(
             cache_tool_results=cache_tool_results,
             verification_rounds=route.verification_rounds,
             use_answer_guard=route.use_answer_guard,
+            planner=PlannerConfig(
+                enabled=route.planner_enabled,
+                skip_for_easy=route.planner_skip_for_easy,
+                max_subtasks=route.planner_max_subtasks,
+                temperature=route.planner_temperature,
+                max_tokens=route.planner_max_tokens,
+            ),
+            use_native_tool_calls=route.use_native_tool_calls,
         ),
     )
     payload = agent.run(task).to_dict()
@@ -1321,6 +1355,50 @@ def _run_one_route(
     """
     adapter = _build_route_adapter(route, agent_config)
 
+    # Install the per-task helper runtime so the React `consult_knowledge`
+    # tool can find a second adapter. Cleared in the finally block so
+    # later routes / tasks see a clean global.
+    helper_runtime = None
+    if agent_config.helper_model.enabled:
+        try:
+            from data_agent_baseline.tools.knowledge import (
+                HelperRuntime,
+                set_helper_runtime,
+            )
+            helper_adapter = _build_helper_model_adapter(route, agent_config)
+            helper_runtime = HelperRuntime(
+                config=agent_config.helper_model,
+                adapter=helper_adapter,
+                calls_remaining=agent_config.helper_model.max_calls_per_task,
+            )
+            set_helper_runtime(helper_runtime)
+        except Exception:  # noqa: BLE001
+            # Helper plumbing must never block the main route. Failure
+            # here just falls back to "no helper tool registered".
+            helper_runtime = None
+
+    try:
+        return _run_one_route_inner(
+            task=task,
+            route=route,
+            agent_config=agent_config,
+            compiled_task=compiled_task,
+            adapter=adapter,
+        )
+    finally:
+        if helper_runtime is not None:
+            from data_agent_baseline.tools.knowledge import set_helper_runtime
+            set_helper_runtime(None)
+
+
+def _run_one_route_inner(
+    *,
+    task: PublicTask,
+    route: RouteConfig,
+    agent_config: AgentConfig,
+    compiled_task: CompiledTask,
+    adapter: OpenAIModelAdapter,
+) -> tuple[dict[str, Any], str]:
     # Decide which self-consistency block applies for this route.
     if route.self_consistency.num_samples > 0:
         sc_config = route.self_consistency

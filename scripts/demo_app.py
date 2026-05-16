@@ -20,7 +20,7 @@ from data_agent_baseline.eval.column_match import score_pair
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "router.deepseek.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "router.qwen.yaml"
 _RESULT_PREFIX = "DEMO_RESULT_JSON="
 _EVENT_PREFIX = "__DEMO_EVENT__"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")

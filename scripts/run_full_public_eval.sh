@@ -9,7 +9,7 @@ set -Eeo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-CONFIG="${CONFIG:-configs/router.deepseek.yaml}"
+CONFIG="${CONFIG:-configs/router.qwen.yaml}"
 LIMIT="${LIMIT:-}"
 RUN_ARGS=()
 

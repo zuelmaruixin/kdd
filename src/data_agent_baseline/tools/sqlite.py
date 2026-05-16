@@ -9,7 +9,21 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True)
 
 
-def inspect_sqlite_schema(path: Path) -> dict[str, object]:
+def inspect_sqlite_schema(
+    path: Path,
+    *,
+    sample_rows: int = 3,
+) -> dict[str, object]:
+    """Inspect tables in a sqlite DB.
+
+    Returns, per table: the CREATE TABLE statement, column metadata
+    (name + sqlite type + nullable + primary-key index), the row count,
+    and up to ``sample_rows`` sample rows. The sample is what the model
+    actually needs to write a correct execute_context_sql query without
+    a round-trip per column name.
+    """
+    sample_rows = max(0, int(sample_rows))
+    tables: list[dict[str, object]] = []
     with _connect_read_only(path) as conn:
         rows = conn.execute(
             """
@@ -19,12 +33,54 @@ def inspect_sqlite_schema(path: Path) -> dict[str, object]:
             ORDER BY name
             """
         ).fetchall()
-        tables: list[dict[str, object]] = []
         for name, create_sql in rows:
+            quoted = f'"{name.replace(chr(34), chr(34) * 2)}"'
+
+            columns: list[dict[str, object]] = []
+            try:
+                column_rows = conn.execute(f"PRAGMA table_info({quoted})").fetchall()
+            except sqlite3.DatabaseError:
+                column_rows = []
+            for cid, col_name, col_type, notnull, _dflt, pk in column_rows:
+                columns.append(
+                    {
+                        "cid": cid,
+                        "name": col_name,
+                        "type": col_type,
+                        "notnull": bool(notnull),
+                        "pk": int(pk),
+                    }
+                )
+
+            row_count: int | None = None
+            sample: list[list[object]] = []
+            sample_columns: list[str] = []
+            try:
+                row_count = conn.execute(
+                    f"SELECT COUNT(*) FROM {quoted}"
+                ).fetchone()[0]
+            except sqlite3.DatabaseError:
+                pass
+
+            if sample_rows > 0:
+                try:
+                    cursor = conn.execute(
+                        f"SELECT * FROM {quoted} LIMIT ?",
+                        (sample_rows,),
+                    )
+                    sample_columns = [item[0] for item in cursor.description or []]
+                    sample = [list(row) for row in cursor.fetchall()]
+                except sqlite3.DatabaseError:
+                    sample = []
+
             tables.append(
                 {
                     "name": name,
                     "create_sql": create_sql,
+                    "columns": columns,
+                    "row_count": row_count,
+                    "sample_columns": sample_columns,
+                    "sample_rows": sample,
                 }
             )
     return {

@@ -146,6 +146,21 @@ class RouteConfig:
     # draft answer (knowledge.md not read, no computation, empty rows,
     # shape vs question mismatch). Disable to get pure legacy behavior.
     use_answer_guard: bool = True
+    # ReAct-only: pre-loop planner. One LLM call that sketches an ordered
+    # list of subtasks before the React loop starts. The plan is
+    # advisory (injected as a user message) and persisted to trace.json.
+    # Disabling it falls back to the legacy one-tool-per-turn loop.
+    planner_enabled: bool = True
+    planner_skip_for_easy: bool = True
+    planner_max_subtasks: int = 6
+    planner_temperature: float = 0.0
+    planner_max_tokens: int = 1024
+    # ReAct-only: when True the loop uses the native OpenAI tool-calling
+    # API (tools=[...], tool_choice="auto") instead of asking the model
+    # to emit a JSON action object in text. Falls back to text parsing
+    # if the model returns content without tool_calls; set to False to
+    # force the legacy text path for endpoints that don't support tools.
+    use_native_tool_calls: bool = True
     # codegen_direct / operator_executor knobs. The tablellm_* field
     # names are kept for config compatibility; YAML may use codegen_*.
     tablellm_max_table_rows: int = 50
@@ -171,9 +186,9 @@ class CrossModelVerifierSpec:
 
     Inherits the primary route's agent kind (agentic_operator /
     multi_agent / react / tablellm_direct) and per-stage knobs; only the
-    model + endpoint are swapped out. This lets you run e.g. a Qwen
-    agent and a DeepSeek agent over the same topology without duplicating
-    the rest of the route config.
+    model + endpoint are swapped out. This lets you run e.g. qwen-max
+    and qwen-plus over the same topology without duplicating the rest of
+    the route config.
     """
 
     name: str = ""
@@ -237,6 +252,34 @@ class ReasonerRepairConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HelperModelConfig:
+    """Optional second (typically larger) LLM used as a knowledge oracle.
+
+    Wired into the React loop via the ``consult_knowledge`` tool. When
+    disabled (the default) the tool is not registered. When enabled, the
+    tool reads any knowledge/rule/glossary doc in the task context, feeds
+    it to this model, and returns a short answer the React agent can
+    cite. Empty endpoint/key fields are interpreted as "inherit from the
+    active route" at construction time.
+    """
+
+    enabled: bool = False
+    model: str = ""
+    api_base: str = ""
+    api_key: str = ""
+    temperature: float = 0.0
+    max_tokens: int = 1024
+    request_timeout: float = 180.0
+    max_retries: int = 1
+    # Hard char cap on what we pass to the helper to avoid blowing token
+    # budgets on a giant knowledge.md.
+    max_doc_chars: int = 12000
+    # Per-task call budget for the helper (the React agent could in
+    # principle call consult_knowledge in a loop; cap it).
+    max_calls_per_task: int = 4
+
+
+@dataclass(frozen=True, slots=True)
 class RouterConfig:
     """Top-level router config (only consumed when agent.mode == 'router')."""
 
@@ -278,6 +321,7 @@ class AgentConfig:
     multi_agent: MultiAgentConfig = field(default_factory=MultiAgentConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     reasoner_repair: ReasonerRepairConfig = field(default_factory=ReasonerRepairConfig)
+    helper_model: HelperModelConfig = field(default_factory=HelperModelConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
 
 
@@ -453,6 +497,34 @@ def _load_route(name: str, payload: dict, agent_defaults: "AgentConfig") -> Rout
         max_steps=int(payload.get("max_steps", agent_defaults.max_steps)),
         verification_rounds=int(payload.get("verification_rounds", 0)),
         use_answer_guard=_bool_value(payload.get("use_answer_guard"), True),
+        planner_enabled=_bool_value(
+            (payload.get("planner") or {}).get("enabled", payload.get("planner_enabled")),
+            True,
+        ),
+        planner_skip_for_easy=_bool_value(
+            (payload.get("planner") or {}).get(
+                "skip_for_easy", payload.get("planner_skip_for_easy")
+            ),
+            True,
+        ),
+        planner_max_subtasks=int(
+            (payload.get("planner") or {}).get(
+                "max_subtasks", payload.get("planner_max_subtasks", 6)
+            )
+        ),
+        planner_temperature=float(
+            (payload.get("planner") or {}).get(
+                "temperature", payload.get("planner_temperature", 0.0)
+            )
+        ),
+        planner_max_tokens=int(
+            (payload.get("planner") or {}).get(
+                "max_tokens", payload.get("planner_max_tokens", 1024)
+            )
+        ),
+        use_native_tool_calls=_bool_value(
+            payload.get("use_native_tool_calls"), True
+        ),
         tablellm_max_table_rows=int(payload.get("codegen_max_table_rows", payload.get("tablellm_max_table_rows", 50))),
         tablellm_max_input_chars=int(payload.get("codegen_max_input_chars", payload.get("tablellm_max_input_chars", 12000))),
         tablellm_python_timeout=int(payload.get("codegen_python_timeout", payload.get("tablellm_python_timeout", 30))),
@@ -549,6 +621,26 @@ def _load_reasoner_repair(
         max_tokens=max_tokens,
         request_timeout=float(payload.get("request_timeout", defaults.request_timeout)),
         max_retries=int(payload.get("max_retries", defaults.max_retries)),
+    )
+
+
+def _load_helper_model(
+    payload: dict,
+    defaults: HelperModelConfig,
+) -> HelperModelConfig:
+    if not payload:
+        return defaults
+    return HelperModelConfig(
+        enabled=_bool_value(payload.get("enabled"), defaults.enabled),
+        model=str(payload.get("model", defaults.model)).strip(),
+        api_base=str(payload.get("api_base", defaults.api_base)).strip(),
+        api_key=str(payload.get("api_key", defaults.api_key)).strip(),
+        temperature=float(payload.get("temperature", defaults.temperature)),
+        max_tokens=int(payload.get("max_tokens", defaults.max_tokens)),
+        request_timeout=float(payload.get("request_timeout", defaults.request_timeout)),
+        max_retries=int(payload.get("max_retries", defaults.max_retries)),
+        max_doc_chars=int(payload.get("max_doc_chars", defaults.max_doc_chars)),
+        max_calls_per_task=int(payload.get("max_calls_per_task", defaults.max_calls_per_task)),
     )
 
 
@@ -655,6 +747,10 @@ def load_app_config(config_path: Path) -> AppConfig:
         agent_payload.get("reasoner_repair", {}) or {},
         agent_defaults.reasoner_repair,
     )
+    helper_model_config = _load_helper_model(
+        agent_payload.get("helper_model", {}) or {},
+        agent_defaults.helper_model,
+    )
 
     raw_max_tokens = agent_payload.get("max_tokens")
     if raw_max_tokens is None or (isinstance(raw_max_tokens, str) and not raw_max_tokens.strip()):
@@ -686,6 +782,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         multi_agent=multi_agent_config,
         budget=budget_config,
         reasoner_repair=reasoner_repair_config,
+        helper_model=helper_model_config,
     )
     router_config = _load_router(agent_payload.get("router", {}) or {}, agent_without_router)
     agent_config = AgentConfig(
@@ -706,6 +803,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         multi_agent=agent_without_router.multi_agent,
         budget=agent_without_router.budget,
         reasoner_repair=agent_without_router.reasoner_repair,
+        helper_model=agent_without_router.helper_model,
         router=router_config,
     )
 

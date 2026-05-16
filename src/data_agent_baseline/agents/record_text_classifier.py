@@ -314,9 +314,9 @@ def classify_record_text_query(
         used directly (meta.source == "fallback_keyword", llm_error ==
         "no_model_configured"). This keeps unit tests cheap.
     model_id:
-        Stable identifier of the model (e.g. ``"deepseek-chat"``,
-        ``"qwen-plus"``). Participates in the cache key so switching
-        providers invalidates cached verdicts automatically.
+        Stable identifier of the model (e.g. ``"qwen-plus"``,
+        ``"qwen-max"``). Participates in the cache key so switching
+        model tiers invalidates cached verdicts automatically.
     cache_dir:
         Optional override for the on-disk cache directory. ``None``
         resolves to ``<project>/artifacts/cache/record_text_classifier/``.

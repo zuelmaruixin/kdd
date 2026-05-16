@@ -609,8 +609,8 @@ Task ID: task_415
 | Config | 用途 |
 | --- | --- |
 | `configs/agentic_router.example.yaml` | 提交版 agent-first 路由模板，已脱敏 |
-| `configs/router.deepseek.yaml` | 本地实验配置，含个人 OpenAI-compatible endpoint/key，默认被 git 忽略 |
-| `configs/router.dashscope.yaml` | DashScope / Qwen API 配置 |
+| `configs/router.qwen.yaml` | Qwen / DashScope OpenAI-compatible 全路径配置，主推 react_harness 主路径 |
+| `configs/router.dashscope.yaml` | DashScope / Qwen API 配置（按 difficulty 路由的版本） |
 | `configs/router.example.yaml` | 路由配置模板 |
 
 注意：配置文件里包含 API endpoint 和 key 字段，提交或展示前请确认是否需要脱敏。

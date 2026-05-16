@@ -409,6 +409,11 @@ def run_with_self_consistency(
             max_steps=base_agent_config.max_steps,
             sample_temperature=sample_temperature,
             sample_seed=sample_index + 1 if num_samples > 1 else base_agent_config.sample_seed,
+            cache_tool_results=base_agent_config.cache_tool_results,
+            verification_rounds=base_agent_config.verification_rounds,
+            use_answer_guard=base_agent_config.use_answer_guard,
+            planner=base_agent_config.planner,
+            use_native_tool_calls=base_agent_config.use_native_tool_calls,
         )
         agent = ReActAgent(model=model, tools=tools, config=agent_config)
         try:

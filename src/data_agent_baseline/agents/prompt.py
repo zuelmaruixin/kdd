@@ -179,8 +179,46 @@ Example response when submitting a final answer:
 """.strip()
 
 
-def build_system_prompt(tool_descriptions: str, system_prompt: str | None = None) -> str:
+# When the React loop runs in native tool-calling mode, the model invokes
+# tools through the OpenAI tools API; emitting JSON-in-text instead would
+# be parsed by the legacy fallback path and lose the native tool_call_id.
+# This variant drops the "always return fenced JSON" instruction and
+# tells the model to use the tools API directly.
+TOOL_API_OUTPUT_RULES = (
+    "Output format (every step):\n"
+    "- Invoke EXACTLY ONE tool per turn via the tools API (i.e. as a\n"
+    "  native ``tool_call``). Do NOT emit JSON action objects in the\n"
+    "  assistant message text — only native tool calls trigger the\n"
+    "  runtime; text-format JSON falls back to a brittle parser and "
+    "  misses the native tool_call_id.\n"
+    "- You MAY include a short rationale (1-3 sentences) in the\n"
+    "  assistant message content alongside the tool call, but the\n"
+    "  rationale is optional. Keep it short.\n"
+    "- The `answer` tool is the only terminating action — call it\n"
+    "  exactly once when you have the final table."
+)
+
+
+def build_system_prompt(
+    tool_descriptions: str,
+    system_prompt: str | None = None,
+    *,
+    use_native_tool_calls: bool = False,
+) -> str:
     base_prompt = system_prompt or REACT_SYSTEM_PROMPT
+    if use_native_tool_calls:
+        # Native tools API: omit the fenced-JSON example and the trailing
+        # "always return ```json" instruction so the model isn't pulled
+        # back into text-format JSON. The schema-link / knowledge.md /
+        # self-verify guidance stays unchanged.
+        return (
+            f"{base_prompt}\n\n"
+            "Available tools (invoked via the tools API, not as JSON in text):\n"
+            f"{tool_descriptions}\n\n"
+            f"{TOOL_API_OUTPUT_RULES}\n\n"
+            f"{SPREADSHEET_FEW_SHOT}\n\n"
+            f"{DOCUMENT_FEW_SHOT}"
+        )
     return (
         f"{base_prompt}\n\n"
         "Available tools:\n"

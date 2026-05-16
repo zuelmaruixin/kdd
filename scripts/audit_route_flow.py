@@ -165,9 +165,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--config",
-        default="configs/router.deepseek.yaml",
+        default="configs/router.qwen.yaml",
         type=Path,
-        help="Config file to audit. Default: configs/router.deepseek.yaml",
+        help="Config file to audit. Default: configs/router.qwen.yaml",
     )
     parser.add_argument(
         "--task",

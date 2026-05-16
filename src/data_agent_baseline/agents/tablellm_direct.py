@@ -1,6 +1,6 @@
 """One-shot executable-code generation agent.
 
-This module asks the configured LLM (DeepSeek/Qwen/etc.) to emit one
+This module asks the configured Qwen model to emit one
 Python program that computes the answer. The router uses it as the
 tool-first codegen branch: skip ReAct, generate code in one shot, run it
 locally, and lift the resulting table into an `AnswerTable`.
