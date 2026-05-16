@@ -495,6 +495,7 @@ def score_run_command(
     console.print(table)
     console.print(
         f"Tasks with predictions: {summary.scored_task_count}/{summary.task_count} | "
+        f"total score: {summary.total_score:.4f}/{summary.task_count} | "
         f"mean score: {summary.mean_score:.4f} | mean recall: {summary.mean_recall:.4f}"
     )
 

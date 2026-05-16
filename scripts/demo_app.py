@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import queue as queue_module
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -115,7 +117,11 @@ section[data-testid="stSidebar"] {
   font-size: .68rem; color: #64748b; line-height: 1.3;
   overflow-wrap: anywhere;
 }
-.stage-pill.idle .sp-label, .stage-pill.idle .sp-detail { color: #cbd5e1; }
+.stage-pill .sp-time {
+  margin-top: auto; font-size: .66rem; color: #475569;
+  font-variant-numeric: tabular-nums;
+}
+.stage-pill.idle .sp-label, .stage-pill.idle .sp-detail, .stage-pill.idle .sp-time { color: #cbd5e1; }
 .stage-pill.run  { background: #fff7e0; border-color: #fde8b8; }
 .stage-pill.run  .sp-title { color: #7a4d00; }
 .stage-pill.ok   { background: #ecf8f3; border-color: #c5eadf; }
@@ -248,6 +254,25 @@ section[data-testid="stSidebar"] {
   color: #0f172a; padding: .2rem 0; word-break: break-all;
 }
 .side-box .sb-file .muted { color: #64748b; }
+.side-box .sb-verify-item {
+  border-top: 1px dashed #e2e8f0; padding: .4rem 0;
+}
+.side-box .sb-verify-item:first-of-type { border-top: none; }
+.side-box .sb-verify-head {
+  display: flex; justify-content: space-between; gap: .5rem;
+  font-size: .78rem; font-weight: 800; color: #0f172a;
+}
+.side-box .sb-verify-meta {
+  margin-top: .15rem; font-size: .72rem; color: #64748b;
+  overflow-wrap: anywhere;
+}
+.side-box .sb-verify-obs {
+  margin-top: .25rem; padding: .35rem .45rem; border-radius: 6px;
+  background: #f8fafc; border: 1px solid #e2e8f0;
+  font-family: ui-monospace, monospace; font-size: .68rem;
+  white-space: pre-wrap; overflow-wrap: anywhere; color: #1f2937;
+  max-height: 220px; overflow: auto;
+}
 
 /* ====== Top hero (idle screen) ====== */
 .hero {
@@ -268,7 +293,7 @@ section[data-testid="stSidebar"] {
 .dashboard-title h2 { margin: 0; color: #0f172a; font-size: 1.35rem; }
 .dashboard-title .path { color: #64748b; font-size: .78rem; overflow-wrap: anywhere; text-align: right; }
 .status-strip {
-  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: .65rem; margin: .6rem 0 1rem 0;
 }
 .status-card {
@@ -425,7 +450,6 @@ section[data-testid="stSidebar"] {
 
 @media (max-width: 1100px) {
   .stage-rail   { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  .status-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dashboard-title { display: block; }
   .dashboard-title .path { text-align: left; margin-top: .2rem; }
   .theater-hero { grid-template-columns: 1fr; }
@@ -545,6 +569,58 @@ def _load_score_summary(run_dir: Path) -> dict[str, dict[str, Any]]:
     }
 
 
+def _compute_batch_score_summary(
+    *,
+    run_dir: Path,
+    task_ids: list[str],
+    app_config: Any,
+) -> dict[str, Any]:
+    per_task: list[dict[str, Any]] = []
+    for task_id in task_ids:
+        pred_csv = run_dir / task_id / "prediction.csv"
+        gold_csv = app_config.dataset.gold_root / task_id / "gold.csv"
+        try:
+            score_info = score_pair(
+                task_id=task_id,
+                pred_csv=pred_csv,
+                gold_csv=gold_csv,
+                redundancy_lambda=app_config.scoring.redundancy_lambda,
+                numeric_tolerance=app_config.scoring.numeric_tolerance,
+                case_insensitive=app_config.scoring.case_insensitive,
+                strip_whitespace=app_config.scoring.strip_whitespace,
+            ).to_dict()
+        except Exception as exc:  # noqa: BLE001
+            score_info = {
+                "task_id": task_id,
+                "matched_count": 0,
+                "pred_col_count": 0,
+                "gold_col_count": 0,
+                "recall": 0.0,
+                "penalty": 0.0,
+                "score": 0.0,
+                "error": f"score_error:{exc}",
+            }
+        per_task.append(score_info)
+
+    task_count = len(per_task)
+    total_score = sum(_coerce_float(item.get("score")) or 0.0 for item in per_task)
+    total_recall = sum(_coerce_float(item.get("recall")) or 0.0 for item in per_task)
+    summary = {
+        "run_dir": str(run_dir),
+        "gold_root": str(app_config.dataset.gold_root),
+        "redundancy_lambda": app_config.scoring.redundancy_lambda,
+        "task_count": task_count,
+        "scored_task_count": sum(1 for item in per_task if not item.get("error")),
+        "total_score": round(total_score, 6),
+        "mean_score": round(total_score / task_count, 6) if task_count else 0.0,
+        "mean_recall": round(total_recall / task_count, 6) if task_count else 0.0,
+        "per_task": per_task,
+    }
+    summary_path = run_dir / "score_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    return summary
+
+
 def _coerce_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -601,14 +677,17 @@ _STAGE_BY_EVENT = {
     "reflection_done":         "verify",
     "reasoner_repair_start":   "verify",
     "reasoner_repair_done":    "verify",
+    "react_answer_guard":      "verify",
     "cross_verify_start":      "verify",
     "cross_verify_done":       "verify",
     "score":                   "score",
+    "task_end":                "score",
 }
 
 _REACT_DISCOVER_ACTIONS = frozenset({"list_context"})
 _REACT_INSPECT_ACTIONS = frozenset({
-    "read_csv", "read_json", "read_doc", "inspect_sqlite_schema",
+    "read_csv", "read_json", "read_doc", "head_doc", "grep_doc",
+    "inspect_sqlite_schema", "consult_knowledge",
 })
 _REACT_COMPUTE_ACTIONS = frozenset({"execute_python", "execute_context_sql"})
 
@@ -632,6 +711,16 @@ def _stage_for_react_step(action: str, prior_answer_count: int) -> str:
 
 def _initial_stage_state() -> dict[str, dict[str, str]]:
     return {name: {"status": "idle", "label": "", "detail": ""} for name in _STAGE_ORDER}
+
+
+def _fmt_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - minutes * 60
+    return f"{minutes}m {rem:04.1f}s"
 
 
 # ============================================================================
@@ -691,16 +780,34 @@ def _format_observation_summary(obs: Any) -> str:
     if obs is None:
         return ""
     if isinstance(obs, str):
-        return _clip(obs, 600)
+        return _clip(obs, 1800)
     if not isinstance(obs, dict):
         try:
-            return _clip(json.dumps(obs, ensure_ascii=False, default=str), 600)
+            return _clip(json.dumps(obs, ensure_ascii=False, default=str), 1800)
         except (TypeError, ValueError):
-            return _clip(str(obs), 600)
+            return _clip(str(obs), 1800)
+    content = obs.get("content")
+    if isinstance(content, dict):
+        if content.get("error"):
+            return "error: " + _clip(str(content.get("error")), 1600)
+        output = content.get("output") or content.get("stdout")
+        stderr = content.get("stderr")
+        if output or stderr:
+            parts = []
+            if output:
+                parts.append("stdout:\n" + str(output))
+            if stderr:
+                parts.append("stderr:\n" + str(stderr))
+            return _clip("\n\n".join(parts), 1800)
+        instructions = content.get("instructions")
+        if instructions:
+            return _clip("instructions:\n" + str(instructions), 1800)
+        if content.get("status"):
+            return _clip(json.dumps(content, ensure_ascii=False, default=str), 1800)
     if "error" in obs and obs.get("error"):
-        return "error: " + _clip(str(obs["error"]), 500)
+        return "error: " + _clip(str(obs["error"]), 1600)
     if "stdout" in obs and obs.get("stdout"):
-        return _clip(str(obs["stdout"]), 600)
+        return _clip(str(obs["stdout"]), 1800)
     if "files" in obs and isinstance(obs.get("files"), list):
         files = obs["files"]
         head = ", ".join(str(f) for f in files[:8])
@@ -724,13 +831,13 @@ def _format_observation_summary(obs: Any) -> str:
                 sample = " \u00b7 sample: " + ", ".join(str(c)[:24] for c in first[:6])
         return f"{len(cols)} column(s) \u00d7 {len(rows)} row(s){sample}"
     if isinstance(obs.get("schema"), (dict, list)):
-        return _clip(json.dumps(obs["schema"], ensure_ascii=False, default=str), 600)
+        return _clip(json.dumps(obs["schema"], ensure_ascii=False, default=str), 1800)
     if obs.get("text"):
-        return _clip(str(obs["text"]), 600)
+        return _clip(str(obs["text"]), 1800)
     try:
-        return _clip(json.dumps(obs, ensure_ascii=False, default=str), 600)
+        return _clip(json.dumps(obs, ensure_ascii=False, default=str), 1800)
     except (TypeError, ValueError):
-        return _clip(str(obs), 600)
+        return _clip(str(obs), 1800)
 
 
 def _to_int(value: Any) -> int | None:
@@ -851,7 +958,7 @@ def _parse_event(event: dict[str, Any], *, prior_answer_count: int) -> ParsedSte
             title="Run completed" if ok else "Run failed",
             subtitle=_clip(event.get("failure_reason") or ("Answer ready" if ok else "see logs"), 300),
             status="ok" if ok else "err", elapsed=elapsed_f,
-            stage="verify" if ok else "compute",
+            stage="score" if ok else "compute",
         )
     if et == "router_decision":
         return ParsedStep(
@@ -881,9 +988,13 @@ def _parse_event(event: dict[str, Any], *, prior_answer_count: int) -> ParsedSte
             stage="route",
         )
     if et == "budget_started":
+        llm_limit = _to_int(event.get("max_llm_calls"))
+        tool_limit = _to_int(event.get("max_tool_calls"))
+        llm_label = "∞" if llm_limit is not None and llm_limit < 0 else str(event.get("max_llm_calls"))
+        tool_label = "∞" if tool_limit is not None and tool_limit < 0 else str(event.get("max_tool_calls"))
         return ParsedStep(
             kind="budget", title="Budget",
-            subtitle=f"llm \u2264 {event.get('max_llm_calls')} \u00b7 tools \u2264 {event.get('max_tool_calls')} \u00b7 {int(float(event.get('max_seconds') or 0))}s wall",
+            subtitle=f"llm \u2264 {llm_label} \u00b7 tools \u2264 {tool_label} \u00b7 {int(float(event.get('max_seconds') or 0))}s wall",
             status="info", elapsed=elapsed_f, stage="route",
         )
     if et == "planner_done":
@@ -987,6 +1098,21 @@ def _parse_event(event: dict[str, Any], *, prior_answer_count: int) -> ParsedSte
             badges=[("info", f"confidence {event.get('confidence') or '-'}")],
             stage="verify",
         )
+    if et == "react_answer_guard":
+        verdict = event.get("verdict") or "-"
+        risks = event.get("risk_codes") or []
+        return ParsedStep(
+            kind="verify",
+            title=f"answer guard \u00b7 {verdict}",
+            subtitle=(
+                "risks: " + ", ".join(str(r) for r in risks[:6])
+                if risks else "risks: none"
+            ),
+            status="ok" if verdict == "pass" else "warn",
+            elapsed=elapsed_f,
+            badges=[("info", f"score {float(event.get('score') or 0):.2f}")],
+            stage="verify",
+        )
     if et == "reasoner_repair_start":
         return ParsedStep(
             kind="reflect", title="reasoner repair",
@@ -1037,6 +1163,8 @@ def _parse_event(event: dict[str, Any], *, prior_answer_count: int) -> ParsedSte
             cached=bool(event.get("cached")),
             elapsed=elapsed_f,
             prior_answer_count=prior_answer_count,
+            thought=str(event.get("thought") or ""),
+            observation=event.get("observation"),
         )
     return None
 
@@ -1108,6 +1236,8 @@ class _StreamView:
         self.stages["route"]["status"] = "run"
         self.stages["route"]["label"] = "starting"
         self.stages["route"]["detail"] = "booting agent runtime"
+        self.stage_started_at: dict[str, float] = {"route": self.start_time}
+        self.stage_finished_at: dict[str, float] = {}
         self.steps: list[ParsedStep] = []
         self.task_meta: dict[str, Any] = {
             "task_id": task_id, "question": "", "difficulty": "",
@@ -1124,6 +1254,7 @@ class _StreamView:
         self.latest_answer: dict[str, Any] | None = None
         self.context_files: list[str] = []
         self.raw_lines: list[str] = []
+        self._last_tick_render_at = 0.0
 
         # Layout: hero + rail at top; left column stream, right column stats.
         self.hero_ph = st.empty()
@@ -1136,8 +1267,9 @@ class _StreamView:
             self.stats_ph = st.empty()
             self.files_ph = st.empty()
             self.answer_ph = st.empty()
+            self.verify_ph = st.empty()
             self.score_ph = st.empty()
-        with st.expander("Raw agent log (rich console output)", expanded=False):
+        with st.expander("Raw events and agent log", expanded=False):
             self.log_ph = st.empty()
 
         self._render_all()
@@ -1149,6 +1281,8 @@ class _StreamView:
             return
         self.event_count += 1
         et = event.get("type")
+        self._append_raw_event(event)
+        final_answer_seen = False
 
         # Sticky bookkeeping
         if et == "task_start":
@@ -1177,6 +1311,7 @@ class _StreamView:
             if action == "answer" and isinstance(ai, dict):
                 cols = ai.get("columns") or []
                 rows = ai.get("rows") or []
+                final_answer_seen = self.answer_count > 0
                 self.latest_answer = {
                     "columns": list(cols),
                     "rows": [list(r) for r in rows][:8],
@@ -1192,6 +1327,14 @@ class _StreamView:
         if stage:
             self._advance_stage_to(stage)
             self._update_stage_from_event(stage, event)
+
+        if final_answer_seen:
+            self._advance_stage_to("score")
+            score_slot = self.stages["score"]
+            if score_slot["status"] == "idle":
+                score_slot["status"] = "run"
+            score_slot["label"] = "finalizing"
+            score_slot["detail"] = "waiting for score / trace write / task_end"
 
         # Parse event into a card
         step = _parse_event(event, prior_answer_count=self.answer_count)
@@ -1209,8 +1352,30 @@ class _StreamView:
 
     def append_log_line(self, line: str) -> None:
         self.raw_lines.append(line)
-        plain = _ANSI_RE.sub("", "".join(self.raw_lines[-180:])).strip() or "Booting agent runtime..."
+        self._render_raw_log()
+
+    def _append_raw_event(self, event: dict[str, Any]) -> None:
+        try:
+            line = "EVENT " + json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        except (TypeError, ValueError):
+            line = f"EVENT {event}\n"
+        self.raw_lines.append(line)
+        self._render_raw_log()
+
+    def _render_raw_log(self) -> None:
+        plain = _ANSI_RE.sub("", "".join(self.raw_lines[-800:])).strip() or "Booting agent runtime..."
         self.log_ph.code(plain, language="text")
+
+    def tick(self) -> None:
+        if self.complete or self.mode != "live":
+            return
+        now = time.time()
+        if now - self._last_tick_render_at < 0.2:
+            return
+        self._last_tick_render_at = now
+        self._render_hero()
+        self._render_rail()
+        self._render_stats()
 
     # --- stage rail logic ---
 
@@ -1225,11 +1390,17 @@ class _StreamView:
             target_idx = _STAGE_ORDER.index(target)
         except ValueError:
             return
+        now = time.time()
         for idx, name in enumerate(_STAGE_ORDER):
-            if idx < target_idx and self.stages[name]["status"] == "run":
-                self.stages[name]["status"] = "ok"
-            elif idx == target_idx and self.stages[name]["status"] == "idle":
-                self.stages[name]["status"] = "run"
+            status = self.stages[name]["status"]
+            if idx < target_idx and status in {"run", "warn"}:
+                self.stage_finished_at.setdefault(name, now)
+                if status == "run":
+                    self.stages[name]["status"] = "ok"
+            elif idx == target_idx:
+                self.stage_started_at.setdefault(name, now)
+                if status == "idle":
+                    self.stages[name]["status"] = "run"
         self.current_stage = target
 
     def _update_stage_from_event(self, stage: str, event: dict[str, Any]) -> None:
@@ -1277,6 +1448,12 @@ class _StreamView:
             slot["label"] = verdict
             slot["detail"] = "; ".join(event.get("issues") or []) or "no concrete issue"
             slot["status"] = "ok" if verdict == "accept" else "warn"
+        elif et == "react_answer_guard":
+            verdict = event.get("verdict") or "-"
+            risks = event.get("risk_codes") or []
+            slot["label"] = f"guard {verdict}"
+            slot["detail"] = ", ".join(str(r) for r in risks[:5]) or "risks=none"
+            slot["status"] = "ok" if verdict == "pass" else "warn"
         elif et == "react_step":
             action = str(event.get("action") or "")
             step_index = event.get("step_index")
@@ -1314,6 +1491,16 @@ class _StreamView:
             slot["status"] = "ok"
             slot["label"] = f"{float(event.get('score') or 0):.3f}"
             slot["detail"] = f"recall={float(event.get('recall') or 0):.3f}"
+            self.stage_finished_at.setdefault(stage, time.time())
+        elif et == "task_end":
+            ok = bool(event.get("succeeded"))
+            slot["status"] = "ok" if ok else "err"
+            slot["label"] = "complete" if ok else "failed"
+            slot["detail"] = (
+                "task_end received"
+                if ok else _clip(event.get("failure_reason") or "task failed", 140)
+            )
+            self.stage_finished_at.setdefault(stage, time.time())
         elif et == "cross_verify_done":
             outcome = event.get("outcome") or "-"
             slot["label"] = outcome
@@ -1321,10 +1508,12 @@ class _StreamView:
             slot["status"] = "ok" if "agreement" in outcome else "warn"
 
     def _finalize_remaining_stages(self) -> None:
+        now = time.time()
         for name in _STAGE_ORDER:
             slot = self.stages[name]
             if slot["status"] == "run":
                 slot["status"] = "ok" if self.succeeded else "err"
+                self.stage_finished_at.setdefault(name, now)
             # idle stages stay idle — honesty about what wasn't walked.
 
     # --- rendering ---
@@ -1336,6 +1525,7 @@ class _StreamView:
         self._render_stats()
         self._render_files()
         self._render_answer()
+        self._render_verify()
         self._render_score()
 
     def _render_hero(self) -> None:
@@ -1380,6 +1570,7 @@ class _StreamView:
 
     def _render_rail(self) -> None:
         pills: list[str] = []
+        now = time.time()
         for idx, name in enumerate(_STAGE_ORDER, start=1):
             slot = self.stages[name]
             status = slot["status"]
@@ -1387,11 +1578,19 @@ class _StreamView:
             label = slot.get("label") or "\u2014"
             detail = slot.get("detail") or ""
             title = f"{idx:02d} \u00b7 {_STAGE_LABEL[name]}"
+            started = self.stage_started_at.get(name)
+            finished = self.stage_finished_at.get(name)
+            timer = ""
+            if started is not None and status in {"run", "warn"} and name == self.current_stage and not self.complete:
+                timer = f"running {_fmt_seconds(now - started)}"
+            elif started is not None and finished is not None and status in {"ok", "warn", "err"}:
+                timer = f"spent {_fmt_seconds(finished - started)}"
             pills.append(
                 f"<div class='stage-pill {cls}'>"
                 f"<div class='sp-title'>{escape(title)}</div>"
                 f"<div class='sp-label'>{escape(str(label))}</div>"
                 f"<div class='sp-detail'>{escape(str(detail))}</div>"
+                f"<div class='sp-time'>{escape(timer)}</div>"
                 "</div>"
             )
         self.rail_ph.markdown("<div class='stage-rail'>" + "".join(pills) + "</div>", unsafe_allow_html=True)
@@ -1477,6 +1676,47 @@ class _StreamView:
             unsafe_allow_html=True,
         )
 
+    def _render_verify(self) -> None:
+        verify_steps = [
+            step for step in self.steps
+            if step.stage == "verify" or step.kind in {"draft", "answer", "verify", "reflect"}
+        ]
+        if not verify_steps:
+            self.verify_ph.markdown("", unsafe_allow_html=True)
+            return
+        items: list[str] = []
+        for step in reversed(verify_steps[-8:]):
+            status = step.status or "-"
+            meta_parts = []
+            if step.step_index is not None:
+                meta_parts.append(f"#{step.step_index}")
+            if step.subtitle:
+                meta_parts.append(step.subtitle)
+            if step.elapsed is not None:
+                meta_parts.append(f"t={step.elapsed:.1f}s")
+            meta = " · ".join(meta_parts)
+            observation = step.observation or ""
+            obs_html = (
+                f"<div class='sb-verify-obs'>{escape(_clip(observation, 1800))}</div>"
+                if observation else ""
+            )
+            items.append(
+                "<div class='sb-verify-item'>"
+                "<div class='sb-verify-head'>"
+                f"<span>{escape(step.title)}</span>"
+                f"<span>{escape(status)}</span>"
+                "</div>"
+                f"<div class='sb-verify-meta'>{escape(meta)}</div>"
+                + obs_html
+                + "</div>"
+            )
+        self.verify_ph.markdown(
+            "<div class='side-box'><div class='sb-title'>Verify Details</div>"
+            + "".join(items)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
     def _render_score(self) -> None:
         if not self.score or self.score.get("score") is None:
             self.score_ph.markdown("", unsafe_allow_html=True)
@@ -1537,12 +1777,34 @@ def _run_task_live(
     result_payload: dict[str, Any] | None = None
 
     assert process.stdout is not None
-    for line in iter(process.stdout.readline, ""):
+    output_queue: "queue_module.Queue[str | None]" = queue_module.Queue()
+
+    def _read_stdout() -> None:
+        try:
+            for stdout_line in iter(process.stdout.readline, ""):
+                output_queue.put(stdout_line)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+
+    while True:
+        try:
+            line = output_queue.get(timeout=0.25)
+        except queue_module.Empty:
+            view.tick()
+            if process.poll() is not None and not reader.is_alive():
+                break
+            continue
+        if line is None:
+            break
         if line.startswith(_RESULT_PREFIX):
             try:
                 result_payload = json.loads(line.removeprefix(_RESULT_PREFIX))
             except json.JSONDecodeError:
                 result_payload = None
+            view.append_log_line(line)
             continue
         if line.startswith(_EVENT_PREFIX):
             payload_str = line[len(_EVENT_PREFIX):].strip()
@@ -1559,6 +1821,7 @@ def _run_task_live(
         view.append_log_line(line)
 
     return_code = process.wait()
+    reader.join(timeout=1.0)
     view.append_log_line("")
 
     if return_code != 0:
@@ -1583,6 +1846,7 @@ def _run_batch(
     cumulative i/N · OK/FAIL counts above the theater.
     """
     total = len(task_ids)
+    app_config = load_app_config(config_path)
     base_run_id = "batch-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     batch_run_dir = PROJECT_ROOT / "artifacts" / "runs" / base_run_id
     batch_run_dir.mkdir(parents=True, exist_ok=True)
@@ -1646,9 +1910,26 @@ def _run_batch(
         _render_progress(tid, i)
 
     _render_progress(task_ids[-1] if task_ids else "", total, finished=True)
-    summary_ph.success(
-        f"Batch saved → {batch_run_dir} · OK {ok_count} / FAIL {fail_count}"
-    )
+    try:
+        score_summary = _compute_batch_score_summary(
+            run_dir=batch_run_dir,
+            task_ids=task_ids,
+            app_config=app_config,
+        )
+        total_score = _coerce_float(score_summary.get("total_score")) or 0.0
+        mean_score = _coerce_float(score_summary.get("mean_score")) or 0.0
+        scored_task_count = int(score_summary.get("scored_task_count") or 0)
+        task_count = int(score_summary.get("task_count") or total)
+        summary_ph.success(
+            f"Batch saved → {batch_run_dir} · OK {ok_count} / FAIL {fail_count} · "
+            f"total score {total_score:.3f}/{task_count} · mean {mean_score:.3f} · "
+            f"scored {scored_task_count}/{task_count}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        summary_ph.warning(
+            f"Batch saved → {batch_run_dir} · OK {ok_count} / FAIL {fail_count} · "
+            f"score summary failed: {exc}"
+        )
 
     if last_trace is not None:
         st.session_state["dashboard_scope"] = str(batch_run_dir)
@@ -2121,15 +2402,19 @@ def _render_dashboard_cards(records: list[dict[str, Any]], filtered_count: int) 
     total = len(records)
     succeeded = sum(1 for item in records if item.get("Status") == "OK")
     failed = total - succeeded
-    scores = [item["Score"] for item in records if item.get("Score") is not None]
-    mean_score = sum(scores) / len(scores) if scores else None
-    perfect = sum(1 for score in scores if score >= 0.999)
+    scores = [_coerce_float(item.get("Score")) for item in records]
+    scored_count = sum(1 for score in scores if score is not None)
+    total_score = sum(score or 0.0 for score in scores)
+    mean_score = total_score / total if total else None
+    perfect = sum(1 for score in scores if score is not None and score >= 0.999)
     values = [
         ("records", str(total), "neutral"),
         ("shown", str(filtered_count), "neutral"),
         ("success", f"{succeeded}/{total}" if total else "0/0", "good"),
         ("failed", str(failed), "bad" if failed else "good"),
+        ("total score", f"{total_score:.3f}/{total}" if total else "-", "score"),
         ("mean score", "-" if mean_score is None else f"{mean_score:.3f}", "score"),
+        ("scored", f"{scored_count}/{total}" if total else "0/0", "neutral"),
         ("score=1.0", str(perfect), "warn"),
     ]
     cards = []

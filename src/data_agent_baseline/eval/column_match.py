@@ -371,10 +371,14 @@ class RunScoreSummary:
         return sum(1 for item in self.per_task if item.error is None)
 
     @property
+    def total_score(self) -> float:
+        return sum(item.score for item in self.per_task)
+
+    @property
     def mean_score(self) -> float:
         if not self.per_task:
             return 0.0
-        return sum(item.score for item in self.per_task) / len(self.per_task)
+        return self.total_score / len(self.per_task)
 
     @property
     def mean_recall(self) -> float:
@@ -389,6 +393,7 @@ class RunScoreSummary:
             "redundancy_lambda": self.redundancy_lambda,
             "task_count": self.task_count,
             "scored_task_count": self.scored_task_count,
+            "total_score": round(self.total_score, 6),
             "mean_score": round(self.mean_score, 6),
             "mean_recall": round(self.mean_recall, 6),
             "per_task": [item.to_dict() for item in self.per_task],

@@ -702,8 +702,12 @@ def _build_helper_model_adapter(
 
 
 def _budget_limit(configured: int, compiled_value: int) -> int:
+    # Negative values are true "unlimited" sentinels. Older behavior used
+    # the compiler's suggested call budget here, which meant configs with
+    # max_llm_calls=-1 still failed with e.g. llm_calls>22. The runtime
+    # already has a wall-clock cap, so keep -1 as unlimited.
     if configured is None or configured < 0:
-        return compiled_value
+        return -1
     return min(configured, compiled_value)
 
 

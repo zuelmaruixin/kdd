@@ -350,6 +350,7 @@ class ReActAgent:
             raw_response = ""
             tool_call_id: str | None = None
             preparsed_step: ModelStep | None = None
+            model_step: ModelStep | None = None
             try:
                 if self.config.use_native_tool_calls:
                     response = self.model.complete_with_tools(
@@ -401,6 +402,19 @@ class ReActAgent:
                         ok=False,
                     )
                 )
+                from data_agent_baseline.progress import get_progress_logger
+                logger = get_progress_logger()
+                if logger is not None:
+                    observation = {"ok": False, "error": str(exc)}
+                    logger.react_step(
+                        prefix=self.stream_label_prefix,
+                        step_index=step_index,
+                        action="__model_error__",
+                        action_input={},
+                        ok=False,
+                        cached=False,
+                        observation=observation,
+                    )
                 state.failure_reason = last_error
                 break
             try:
@@ -560,6 +574,7 @@ class ReActAgent:
                                 action_input=model_step.action_input,
                                 ok=True,
                                 cached=False,
+                                observation=observation,
                             )
                         continue
 
@@ -611,6 +626,7 @@ class ReActAgent:
                                 action_input=model_step.action_input,
                                 ok=tool_result.ok,
                                 cached=False,
+                                observation=observation,
                             )
                         break
 
@@ -624,6 +640,7 @@ class ReActAgent:
                         action_input=model_step.action_input,
                         ok=cache_hit or step_record.ok,
                         cached=cache_hit,
+                        observation=step_record.observation,
                     )
             except BudgetExceeded as budget_exc:
                 if pending_answer is not None:
@@ -647,7 +664,7 @@ class ReActAgent:
                 failed_action = "__error__"
                 failed_action_input: dict[str, object] = {}
                 failed_thought = ""
-                if 'model_step' in locals():
+                if model_step is not None:
                     try:
                         failed_action = model_step.action or failed_action
                         failed_action_input = dict(model_step.action_input or {})
@@ -684,6 +701,18 @@ class ReActAgent:
                         tool_call_id=tool_call_id,
                     )
                 )
+                from data_agent_baseline.progress import get_progress_logger
+                logger = get_progress_logger()
+                if logger is not None:
+                    logger.react_step(
+                        prefix=self.stream_label_prefix,
+                        step_index=step_index,
+                        action=record_action,
+                        action_input=record_input,
+                        ok=False,
+                        cached=False,
+                        observation=observation,
+                    )
 
         if state.answer is None and pending_answer is not None:
             # Self-verify cycle was started but the model never confirmed.

@@ -37,6 +37,31 @@ from rich.console import Console
 DEMO_EVENT_PREFIX = "__DEMO_EVENT__"
 
 
+def _safe_event_value(value: Any, *, depth: int = 0) -> Any:
+    """Clip nested event payloads so live-demo JSON stays pipe-friendly."""
+    if depth >= 5:
+        return str(value)[:500]
+    if isinstance(value, str):
+        return value if len(value) <= 12_000 else value[:12_000] + "..."
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        clipped: dict[str, Any] = {}
+        for idx, (key, item) in enumerate(value.items()):
+            if idx >= 60:
+                clipped["__truncated_keys__"] = len(value) - idx
+                break
+            clipped[str(key)] = _safe_event_value(item, depth=depth + 1)
+        return clipped
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        clipped_items = [_safe_event_value(item, depth=depth + 1) for item in items[:80]]
+        if len(items) > 80:
+            clipped_items.append({"__truncated_items__": len(items) - 80})
+        return clipped_items
+    return str(value)[:1000]
+
+
 @dataclass(slots=True)
 class ProgressLogger:
     # `force_terminal=False` keeps Rich from emitting ANSI escapes when
@@ -265,10 +290,12 @@ class ProgressLogger:
         )
 
     def budget_started(self, *, max_llm_calls: int, max_tool_calls: int, max_seconds: float) -> None:
+        llm_label = "∞" if max_llm_calls < 0 else str(max_llm_calls)
+        tool_label = "∞" if max_tool_calls < 0 else str(max_tool_calls)
         seconds = f", {max_seconds:.0f}s" if max_seconds > 0 else ""
         self._line(
             f"[bold blue]{self._t('budget')}[/bold blue]",
-            f"llm≤{max_llm_calls}, tools≤{max_tool_calls}{seconds}",
+            f"llm≤{llm_label}, tools≤{tool_label}{seconds}",
         )
         self._emit_event(
             "budget_started",
@@ -534,6 +561,7 @@ class ProgressLogger:
         action_input: dict[str, Any],
         ok: bool,
         cached: bool = False,
+        observation: dict[str, Any] | None = None,
     ) -> None:
         cache_tag = " [dim](cached)[/dim]" if cached else ""
         marker = "[green]✓[/green]" if ok else "[red]✗[/red]"
@@ -548,15 +576,17 @@ class ProgressLogger:
             f"{marker} {prefix}#{step_index} [yellow]{action}[/yellow]{cache_tag}",
             args_text,
         )
-        self._emit_event(
-            "react_step",
-            prefix=prefix,
-            step_index=step_index,
-            action=action,
-            action_input=action_input,
-            ok=ok,
-            cached=cached,
-        )
+        event_payload = {
+            "prefix": prefix,
+            "step_index": step_index,
+            "action": action,
+            "action_input": action_input,
+            "ok": ok,
+            "cached": cached,
+        }
+        if observation is not None:
+            event_payload["observation"] = _safe_event_value(observation)
+        self._emit_event("react_step", **event_payload)
 
     # ---- cross-model verify -----------------------------------------------
 

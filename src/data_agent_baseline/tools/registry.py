@@ -297,7 +297,9 @@ def create_default_tool_registry(*, include_helper_tool: bool | None = None) -> 
             description=(
                 "Execute arbitrary Python code with the task context directory as the "
                 "working directory. The tool returns the code's captured stdout as `output`. "
-                f"The execution timeout is fixed at {EXECUTE_PYTHON_TIMEOUT_SECONDS} seconds."
+                f"The execution timeout is fixed at {EXECUTE_PYTHON_TIMEOUT_SECONDS} seconds. "
+                "For large CSV files, scan with pandas.read_csv(..., chunksize=...) "
+                "and filter early instead of loading the whole file repeatedly."
             ),
             input_schema={
                 "code": "import os\nprint(sorted(os.listdir('.')))",

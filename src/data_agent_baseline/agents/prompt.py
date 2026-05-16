@@ -39,6 +39,10 @@ Critical scoring details (read carefully):
   keys. Never derive the final answer from them — query the full data
   via `execute_python` (pandas) or `execute_context_sql` (SQLite) before
   deciding the result rows.
+- For large CSVs, do not repeatedly load the whole file just to inspect
+  schema or test a filter. Use `read_csv(..., columns_only=true)` for
+  schema, then in `execute_python` scan with `pd.read_csv(..., chunksize=...)`
+  and filter early.
 
 How to work (TableLLM-inspired schema-link first, then code):
 1. Start with `list_context` so you know every file you may use.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import multiprocessing
+import queue as queue_module
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -513,6 +514,7 @@ def _run_single_task_in_subprocess(
     config: AppConfig,
     queue: multiprocessing.Queue[Any],
     progress_events_enabled: bool = False,
+    progress_emit_demo_events: bool = False,
     stream_enabled: bool = False,
     progress_lang: str = "en",
 ) -> None:
@@ -520,7 +522,16 @@ def _run_single_task_in_subprocess(
         if progress_events_enabled:
             from data_agent_baseline.progress import ProgressLogger, set_progress_logger
 
-            set_progress_logger(ProgressLogger(enabled=True, lang=progress_lang))
+            logger = ProgressLogger(
+                enabled=True,
+                lang=progress_lang,
+                emit_demo_events=progress_emit_demo_events,
+            )
+            # The parent emits task_start/task_end, but the actual route /
+            # tool events happen in this timeout worker. Seed the timer so
+            # demo events still carry useful elapsed values.
+            logger._task_started_at = perf_counter()
+            set_progress_logger(logger)
         if stream_enabled:
             from data_agent_baseline.agents.model import StreamSink, set_stream_sink
 
@@ -551,17 +562,48 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
 
     progress_logger = get_progress_logger()
     progress_events_enabled = progress_logger is not None
+    progress_emit_demo_events = (
+        bool(getattr(progress_logger, "emit_demo_events", False))
+        if progress_logger is not None
+        else False
+    )
     progress_lang = getattr(progress_logger, "lang", "en") if progress_logger is not None else "en"
     stream_sink = get_stream_sink()
     stream_enabled = stream_sink is not None and stream_sink.enabled
     process = multiprocessing.Process(
         target=_run_single_task_in_subprocess,
-        args=(task_id, config, queue, progress_events_enabled, stream_enabled, progress_lang),
+        args=(
+            task_id,
+            config,
+            queue,
+            progress_events_enabled,
+            progress_emit_demo_events,
+            stream_enabled,
+            progress_lang,
+        ),
     )
     process.start()
-    process.join(timeout_seconds)
 
-    if process.is_alive():
+    result: dict[str, Any] | None = None
+    deadline = perf_counter() + timeout_seconds
+    while True:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            break
+        try:
+            result = queue.get(timeout=min(0.25, remaining))
+            break
+        except queue_module.Empty:
+            if not process.is_alive():
+                break
+
+    if result is None:
+        try:
+            result = queue.get_nowait()
+        except queue_module.Empty:
+            result = None
+
+    if result is None and process.is_alive():
         process.terminate()
         process.join(timeout=1.0)
         if process.is_alive():
@@ -569,7 +611,20 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
             process.join()
         return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.")
 
-    if queue.empty():
+    if result is not None:
+        process.join(timeout=1.0)
+        if process.is_alive():
+            # The worker has already handed us the run result. If it is still
+            # alive, it is usually flushing multiprocessing.Queue feeder state
+            # for a large trace payload; don't let that masquerade as a task
+            # hang.
+            process.terminate()
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.kill()
+                process.join()
+
+    if result is None:
         exit_code = process.exitcode
         if exit_code not in (None, 0):
             return _failure_run_result_payload(
@@ -578,7 +633,6 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
             )
         return _failure_run_result_payload(task_id, "Task exited without returning a result.")
 
-    result = queue.get()
     if result.get("ok"):
         return dict(result["run_result"])
     return _failure_run_result_payload(task_id, f"Task failed with uncaught error: {result['error']}")
