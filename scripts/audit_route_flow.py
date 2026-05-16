@@ -80,6 +80,7 @@ def _iter_rows(
         route_name, route_reason, _fallback_used = _route_for_compiled_task(
             config.agent.router,
             compiled,
+            difficulty_key=(task.difficulty or "").strip().lower(),
         )
         route = config.agent.router.routes[route_name]
         rows.append({

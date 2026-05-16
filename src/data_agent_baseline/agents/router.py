@@ -299,19 +299,29 @@ def _route_for_compiled_task(
     difficulty_key: str = "",
     visited: set[str] | None = None,
 ) -> tuple[str, str, bool]:
+    task_type = compiled.task_type.lower()
+    visited = visited or set()
+
+    mapped = router.task_type_routing.get(task_type)
+    if mapped and mapped in router.routes and mapped not in visited:
+        return mapped, "task_type_routing", False
+
+    difficulty_mapped = router.difficulty_routing.get(difficulty_key)
+    if (
+        difficulty_mapped
+        and difficulty_mapped in router.routes
+        and difficulty_mapped not in visited
+    ):
+        return difficulty_mapped, "difficulty_routing", False
+
     profile_route = _route_for_execution_profile(router, compiled, visited=visited)
     if profile_route is not None:
         return profile_route
 
-    task_type = compiled.task_type.lower()
     if _is_light_table_task(compiled, difficulty_key=difficulty_key):
         candidate = _first_route_named(router, ("easy",), visited=visited)
         if candidate is not None:
             return candidate, "light_table_easy", False
-
-    mapped = router.task_type_routing.get(task_type)
-    if mapped and mapped in router.routes and mapped not in (visited or set()):
-        return mapped, "task_type_routing", False
 
     if task_type == "table_computation":
         candidate = _first_route_with_kind(
@@ -338,10 +348,10 @@ def _route_for_compiled_task(
     if candidate is not None:
         return candidate, "task_type_auto", False
 
-    if router.default_route in router.routes and router.default_route not in (visited or set()):
+    if router.default_route in router.routes and router.default_route not in visited:
         return router.default_route, "default_route", True
     for name in router.routes:
-        if name not in (visited or set()):
+        if name not in visited:
             return name, "first_available", True
     raise ValueError("No unvisited route is available.")
 
@@ -1355,11 +1365,11 @@ def _run_one_route(
     """
     adapter = _build_route_adapter(route, agent_config)
 
-    # Install the per-task helper runtime so the React `consult_knowledge`
-    # tool can find a second adapter. Cleared in the finally block so
-    # later routes / tasks see a clean global.
+    # Install the per-task helper runtime only for ReAct routes so the
+    # `consult_knowledge` tool can find a second adapter. Cleared in the
+    # finally block so later routes / tasks see a clean global.
     helper_runtime = None
-    if agent_config.helper_model.enabled:
+    if agent_config.helper_model.enabled and route.kind.lower() == "react":
         try:
             from data_agent_baseline.tools.knowledge import (
                 HelperRuntime,
