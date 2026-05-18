@@ -1,14 +1,21 @@
-# Agent-first submission config.
+# Qwen (DashScope OpenAI-compatible) full-route config.
 #
-# Primary path is a harness-style ReAct loop with one self-verification
-# round (`react_harness`). The agent does Plan → tool actions → call
-# `answer` (draft) → reflect → call `answer` again (final).
+# Main path: harness-style ReAct loop (`react_harness`).
+#   plan → tool actions → answer (draft) → self-verify → answer (final)
+# Each task is hard-capped at 10 minutes (budget.max_seconds=600);
+# LLM call count is unlimited within that budget.
 #
-# The `agentic_operator` routes (Planner + Operator + Reflection critic)
-# are kept defined here for ablation comparisons but are no longer hung
-# off the default route or any task_type.
+# The `agentic_operator` and `multi_agent` routes below are kept for
+# cascade fallback / ablation only — they are not in `task_type_routing`.
 #
-# Fill in api_key/model/api_base for your provider before running.
+# Get a DashScope key at https://dashscope.console.aliyuncs.com/ and
+# replace REPLACE_WITH_YOUR_DASHSCOPE_KEY throughout the file before
+# running.
+#
+# Run:
+#   uv run dabench run-task task_19   --config configs/router.qwen.yaml
+#   uv run dabench run-benchmark      --config configs/router.qwen.yaml --limit 5
+#   uv run dabench score-run artifacts/runs/<run_id> --config configs/router.qwen.yaml
 
 dataset:
   root_path: data/public/input
@@ -17,28 +24,39 @@ dataset:
 agent:
   provider: openai_compatible
   mode: router
-  model: REPLACE_WITH_MODEL
-  api_base: https://your-openai-compatible-endpoint.example.com/v1
-  api_key: REPLACE_WITH_API_KEY
-  # Harness-style ReAct: unlimited LLM calls within a 10-minute wallclock
-  # per task. Force-kill is enforced by budget.max_seconds below.
+
+  name: qwen_plus
+  model: qwen3.5-35b-a3b
+  api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key: 
+  # Harness main path: at most 40 ReAct steps per task; 10-min wallclock
+  # force-kill is enforced by budget.max_seconds below.
   max_steps: 40
   temperature: 0.0
-  max_tokens: 4096
-  request_timeout: 360
+  max_tokens: 2048
+  request_timeout: 240
 
   budget:
     enabled: true
+    # LLM / tool call counts uncapped.
     max_llm_calls: -1
     max_tool_calls: -1
-    # 600 s = 10 min per task hard ceiling. Triggers BudgetExceeded and
+    # Hard 10-minute ceiling per task. Triggers BudgetExceeded and
     # terminates the ReAct loop regardless of step count.
     max_seconds: 600
 
-  # Main-path self-consistency stays at 1 because the agent now improves
-  # itself through one self-verify round rather than answer voting.
+  reasoner_repair:
+    enabled: true
+    # Only fires after a tool execution failure to attempt a local fix.
+    # api_base / api_key empty = inherit from the active route.
+    model: qwen3.5-35b-a3b
+    temperature: 0.0
+    max_tokens: 1024
+    request_timeout: 180
+    max_retries: 1
+
   self_consistency:
-    num_samples: 1
+    num_samples: 3
     sample_temperature: 0.7
     aggregator: column_vote
     min_votes: 1
@@ -46,58 +64,70 @@ agent:
   router:
     enabled: true
     default_route: react_harness
+    # Difficulty is treated as a budget hint only; the main dispatch
+    # signal is task_type.
     estimate_when_missing: true
+    # On failure, cascade through agentic_operator + RAG paths, then
+    # finally multi_agent.
     cascade_on_failure: true
-    cascade_order: [react_harness, agentic_mixed, agentic_table, fallback_multi_agent]
+    cascade_order: [react_harness, tool_first_mixed, extreme, fallback_multi_agent]
     cascade_max_extra_attempts: 1
+
+    # Cross-model verify is off on the main path: react_harness already
+    # does one self-verify round, layering a second model on top blows
+    # past the 10-min wallclock.
+    cross_model_verify:
+      enabled: false
+      apply_to_routes: []
+      min_agreement: 2
+      parallel: true
+      verifiers: []
 
     task_type_routing:
       table_computation: react_harness
-      table_with_semantic_rule: react_harness
       record_text_with_semantic_rule: react_harness
+      table_with_semantic_rule: react_harness
       document_qa: react_harness
       mixed_context: react_harness
       image_understanding: react_harness
       pure_reasoning: react_harness
 
+    # Backward-compatible only; not used as the primary router anymore.
+    difficulty_routing: {}
+
     routes:
       react_harness:
         kind: react
-        model: REPLACE_WITH_MODEL
-        api_base: https://your-openai-compatible-endpoint.example.com/v1
-        api_key: REPLACE_WITH_API_KEY
-        temperature: 0.0
-        max_tokens: 4096
-        request_timeout: 360
-        max_steps: 32
-        # Default 0: commit on first answer. The deterministic React
-        # answer guard (use_answer_guard) bumps to one verify round only
-        # when it finds concrete risk (knowledge.md not read, no
-        # computation, empty/invalid draft). Unconditional 2-round
-        # verification was found to regress accuracy + double wallclock
-        # (Huang et al. ICLR 2024 — intrinsic self-correction hurts
-        # without an external signal; CRITIC ICLR 2024 — only escalate
-        # on grounded checks).
-        verification_rounds: 0
-        use_answer_guard: true
-        self_consistency:
-          num_samples: 1
-
-      # Ablation route — kept defined but not in task_type_routing.
-      agentic_table:
-        kind: agentic_operator
-        model: REPLACE_WITH_MODEL
-        api_base: https://your-openai-compatible-endpoint.example.com/v1
-        api_key: REPLACE_WITH_API_KEY
+        # Main path: harness-style ReAct. Plan → tools → answer (draft)
+        # → self-verify → answer (final). 10-min wallclock force-kill,
+        # LLM calls uncapped.
+        model: qwen3.5-35b-a3b
+        api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+        api_key: 
         temperature: 0.0
         max_tokens: 2048
         request_timeout: 240
-        tablellm_max_table_rows: 80
-        tablellm_max_input_chars: 20000
-        tablellm_python_timeout: 45
-        semantic_consistency:
-          enabled: true
-          max_repairs: 2
+        max_steps: 40
+        verification_rounds: 1
+        self_consistency:
+          num_samples: 1
+
+      # ---- Routes below are ablation / cascade fallback only. ----
+
+      easy:
+        kind: agentic_operator
+        # Ablation: Planner decomposes the task, Operator runs
+        # pandas/SQL/RAG tool actions, Reflection critic accepts or
+        # re-runs with feedback.
+        model: qwen3.5-35b-a3b
+        api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+        api_key: 
+        temperature: 0.0
+        max_tokens: 1024
+        request_timeout: 120
+        tablellm_max_table_rows: 50
+        tablellm_max_input_chars: 12000
+        tablellm_python_timeout: 30
         multi_agent:
           enabled: true
           planner_temperature: 0.0
@@ -105,11 +135,41 @@ agent:
         self_consistency:
           num_samples: 1
 
-      agentic_mixed:
+      medium:
+        kind: react
+        model: qwen3.5-35b-a3b
+        api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+        api_key: 
+        temperature: 0.0
+        max_tokens: 2048
+        max_steps: 16
+        self_consistency:
+          num_samples: 2
+
+      hard:
         kind: agentic_operator
-        model: REPLACE_WITH_MODEL
-        api_base: https://your-openai-compatible-endpoint.example.com/v1
-        api_key: REPLACE_WITH_API_KEY
+        model: qwen3.5-35b-a3b
+        api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+        api_key: 
+        temperature: 0.0
+        max_tokens: 2048
+        request_timeout: 360
+        tablellm_max_table_rows: 80
+        tablellm_max_input_chars: 20000
+        tablellm_python_timeout: 45
+        multi_agent:
+          enabled: true
+          planner_temperature: 0.0
+          enable_iterative_refinement: true
+        self_consistency:
+          # Agentic reflection replaces heavy output voting on the main path.
+          num_samples: 1
+
+      tool_first_mixed:
+        kind: agentic_operator
+        model: qwen3.5-35b-a3b
+        api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+        api_key: 
         temperature: 0.0
         max_tokens: 4096
         request_timeout: 600
@@ -121,16 +181,18 @@ agent:
           max_chunk_chars: 1200
           chunk_overlap_chars: 150
           doc_char_budget: 6000
-          use_hybrid: false
+          use_hybrid: true
+          embedding_model: text-embedding-v4
+          embedding_api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+          embedding_api_key: 
+          embedding_batch_size: 10
+          cache_dir: artifacts/cache/embeddings
           query_expansion_enabled: true
           query_expansion_paraphrases: 2
           query_expansion_include_hyde: true
         tablellm_max_table_rows: 80
         tablellm_max_input_chars: 26000
         tablellm_python_timeout: 60
-        semantic_consistency:
-          enabled: true
-          max_repairs: 3
         multi_agent:
           enabled: true
           planner_temperature: 0.0
@@ -138,33 +200,85 @@ agent:
         self_consistency:
           num_samples: 1
 
-      fallback_multi_agent:
-        kind: multi_agent
-        model: REPLACE_WITH_MODEL
-        api_base: https://your-openai-compatible-endpoint.example.com/v1
-        api_key: REPLACE_WITH_API_KEY
+      extreme:
+        kind: agentic_operator
+        model: qwen3.5-35b-a3b
+        api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+        api_key: 
         temperature: 0.0
         max_tokens: 4096
         request_timeout: 600
+        # Long doc / .docx tasks: full RAG pipeline.
+        #
+        # OpenAI-compatible /v1/embeddings supports DashScope
+        # text-embedding-v4/v3 here. To add a cross-encoder rerank step,
+        # set the reranker_* fields to a service that exposes /rerank
+        # (DashScope gte-rerank or any OpenAI-style rerank endpoint).
+        rag:
+          enabled: true
+          top_k: 6
+          first_stage_top_n: 30
+          rrf_k: 60
+          max_chunk_chars: 1200
+          chunk_overlap_chars: 150
+          doc_char_budget: 6000
+          use_hybrid: true
+          embedding_model: text-embedding-v4
+          embedding_api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+          embedding_api_key: 
+          embedding_batch_size: 10
+          cache_dir: artifacts/cache/embeddings
+          query_expansion_enabled: true
+          query_expansion_paraphrases: 2
+          query_expansion_include_hyde: true
+          # Reranker left blank = no second-stage rerank. To enable, set:
+          #   reranker_model: gte-rerank
+          #   reranker_api_base: https://dashscope.aliyuncs.com/api/v1
+          #   reranker_api_key: sk-...
+          #   reranker_endpoint_path: /services/rerank/text-rerank/text-rerank
+        tablellm_max_table_rows: 80
+        tablellm_max_input_chars: 24000
+        tablellm_python_timeout: 60
         multi_agent:
           enabled: true
           planner_temperature: 0.0
-          specialist_max_steps: 10
-          specialist_temperature: 0.0
-          synthesizer_max_steps: 6
-          synthesizer_temperature: 0.0
-          max_specialist_workers: 3
           enable_iterative_refinement: true
         self_consistency:
           num_samples: 1
+          sample_temperature: 0.5
+          aggregator: column_vote
+          min_votes: 1
+
+      fallback_multi_agent:
+        kind: multi_agent
+        model: qwen3.5-35b-a3b
+        api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+        api_key: 
+        temperature: 0.0
+        max_tokens: 2048
+        request_timeout: 360
+        multi_agent:
+          enabled: true
+          planner_temperature: 0.0
+          specialist_max_steps: 8
+          specialist_temperature: 0.0
+          synthesizer_max_steps: 4
+          synthesizer_temperature: 0.0
+          max_specialist_workers: 2
+          enable_iterative_refinement: false
+        self_consistency:
+          num_samples: 3
 
 run:
   output_dir: artifacts/runs
   max_workers: 1
+  # Outer process guard matches agent.budget.max_seconds: time is the only
+  # per-task hard cap; raw LLM/tool call counts are unlimited.
   task_timeout_seconds: 600
 
 scoring:
   redundancy_lambda: 0.5
+  # Accept sensible rounded numeric answers, e.g. 2.73 vs 2.727272727...
   numeric_tolerance: 1.0e-2
   case_insensitive: true
   strip_whitespace: true
