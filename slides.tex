@@ -1,6 +1,7 @@
+% 编译命令: XeLaTeX (Overleaf 默认即可)
 \documentclass[11pt, aspectratio=169]{beamer}
 
-\usepackage[T1]{fontenc}
+\usepackage{ctex}              % 中文支持，XeLaTeX 编译
 \usepackage{hyperref}
 \usepackage{graphicx}
 \usepackage{booktabs}
@@ -8,12 +9,11 @@
 \usepackage{xcolor}
 \usepackage{multicol,multirow}
 \usepackage{array}
-\usepackage[english]{babel}
 \usepackage{listings}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit}
 
-%-------- theme --------
+%-------- 主题 --------
 \usetheme{Madrid}
 \usecolortheme{default}
 \useinnertheme{circles}
@@ -22,7 +22,7 @@
 \setbeamerfont{date}{size=\fontsize{9}{9}\selectfont}
 \usefonttheme[onlymath]{serif}
 
-%--------------- color --------------------
+%--------------- 颜色 --------------------
 \definecolor{ustgold}{RGB}{153, 102, 0}
 \definecolor{ustblue}{RGB}{0, 51, 102}
 \definecolor{ustgold_1}{RGB}{204, 153, 0}
@@ -42,7 +42,7 @@
 \setbeamercolor{block title example}{bg=ustgold_1,fg=white}
 \setbeamertemplate{itemize items}{\color{ustgold_1}$\bullet$}
 
-%-------- listings style --------
+%-------- 代码块 --------
 \lstset{
   basicstyle=\ttfamily\scriptsize,
   keywordstyle=\color{ustblue}\bfseries,
@@ -53,18 +53,18 @@
   columns=fullflexible,
 }
 
-%--------------- title ---------------
+%--------------- 标题 ---------------
 \title[FEWLLM Data Agent]{FEWLLM Data Agent}
-\subtitle{KDD Cup 2026 DataAgent-Bench --- Course Project}
+\subtitle{KDD Cup 2026 DataAgent-Bench --- 课程项目}
 
-\author[Team]{MA Ruixin, LIN Yipeng, XIAO Yao}
+\author[团队]{马瑞鑫\quad 林译鹏\quad 肖尧}
 
-\institute[HKUST(GZ)]{
-Society Hub\\[0.3em]
-The Hong Kong University of Science and Technology (Guangzhou)
+\institute[港科大（广州）]{
+信息枢纽\\[0.3em]
+香港科技大学（广州）
 }
 
-\date[2026]{Spring 2026}
+\date[2026]{2026 年春季}
 
 \titlegraphic{\vspace*{0.3cm}
     \includegraphics[width=3.3cm]{./ustlogos/UST-GZ-logo.pdf}
@@ -77,44 +77,44 @@ The Hong Kong University of Science and Technology (Guangzhou)
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{Outline}
+\frametitle{大纲}
 \begin{columns}[T]
 \column{0.5\textwidth}
 \begin{enumerate}
-    \item \textbf{Problem \& Architecture}\\{\small Task, scoring rule, four-layer design}
-    \item \textbf{Agent Loop \& Routing}\\{\small TaskCompiler, Controller, Tool actions}
-    \item \textbf{Risk Gating (Core Innovation)}\\{\small Cheap guard + lazy escalation + audit}
+    \item \textbf{问题与系统架构}\\{\small 任务定义、评分函数、四层设计}
+    \item \textbf{Agent 主循环与路由}\\{\small TaskCompiler、React Harness（协议/上下文/Self-verify）、Operator cascade 流水线}
+    \item \textbf{风险闸门（核心创新）}\\{\small Cheap guard、惰性升级、可审计 trace}
 \end{enumerate}
 \column{0.5\textwidth}
 \begin{enumerate}
     \setcounter{enumi}{3}
-    \item \textbf{Supporting Components}\\{\small RAG tools, multi-agent, self-consistency}
-    \item \textbf{Demo \& Conclusion}
+    \item \textbf{支撑组件}\\{\small RAG 工具、多 Agent 编排、self-consistency}
+    \item \textbf{演示与结论}
 \end{enumerate}
 \end{columns}
 \end{frame}
 %---------------------------------------------------------
 
-\section{Problem \& Architecture}
+\section{问题与系统架构}
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{Task \& Scoring Rule}
+\frametitle{任务形式与评分函数}
 
 \begin{columns}[T]
 \column{0.45\textwidth}
-\textbf{Input:} \texttt{task.json} + heterogeneous context\\
-{\small (CSV, SQLite, JSON, Markdown rules, record-text prose, images)}
+\textbf{输入：} \texttt{task.json} + 异构上下文目录\\
+{\small （CSV、SQLite、JSON、Markdown 规则文档、自然语言记录、图像）}
 
 \vspace{0.3em}
-\textbf{Output:} \texttt{prediction.csv} scored by\\
-\textbf{column-content signature matching}
+\textbf{输出：} \texttt{prediction.csv}，由\\
+\textbf{列内容签名匹配}评分
 
 \vspace{0.3em}
 \begin{itemize}
-    \item Column names \textbf{ignored}; row order \textbf{ignored}
-    \item Multi-column match via bipartite augmenting paths
-    \item Normalize: numeric $\to 10^{-2}$, string \texttt{strip+lower}
+    \item 列名忽略；行顺序忽略
+    \item 多列匹配走二部图最大匹配
+    \item 归一化：数值 $\to 10^{-2}$，字符串 \texttt{strip+lower}
 \end{itemize}
 
 \column{0.52\textwidth}
@@ -124,11 +124,11 @@ The Hong Kong University of Science and Technology (Guangzhou)
 \end{equation*}
 
 \vspace{0.3em}
-\begin{alertblock}{Design implications}
+\begin{alertblock}{设计含义}
 \begin{itemize}
-    \item \textbf{Fewer columns} --- every extra wrong col is penalized
-    \item \textbf{Preserve granularity} --- \texttt{first\_name}+\texttt{last\_name} beats merged \texttt{name}
-    \item \textbf{Match dtypes} --- \texttt{163109.0} $\neq$ \texttt{163109}
+    \item \textbf{列要少而准}：每多一列冗余都会扣分
+    \item \textbf{保留粒度}：\texttt{first\_name}+\texttt{last\_name} 优于合并的 \texttt{name}
+    \item \textbf{类型一致}：\texttt{163109.0} $\neq$ \texttt{163109}
 \end{itemize}
 \end{alertblock}
 \end{columns}
@@ -138,9 +138,104 @@ The Hong Kong University of Science and Technology (Guangzhou)
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{Why Agentic? --- Controller, Tools, Memory, Verifier}
+\frametitle{设计目标：失败模式与设计原则}
 
-\textbf{Raw ReAct is too unconstrained:} easy tasks waste tokens on repeated tool calls; hard tasks drift across intermediate observations; final tables need strict shape control and semantic verification.
+\footnotesize
+\begin{columns}[T]
+\column{0.5\textwidth}
+\textbf{六类可观察失败模式}
+\begin{itemize}
+    \setlength\itemsep{0.1em}
+    \item \textbf{答案缺乏数据支撑}：依文件预览或先验直接作答 $\to$ 形状对、内容错。
+    \item \textbf{字段语义绑定错误}：将概念词当列名/过滤值；目标实为字段值。
+    \item \textbf{工具协议不稳定}：自由文本 JSON 易被转义/括号问题打断。
+    \item \textbf{错误信息可利用性不足}：原始异常不足以指导自我纠正。
+    \item \textbf{程序静态错误}：codegen 引用不存在的文件、表、列。
+    \item \textbf{任务级边界控制}：验证、修复、路径切换可耗尽时间。
+\end{itemize}
+
+\column{0.5\textwidth}
+\textbf{四条设计原则}
+\begin{itemize}
+    \setlength\itemsep{0.1em}
+    \item \textbf{先扫描，再推理}：任何模型推理前先做无 LLM 的上下文画像。
+    \item \textbf{工具行为显式化}：所有数据访问与计算经统一工具完成，每步动作写入 \texttt{trace.json}。
+    \item \textbf{本地检查优先}：结构、静态、风险评估、可机械修复的错误尽量由确定性规则处理；必要时再升级到 LLM。
+    \item \textbf{路径失败可复盘}：路由选择、失败原因、兜底路径与最终答案均结构化写入 trace。
+\end{itemize}
+\end{columns}
+
+\vspace{0.4em}
+\begin{block}{核心权衡}
+\scriptsize
+模型负责"规划与生成"，确定性模块负责"约束与验证"。这条边界使主路径在不牺牲可解释性的前提下保持稳定。
+\end{block}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{端到端架构与上下文进入方式}
+
+\vspace{-0.3em}
+\scriptsize
+\begin{columns}[T]
+\column{0.46\textwidth}
+\textbf{流水线}
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.18cm,
+    box/.style={rectangle, draw=ustblue, fill=gray!8, rounded corners=2pt,
+                minimum width=4.6cm, minimum height=0.5cm, align=center, font=\scriptsize},
+    arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!70},
+]
+\node[box, fill=ustblue!12] (in) {\texttt{task.json + context/}};
+\node[box, fill=ustblue!18, below=of in] (tc) {TaskCompiler（无 LLM）};
+\node[box, fill=ustblue!18, below=of tc] (rt) {Router（task\_type 路由）};
+\node[box, fill=ustgold_1!22, below=of rt] (re) {\textbf{React Harness}（主路径）};
+\node[box, fill=ustred_1!12, below=of re] (cc) {Cascade：operator $\to$ multi\_agent};
+\node[box, fill=ustblue!12, below=of cc] (av) {Answer Validator + Column-match scorer};
+\draw[arrow] (in) -- (tc);
+\draw[arrow] (tc) -- (rt);
+\draw[arrow] (rt) -- (re);
+\draw[arrow] (re) -- (cc);
+\draw[arrow] (cc) -- (av);
+\end{tikzpicture}
+\end{center}
+
+\column{0.52\textwidth}
+\textbf{不同阶段以不同粒度进入模型}
+\vspace{0.2em}
+\tiny
+\begin{tabular}{@{}p{0.30\linewidth}p{0.66\linewidth}@{}}
+\toprule
+\textbf{阶段} & \textbf{送入模型的内容} \\
+\midrule
+React 预规划 & 文件路径 / 类型 / 大小（最多 25 项） \\
+React 主循环 & 仅初始问题；文件内容须经工具读取 \\
+Multi-agent planner & 文件清单 / schema / 行数（不含数据行） \\
+Operator codegen & 表格样本、JSON 摘要、文档相关章节、RAG top-K 片段 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.4em}
+\scriptsize
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 预规划阶段不读数据内容；codegen 阶段仅接收预算筛选后的切片。
+    \item 真正计算必须由 \texttt{execute\_python} / \texttt{execute\_context\_sql} 在原始上下文中完成。
+\end{itemize}
+\end{columns}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{为什么使用 Agent 框架：控制器、工具、记忆与验证}
+
+\textbf{裸 ReAct 不足以应对该任务：}简单题在重复工具调用中浪费 token；复杂题在中间观察间漂移；最终表格需要严格的形状控制与语义验证。
 
 \vspace{0.4em}
 \begin{center}
@@ -150,25 +245,25 @@ The Hong Kong University of Science and Technology (Guangzhou)
                 minimum width=2.65cm, minimum height=0.8cm, align=center, font=\small},
     arrow/.style={-{Stealth[length=5pt]}, thick, ustblue},
 ]
-\node[box, fill=ustblue!15] (observe) {Observe\\{\scriptsize files, schema, samples}};
-\node[box, fill=ustblue!15, right=of observe] (plan) {Plan\\{\scriptsize route + semantic plan}};
-\node[box, fill=ustgold_1!20, right=of plan] (act) {Act\\{\scriptsize SQL / Python / RAG tools}};
-\node[box, fill=ustred_1!15, right=of act] (verify) {Verify\\{\scriptsize guard + judge}};
-\node[box, fill=ustgold_1!16, below=0.55cm of act] (repair) {Repair / Replan\\{\scriptsize local patch + LLM retry}};
+\node[box, fill=ustblue!15] (observe) {观察\\{\scriptsize 文件、schema、样本}};
+\node[box, fill=ustblue!15, right=of observe] (plan) {规划\\{\scriptsize 路由 + 语义计划}};
+\node[box, fill=ustgold_1!20, right=of plan] (act) {行动\\{\scriptsize SQL / Python / RAG 工具}};
+\node[box, fill=ustred_1!15, right=of act] (verify) {验证\\{\scriptsize guard + judge}};
+\node[box, fill=ustgold_1!16, below=0.55cm of act] (repair) {修复 / 重规划\\{\scriptsize 本地补丁 + LLM 重写}};
 \draw[arrow] (observe) -- (plan);
 \draw[arrow] (plan) -- (act);
 \draw[arrow] (act) -- (verify);
 \draw[arrow] (verify.south) |- (repair.east);
 \draw[arrow] (repair.west) -| (plan.south);
-\node[below=0.15cm of observe, font=\scriptsize\itshape, text=gray] {Task memory};
-\node[below=0.15cm of plan, font=\scriptsize\itshape, text=gray] {Controller};
-\node[above=0.15cm of act, font=\scriptsize\itshape, text=gray] {Tool calls};
-\node[below=0.15cm of verify, font=\scriptsize\itshape, text=gray] {Stop / retry};
+\node[below=0.15cm of observe, font=\scriptsize\itshape, text=gray] {任务记忆};
+\node[below=0.15cm of plan, font=\scriptsize\itshape, text=gray] {控制器};
+\node[above=0.15cm of act, font=\scriptsize\itshape, text=gray] {工具调用};
+\node[below=0.15cm of verify, font=\scriptsize\itshape, text=gray] {提交 / 重试};
 \end{tikzpicture}
 \end{center}
 
-\begin{block}{Design principle}
-\emph{The agent keeps a task trace, chooses tools, observes tool outputs, and only stops when the verifier accepts the answer. Simple tasks still pay minimal LLM cost.}
+\begin{block}{设计原则}
+\emph{Agent 维护一份任务 trace，自主选择工具，观察工具输出，仅当验证模块接受答案时停止。简单任务依然只支付最小 LLM 成本。}
 \end{block}
 
 \end{frame}
@@ -176,111 +271,280 @@ The Hong Kong University of Science and Technology (Guangzhou)
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{LangChain / LangGraph Positioning}
+\frametitle{相对 LangChain / LangGraph 的定位}
 
 \begin{columns}[T]
 \column{0.48\textwidth}
-\textbf{LangChain vocabulary}
+\textbf{LangChain 词汇}
 \begin{itemize}
-    \item Agent = model + tools + iterative loop
-    \item Runtime graph = model node, tool node, stop / retry edges
-    \item Middleware controls context, tool access, guardrails
-    \item LangSmith-style tracing is useful for debugging
+    \item Agent = 模型 + 工具 + 迭代循环
+    \item 运行时图 = 模型节点、工具节点、提交/重试边
+    \item 中间件控制上下文、工具访问与护栏
+    \item LangSmith 风格 trace 用于调试
 \end{itemize}
 
 \column{0.48\textwidth}
-\textbf{Our implementation}
+\textbf{本系统对应实现}
 \begin{itemize}
-    \item \texttt{ModelAdapter} = provider abstraction
-    \item \texttt{ToolRegistry} = typed tool catalog
-    \item \texttt{ReActAgent} = model-tool loop
+    \item \texttt{ModelAdapter} = 提供方抽象
+    \item \texttt{ToolRegistry} = 强类型工具目录
+    \item \texttt{ReActAgent} = 模型—工具循环
     \item \texttt{Orchestrator} = planner-specialist-synthesizer DAG
-    \item \texttt{trace.json} = memory + audit trail
+    \item \texttt{trace.json} = 记忆 + 审计
 \end{itemize}
 \end{columns}
 
 \vspace{0.4em}
-\begin{block}{Position}
-We use a lightweight LangGraph-style runtime instead of depending on LangChain directly. The architecture is compatible with a LangChain adapter: wrap \texttt{ToolRegistry} as LangChain tools, keep the same router, verifier, and answer validator.
+\begin{block}{定位}
+本项目使用一个轻量的、LangGraph 风格的运行时，而非直接依赖 LangChain。该架构与 LangChain 适配器兼容：将 \texttt{ToolRegistry} 包装为 LangChain 工具，复用同一套路由器、验证器与答案校验器即可。
 \end{block}
 
 \end{frame}
 %---------------------------------------------------------
 
-\section{Agent Loop \& Routing}
+\section{Agent 主循环与路由}
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{Agent Controller --- Dispatch by Shape, Not Difficulty}
+\frametitle{Agent 控制器：按任务画像分派}
 
 \begin{columns}[T]
 \column{0.48\textwidth}
-\textbf{TaskCompiler (zero LLM):}
+\textbf{TaskCompiler（不调用 LLM）：}
 \begin{itemize}
-    \item Per-file scan $\to$ \texttt{SourceCapability}\\{\scriptsize headers, dtypes, cardinality, samples}
-    \item Task-level aggregation $\to$ \texttt{ExecutionProfile}
+    \item 逐文件扫描 $\to$ \texttt{SourceCapability}\\{\scriptsize 列名、类型、基数、样本}
+    \item 任务级聚合 $\to$ \texttt{ExecutionProfile}
     \begin{itemize}
         \scriptsize
         \item \texttt{context\_size}, \texttt{source\_shape}
         \item \texttt{verifiability}, \texttt{operation\_complexity}
         \item \texttt{semantic\_rule\_required}
     \end{itemize}
-    \item \alert{Single source of truth} --- reused by prompt, static checker, guard, judge
+    \item \alert{统一事实快照} —— 由 prompt、静态检查、guard、judge 共享
 \end{itemize}
 
 \column{0.48\textwidth}
-\textbf{Router rules (hard, deterministic):}
+\textbf{路由规则（确定性）：}
 \begin{itemize}
-    \item \texttt{weak} / \texttt{image} $\to$ multi\_agent
-    \item \texttt{long\_docs} $\to$ RAG-enabled operator
-    \item \texttt{semantic\_rule\_required} $\to$ tool\_first\_mixed
-    \item \texttt{small+programmatic+low} $\to$ easy
+    \item 全部 7 种 \texttt{task\_type} 统一映射至 \alert{\texttt{react\_harness}} 作为首发路径
+    \item 失败回退依据 \texttt{failure\_type} 选择：
+    \begin{itemize}
+        \scriptsize
+        \item \texttt{retrieval\_empty} $\to$ RAG-enabled operator
+        \item \texttt{semantic\_consistency\_failed} $\to$ \texttt{tool\_first\_mixed}
+        \item \texttt{syntax / static / exec\_error} $\to$ 同类 operator
+        \item \texttt{zero\_rows} $\to$ 不换路径，由 local repair 处理
+    \end{itemize}
+    \item 单题硬预算：仅 \texttt{max\_seconds=600}，LLM 与工具调用次数不设上限
 \end{itemize}
 
 \vspace{0.3em}
-\textbf{Cascade by \emph{failure type}, not difficulty:}\\
-{\scriptsize zero\_rows $\to$ \alert{no upgrade} (column wrong, not route)\\
-retrieval\_empty $\to$ RAG route\\
-semantic\_consistency\_failed $\to$ tool\_first\_mixed\\
-syntax/static/exec error $\to$ sibling operator}
+\textbf{Cascade 链：}\\
+{\scriptsize \texttt{react\_harness} $\to$ \texttt{tool\_first\_mixed} $\to$ \texttt{extreme} $\to$ \texttt{fallback\_multi\_agent}\\至多额外尝试 1 次}
 \end{columns}
 
 \vspace{0.3em}
-\begin{exampleblock}{Cross-model verify (optional)}
-Primary + verifiers run in parallel; keep columns whose signatures agree $\geq$ \texttt{min\_agreement} --- directly targets the $-\lambda \cdot$ extra penalty.
+\begin{exampleblock}{Cross-model verification（可选）}
+主路径与若干 verifier endpoint 并行求解，仅保留列签名一致数 $\geq$ \texttt{min\_agreement} 的列；直接抑制评分中的 $-\lambda \cdot$ extra 罚项。当前配置中关闭，以保留单题 10 分钟预算给主路径。
 \end{exampleblock}
 
 \end{frame}
 %---------------------------------------------------------
 
 %---------------------------------------------------------
+\begin{frame}[t]
+\frametitle{React Harness 主路径（一）：协议、上下文与知识引导}
+
+\vspace{-0.3em}
+\footnotesize
+\begin{columns}[T,onlytextwidth]
+
+\column{0.49\textwidth}
+
+\textbf{1. Native tool calling 与文本回退}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \texttt{ToolSpec} 同源维护 prompt 描述与 tools-API JSON Schema，避免协议描述漂移
+    \item 模型经 OpenAI function-call 协议调用工具
+    \item 服务端返回纯文本时退化为 JSON 解析，含\textbf{三层容错}：fence 剥离 / 控制字符转义 / 未闭合括号补齐
+    \item 模型一次返回多个 tool\_call 时只采纳第一个，且不记录被丢弃的，避免下一轮 orphan tool message 触发 API 拒绝
+\end{itemize}
+
+\vspace{0.3em}
+
+\textbf{2. 工具结果缓存（per-task）}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 缓存键 \texttt{= (action, sorted(action\_input))}，处理参数次序差异
+    \item 仅缓存 9 类只读工具；\texttt{execute\_python} 与 \texttt{answer} 不缓存
+    \item 缓存命中永不触发终止，避免重复触发 \texttt{answer} 终结
+\end{itemize}
+
+\vspace{0.3em}
+
+\textbf{3. 切片式 observation}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \texttt{read\_csv} 支持 \texttt{columns\_only}/\texttt{offset} 分页
+    \item \texttt{read\_doc/json} 按 \texttt{max\_chars} + \texttt{offset} 分页
+    \item \texttt{grep\_doc} 仅返回命中行 + 上下文
+\end{itemize}
+
+\column{0.49\textwidth}
+
+\textbf{4. 轻量 pre-loop planner（可选）}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 单次 LLM 调用；仅基于文件清单（最多 25 项）；不读取内容
+    \item Plan 注入为 user 消息前缀，每轮重构 messages 时持续可见
+    \item Planner prompt 强约束第二步必须读 \texttt{knowledge / rule / glossary} 文档
+    \item Plan 解析或调用失败时优雅降级；\texttt{skip\_for\_easy} 跳过简单题以省一次调用
+\end{itemize}
+
+\vspace{0.3em}
+
+\textbf{5. System Prompt 强约束（schema-link first，then code）}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \textbf{Knowledge file 不可议价}：\texttt{knowledge.md / rule / glossary} 为单一事实源；先验知识与之冲突时一律以文档为准；要求语义化应用规则而非照抄公式
+    \item \textbf{样本行使用约束}：\texttt{read\_csv} 等预览行仅可推断 dtype / 格式 / join key，禁止据此输出最终答案
+    \item \textbf{粒度保留约束}：与评分函数对齐，\texttt{first\_name} / \texttt{last\_name} 等不应合并
+    \item 数值容差 + 字符串归一化提醒；附 spreadsheet / document 两类 few-shot 示例
+\end{itemize}
+
+\end{columns}
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}[t]
+\frametitle{React Harness 主路径（二）：错误归类与 self-verify 闭环}
+
+\vspace{-0.3em}
+\footnotesize
+\begin{columns}[T,onlytextwidth]
+
+\column{0.49\textwidth}
+
+\textbf{6. 确定性 retry hints（无 LLM）}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 错误模式按工具分类：Python（10 类，覆盖 \texttt{KeyError}、\texttt{ParserError}、\texttt{python\_timeout} 等）、SQL（4 类）、Path（1 类）、Answer（3 类）
+    \item 错误签名归一化：去 \texttt{line N} / 路径 / 引号，使同类错误能"碰头"
+    \item \texttt{ErrorHistory} 跟踪重复次数：相同错误 $\geq 2$ 次时提示前置 \emph{"Stop retrying — switch tools or read the data first"}
+    \item 即使工具抛异常未返回 result，仍跑一次 hint 归类（覆盖 \texttt{answer} 行宽错误等）
+\end{itemize}
+
+\vspace{0.3em}
+
+\textbf{7. Native tool\_call orphan 修复}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 工具异常时仍把 action 名 + tool\_call\_id 记录入 step
+    \item 下一轮 messages 重建时不会出现 orphan tool message，避免 API 因 \texttt{tool\_call\_id} 不匹配而 400
+\end{itemize}
+
+\column{0.49\textwidth}
+
+\textbf{8. 强制 self-verification（draft → verify → final）}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \texttt{verification\_rounds = 1} + \texttt{use\_answer\_guard = true}
+    \item 第一次 \texttt{answer} 不立即终止，被改写为 \texttt{status = draft\_submitted} observation，附 \texttt{draft\_columns / draft\_row\_count / remaining\_rounds}
+    \item \alert{Cheap Answer Guard}（下一帧详述）输出风险代码 + top\_risk
+    \item \texttt{build\_verify\_instructions} 把每个风险代码翻译为具体行动指令；附 \emph{Most important: ...} 突出最高风险
+\end{itemize}
+
+\vspace{0.3em}
+
+\textbf{9. 预算与未确认的 draft 兜底}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item self-verify 阶段触发 \texttt{BudgetExceeded} 时，commit 最近 draft 并标记 \texttt{budget\_exceeded\_during\_self\_verify}
+    \item 循环结束模型未确认时，回退至最近 draft 并标记未完成 verify，避免有效结果被整体丢弃
+    \item 模型 API 抛异常时单独记录 \texttt{\_\_model\_error\_\_} step 并终止当前循环
+\end{itemize}
+
+\vspace{0.3em}
+
+\textbf{10. 可观测性}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 每步含 \texttt{stream\_label}（如 \texttt{react step N}、\texttt{react.planner}）
+    \item Guard 单独发 \texttt{react\_answer\_guard} 事件
+    \item \texttt{failure\_reason} 区分多种结局：超时 commit draft / 未完成 verify / 超步数未提交答案
+\end{itemize}
+
+\end{columns}
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
 \begin{frame}
-\frametitle{Data Agent Controller --- 8 Decision Points}
+\frametitle{React Cheap Answer Guard：7 类确定性风险}
+
+\vspace{-0.2em}
+\scriptsize
+\textbf{位置：}React 主路径首次提交 \texttt{answer} 前；\textbf{零 LLM 成本}；与 Operator 路径共享 \texttt{SemanticRiskAssessment} 数据结构。
+
+\vspace{0.3em}
+\begin{center}
+\begin{tabular}{p{0.32\linewidth}p{0.42\linewidth}cc}
+\toprule
+\textbf{风险代码} & \textbf{触发条件} & \textbf{Severity} & \textbf{Weight} \\
+\midrule
+\texttt{execution\_failed\_or\_missing\_answer} & answer 调用未产出 AnswerTable & error & 1.0 \\
+\texttt{empty\_answer\_rows} & 候选答案有列但行数为 0 & error & 0.75 \\
+\texttt{invalid\_answer} & \texttt{validate\_answer\_table} 检查失败 & error & 1.0 \\
+\texttt{answer\_without\_computation} & 提交前未成功调用 \texttt{execute\_python} 或 \texttt{execute\_context\_sql} & error & 0.85 \\
+\texttt{knowledge\_doc\_not\_read} & 上下文存在 \texttt{knowledge / rule / glossary} 文档但 \texttt{read\_doc} 从未读取 & error & 0.8 \\
+\texttt{shape\_mismatch\_scalar\_question} & 问题语气暗示标量但答案行数 $> 1$ & warning & 0.35 \\
+\texttt{shape\_mismatch\_list\_question} & 问题语气暗示列表但答案为 $1\times 1$ 标量 & warning & 0.35 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.4em}
+\begin{block}{升级行为（与 \texttt{verification\_rounds} 协同）}
+\scriptsize
+\textbf{当前配置 \texttt{verification\_rounds=1}}：所有任务均走两轮 \texttt{answer}，guard 不再决定是否升级，而是把发现的风险代码塞进 verify observation，使模型在重答时\textbf{有针对性地}复核——而非无差别 self-correction。
+\end{block}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}
+\frametitle{Cascade 兜底：Operator Executor 流水线（8 决策点）}
+
+\vspace{-0.2em}
+\scriptsize
+\textbf{位置：}主路径失败、cascade 进入 \texttt{tool\_first\_mixed} 或 \texttt{extreme} 之后；\textbf{并非}主路径流程。
 
 \begin{center}
-\scriptsize
 \begin{tikzpicture}[
-    node distance=0.08cm,
+    node distance=0.06cm,
     stage/.style={rectangle, draw=ustblue, fill=gray!8, rounded corners=2pt,
-                  minimum width=12cm, minimum height=0.5cm, align=center, font=\scriptsize},
+                  minimum width=12cm, minimum height=0.46cm, align=center, font=\scriptsize},
     arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!70},
 ]
-\node[stage, fill=ustblue!20] (s0) {\textbf{0. record\_text query classifier} : LLM labels question \texttt{aggregate} vs \texttt{read};};
-\node[stage, fill=ustblue!12, below=of s0] (s1) {1. ExecutionContext --- schema diagnostics computed once};
-\node[stage, fill=ustblue!12, below=of s1] (s2) {2. Semantic Analyst (plan) --- \textit{fast\_path\_skip for low-complexity tasks}};
-\node[stage, fill=ustgold_1!15, below=of s2] (s3) {3. Act --- choose executable Python / pandas / SQL tool plan};
-\node[stage, fill=ustgold_1!15, below=of s3] (s4) {4. Observe error --- Static Check $\to$ Local Repair $\to$ Schema-retry};
-\node[stage, fill=ustgold_1!15, below=of s4] (s5) {5. Tool fallback --- record\_text $\to$ synthesized CSV (skipped when verdict=\texttt{read})};
-\node[stage, fill=ustred_1!12, below=of s5] (s6) {6. Cheap Semantic Guard --- non-LLM risk gate (lazy escalation)};
-\node[stage, fill=ustred_1!12, below=of s6] (s7) {7. Judge + Semantic Repair --- preflight $\to$ LLM judge $\to$ bounded repair};
+\node[stage, fill=ustblue!20] (s0) {\textbf{0. record\_text 问题分类器}：将问题判定为 \texttt{aggregate} 或 \texttt{read}};
+\node[stage, fill=ustblue!12, below=of s0] (s1) {1. ExecutionContext —— 一次性构建 schema 诊断};
+\node[stage, fill=ustblue!12, below=of s1] (s2) {2. 语义审题官（plan）—— \textit{低风险任务可跳过}};
+\node[stage, fill=ustgold_1!15, below=of s2] (s3) {3. 行动 —— 选择可执行的 Python / pandas / SQL 工具计划};
+\node[stage, fill=ustgold_1!15, below=of s3] (s4) {4. 错误观察 —— 静态检查 $\to$ 本地修复 $\to$ schema-retry};
+\node[stage, fill=ustgold_1!15, below=of s4] (s5) {5. record\_text 兜底 —— 抽取得到合成 CSV（verdict=\texttt{read} 时跳过）};
+\node[stage, fill=ustred_1!12, below=of s5] (s6) {6. Cheap Semantic Guard —— 非 LLM 风险闸门（惰性升级）};
+\node[stage, fill=ustred_1!12, below=of s6] (s7) {7. Judge + 语义修复 —— 前置检查 $\to$ LLM judge $\to$ 有界重写};
 \foreach \i/\j in {s0/s1, s1/s2, s2/s3, s3/s4, s4/s5, s5/s6, s6/s7}
     \draw[arrow] (\i) -- (\j);
 \end{tikzpicture}
 \end{center}
 
 \vspace{0.2em}
-\begin{block}{Shared evidence --- \texttt{debug\_steps}}
-Every generated program emits \texttt{schema\_inspection}, \texttt{used\_columns}, \texttt{filter\_conditions}, \texttt{join\_keys}, \texttt{intermediate\_counts}. Read by \alert{3 consumers}: cheap guard, preflight, LLM judge --- single audit trail, no drift.
+\begin{block}{共享证据 —— \texttt{debug\_steps}}
+\scriptsize
+每段生成的程序都会输出 \texttt{schema\_inspection}、\texttt{used\_columns}、\texttt{filter\_conditions}、\texttt{join\_keys}、\texttt{intermediate\_counts}。被 \alert{3 个消费方} 读取：cheap guard、preflight、LLM judge —— 同一份审计 trace，避免下游模块认知漂移。
 \end{block}
 
 \end{frame}
@@ -288,68 +552,118 @@ Every generated program emits \texttt{schema\_inspection}, \texttt{used\_columns
 
 %---------------------------------------------------------
 \begin{frame}[t]
-\frametitle{Schema Grounding + Static Checker + Local Repair}
+\frametitle{运行配置、预算控制与 Reasoner Repair}
+
+\vspace{-0.3em}
+\footnotesize
+\begin{columns}[T]
+
+\column{0.5\textwidth}
+\textbf{运行配置摘要}
+\vspace{0.2em}
+\scriptsize
+\begin{tabular}{@{}p{0.36\linewidth}p{0.6\linewidth}@{}}
+\toprule
+\textbf{维度} & \textbf{配置} \\
+\midrule
+Agent 模式 & \texttt{router} \\
+主模型 & \texttt{qwen3.5-35b-a3b}（DashScope OpenAI-compatible 端点） \\
+单题硬预算 & \texttt{max\_seconds = 600}；LLM / 工具调用次数不设上限 \\
+默认 route & \texttt{react\_harness}，max\_steps=40，\texttt{verification\_rounds=1}，\texttt{use\_answer\_guard=true} \\
+Cascade & \texttt{react\_harness} $\to$ \texttt{tool\_first\_mixed} $\to$ \texttt{extreme} $\to$ \texttt{fallback\_multi\_agent}，至多额外 1 次 \\
+RAG（cascade）& \texttt{use\_hybrid=true} + DashScope \texttt{text-embedding-v4} dense + 查询扩展（HyDE），无 reranker \\
+Cross-model verify & 关闭 \\
+\bottomrule
+\end{tabular}
+
+\column{0.46\textwidth}
+\textbf{BudgetController：6 维度}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \texttt{max\_llm\_calls}（$-1$ 不限）
+    \item \texttt{max\_tool\_calls}（$-1$ 不限）
+    \item \texttt{max\_seconds = 600}（唯一硬上限）
+    \item \texttt{max\_local\_repairs}（确定性 fixer 上限）
+    \item \texttt{max\_reasoner\_repairs}
+    \item \texttt{max\_multiagent\_fallbacks}
+\end{itemize}
+
+\vspace{0.4em}
+\textbf{Reasoner Repair（启用，仅 cascade）}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 触发条件：当前 route 为 program 类、payload 失败且含已生成程序、\texttt{needs\_reasoner=true} 或 large\_document\_context、预算未耗尽
+    \item React 主路径不属于 program 类，因此 reasoner repair 仅在 cascade 进入 \texttt{tool\_first\_mixed} / \texttt{extreme} 之后才会触发
+    \item 失败程序 + stderr/stdout + capabilities 摘要 $\to$ reasoner 模型重写程序 $\to$ 立即在任务上下文中执行
+\end{itemize}
+\end{columns}
+
+\end{frame}
+%---------------------------------------------------------
+
+%---------------------------------------------------------
+\begin{frame}[t]
+\frametitle{Schema Grounding + 静态检查 + 本地修复}
 \scriptsize
 
 \begin{columns}[T]
 \column{0.32\textwidth}
 \textbf{Schema Grounding}\\
-{\textit{Tabular-source prompt hint}}
+{\textit{表格类源 prompt 提示}}
 \begin{itemize}
-    \item Real-column TOP-K hints
-    \item \textbf{Per source-kind:}
-        \item \textbf{CSV / SQLite} --- full scoring
-        \item \textbf{JSON} --- sample + record fields
-        \item \textbf{text / image} --- skip
+    \item 真实列 TOP-K 候选
+    \item \textbf{按源类型：}
+        \item \textbf{CSV / SQLite} —— 完整打分
+        \item \textbf{JSON} —— 样本 + 字段
+        \item \textbf{文本 / 图像} —— 跳过
 \end{itemize}
 
 \column{0.32\textwidth}
-\textbf{Static Checker}\\
-{\textit{Pre-execution gate}}
+\textbf{静态检查}\\
+{\textit{执行前闸门}}
 \begin{itemize}
-    \item Python AST + SQL scan
-    \item \texttt{no\_such\_column}, \texttt{bad\_join\_key}, \texttt{\_x/\_y} suffixes
-    \item Runs \emph{before} execution
-    \item Blocks predictable failures
+    \item Python AST + SQL 扫描
+    \item \texttt{no\_such\_column}、\texttt{bad\_join\_key}、\texttt{\_x/\_y} 后缀
+    \item 在执行之前运行
+    \item 拦截可预见的失败
 \end{itemize}
 
 \column{0.32\textwidth}
-\textbf{Local Repair (0 LLM)}\\
-{\textit{Deterministic patcher}}
+\textbf{Local Repair（无 LLM）}\\
+{\textit{确定性补丁器}}
 \begin{itemize}
-    \item 10+ deterministic patches
-    \item Fuzzy column-name fix
-    \item Cast merge keys to string
-    \item Append missing \texttt{answer}
-    \item Zero-row filter normalize
+    \item 9 类确定性 fixer
+    \item 列名近似替换
+    \item merge key 字符串归一
+    \item 缺失 \texttt{answer} 自动补齐
+    \item 零行常见过滤修正
 \end{itemize}
 \end{columns}
 
 \vspace{0.25em}
-\begin{alertblock}{Runtime safety net}
-Grounding is only a prompt hint. The real defense is runtime evidence:
-\textbf{schema\_inspection} $\to$ \textbf{static checker} $\to$
-\textbf{cheap guard} $\to$ \textbf{LLM judge}. All read the same
-\texttt{SourceCapability} + \texttt{trace.json}, so the audit trail does not drift.
+\begin{alertblock}{运行期安全网}
+Schema grounding 仅作为 prompt 提示。真正的防御来自运行期证据：
+\textbf{schema\_inspection} $\to$ \textbf{静态检查} $\to$
+\textbf{cheap guard} $\to$ \textbf{LLM judge}。它们读取同一份
+\texttt{SourceCapability} 与 \texttt{trace.json}，审计链路不漂移。
 \end{alertblock}
 
 \end{frame}
 
 %---------------------------------------------------------
 
-\section{Risk Gating (Core Innovation)}
+\section{风险闸门（核心创新）}
 
-%---------------------------------------------------------
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{Cheap Semantic Guard --- Non-LLM Risk Gate}
+\frametitle{Cheap Semantic Guard：非 LLM 风险闸门}
 
-\textbf{Position:} codegen succeeded, answer structurally valid, $\to$ trust this answer?
+\textbf{位置：}codegen 已经成功，answer 也通过结构校验 $\to$ 是否可以信任该答案？
 
 \vspace{-0.2em}
 \begin{equation*}
 \text{risk\_score} = \min\!\big(1.0,\textstyle\sum \text{unique\_weights}\big), \quad
-\text{escalate} = \text{any error} \,\lor\, \text{score} \geq 0.5
+\text{escalate} = \text{任一 error 级风险} \,\lor\, \text{score} \geq 0.5
 \end{equation*}
 
 \vspace{-0.3em}
@@ -357,22 +671,22 @@ Grounding is only a prompt hint. The real defense is runtime evidence:
 \scriptsize
 \begin{tabular}{llcl}
 \toprule
-\textbf{Category} & \textbf{Risk Code} & \textbf{Wt} & \textbf{Meaning} \\
+\textbf{类别} & \textbf{风险代码} & \textbf{权重} & \textbf{含义} \\
 \midrule
-Execution & \texttt{execution\_failed / empty\_answer\_rows} & 1.0 / 0.75 & No/zero answer rows \\
-Repair & \texttt{suspicious\_fallback:schema\_retry} & 0.8 & Needed schema retry \\
-Trace & \texttt{trace\_missing:schema\_inspection} & 0.8 & No real-column check \\
-Trace & \texttt{zero\_intermediate\_count} & 0.8 & Intermediate count drops to 0 \\
-\textbf{Coverage} & \texttt{\textbf{field\_coverage\_mismatch}} & \textbf{0.75} & \textbf{Grounding candidate unused} \\
-Formula & \texttt{formula\_without\_trigger} & 0.75 & Unasked formula used \\
+执行 & \texttt{execution\_failed / empty\_answer\_rows} & 1.0 / 0.75 & 答案缺失或零行 \\
+修复 & \texttt{suspicious\_fallback:schema\_retry} & 0.8 & 依赖 schema retry \\
+Trace & \texttt{trace\_missing:schema\_inspection} & 0.8 & 缺真实列检查 \\
+Trace & \texttt{zero\_intermediate\_count} & 0.8 & 中间行数降为 0 \\
+\textbf{覆盖} & \texttt{\textbf{field\_coverage\_mismatch}} & \textbf{0.75} & \textbf{Grounding 候选未被使用} \\
+公式 & \texttt{formula\_without\_trigger} & 0.75 & 使用了问题未要求的派生公式 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \vspace{-0.2em}
-\begin{alertblock}{Killer example}
+\begin{alertblock}{典型识别场景}
 \scriptsize
-Q: \emph{``patients with severe degree of thrombosis''}. Code uses \texttt{disease=="thrombosis"} but grounding found \texttt{degree\_of\_thrombosis} $\to$ \texttt{field\_coverage\_mismatch} (0.75) $\to$ \alert{escalate to judge} instead of shipping wrong answer.
+问题询问"具有特定属性的实体"，但程序使用与属性名仅形似的字段做过滤；schema grounding 已给出更合适的候选字段，却未被代码使用 $\to$ \texttt{field\_coverage\_mismatch}（0.75）$\to$ \alert{升级到 judge}，避免直接提交错误答案。
 \end{alertblock}
 
 \end{frame}
@@ -381,7 +695,7 @@ Q: \emph{``patients with severe degree of thrombosis''}. Code uses \texttt{disea
 %---------------------------------------------------------
 
 \begin{frame}[t]
-\frametitle{Lazy Escalation + Analyst-Exception Recovery}
+\frametitle{惰性升级 + Analyst 异常恢复}
 
 \vspace{-0.65em}
 \footnotesize
@@ -390,65 +704,65 @@ Q: \emph{``patients with severe degree of thrombosis''}. Code uses \texttt{disea
 
 \column{0.48\textwidth}
 
-\textbf{1. Post-codegen gate}
+\textbf{1. codegen 后的闸门}
 
 \vspace{0.1em}
-After codegen succeeds and the answer is structurally valid, the \textbf{Cheap Guard} scores 10+ deterministic rules (non-LLM). If \texttt{score < 0.5} \alert{$\to$ fast return}, zero extra LLM cost. Otherwise escalate.
+codegen 成功且答案结构合法后，\textbf{Cheap Guard} 用 13 类确定性风险打分（无 LLM）。若 \texttt{score < 0.5} 则 \alert{快速通过}，零额外 LLM 成本；否则升级。
 
 \vspace{0.35em}
 
-\textbf{2. Escalation flow (LLM path)}
+\textbf{2. 升级后的 LLM 流程}
 
 \vspace{0.1em}
 \begin{itemize}
     \setlength\itemsep{0.05em}
-    \item \textbf{Analyst} (1 LLM call) --- emits semantic plan
-    \item \textbf{Judge} --- compares plan vs code
+    \item \textbf{审题官（Analyst）}（1 次 LLM 调用）—— 输出语义计划
+    \item \textbf{执行官（Judge）} —— 比较计划与代码
     \begin{itemize}
         \scriptsize
         \setlength\itemsep{0.03em}
-        \item \texttt{pass} $\to$ done
-        \item \texttt{fail} / \texttt{low\_confidence} $\to$ \textbf{Semantic Repair} rewrites code
+        \item \texttt{pass} $\to$ 完成
+        \item \texttt{fail / low\_confidence} $\to$ \textbf{语义修复} 重写代码
     \end{itemize}
-    \item Judge--Repair loops at most \textbf{3 rounds}
+    \item Judge--Repair 循环最多 \textbf{3 轮}
 \end{itemize}
 
 \vspace{0.25em}
 
-\textbf{3. Analyst-exception recovery}
-\texttt{stage=analyst\_exception} → retry once with \texttt{force=True}; still fails → low-confidence synthetic plan → \alert{judge must run}.
+\textbf{3. Analyst 异常恢复}\\
+\texttt{stage=analyst\_exception} $\to$ 以 \texttt{force=True} 重试一次；仍失败则构造低置信度的 synthetic plan $\to$ \alert{judge 必须运行}。
 
 \column{0.49\textwidth}
 
-\textbf{4. Observability --- \texttt{final\_gate}}
+\textbf{4. 可观测性 —— \texttt{final\_gate}}
 
 \vspace{0.05em}
-Top-level field in \texttt{trace.json}:
+\texttt{trace.json} 顶层字段：
 \begin{itemize}
     \scriptsize
     \setlength\itemsep{0.05em}
-    \item \texttt{plan+judge} --- strong path
-    \item \texttt{escalated+judge} --- recovered (retry / fallback / lazy escalation)
-    \item \texttt{cheap\_guard\_only} --- guard fired but judge did not run (investigate)
-    \item \texttt{bypassed} --- no semantic check
+    \item \texttt{plan+judge} —— 主路径
+    \item \texttt{escalated+judge} —— 经过重试 / fallback / 惰性升级后恢复
+    \item \texttt{cheap\_guard\_only} —— guard 触发但 judge 未运行（需调查）
+    \item \texttt{bypassed} —— 未进入语义验证
 \end{itemize}
 
 \vspace{0.3em}
 
-\textbf{5. Cost}
+\textbf{5. 成本}
 
 \vspace{0.05em}
 \begin{itemize}
     \setlength\itemsep{0.05em}
-    \item Simple task: \textbf{1 LLM call} (codegen only)
-    \item Rule-based task: 3--5 calls (analyst + codegen + judge $\pm$ repair)
-    \item Analyst exception: +1 retry +1 judge (worst case)
+    \item 简单任务：\textbf{1 次 LLM 调用}（仅 codegen）
+    \item 含规则的任务：3--5 次（analyst + codegen + judge $\pm$ repair）
+    \item Analyst 异常：最坏额外 +1 重试 +1 judge
 \end{itemize}
 \vspace{0.1em}
-\alert{\textbf{Core guarantee}}
+\alert{\textbf{核心保证}}
 
 \scriptsize
-No suspicious answer ships unchecked: if guard escalates, judge \emph{will} run --- even if analyst fails.
+任何可疑答案都不会被直接提交：一旦 guard 决定升级，judge 必然会运行 —— 即便 analyst 失败。
 
 \end{columns}
 \end{frame}
@@ -457,79 +771,85 @@ No suspicious answer ships unchecked: if guard escalates, judge \emph{will} run 
 
 %---------------------------------------------------------
 
-\section{Supporting Components}
+\section{支撑组件}
 
 %---------------------------------------------------------
-\begin{frame}
-\frametitle{Retrieval Tools \& Multi-Agent Orchestrator}
+\begin{frame}[t]
+\frametitle{工具沙箱、知识工具与长文档检索}
 
+\vspace{-0.3em}
+\footnotesize
 \begin{columns}[T]
-\column{0.55\textwidth}
-\textbf{RAG (long\_docs route):}
+
+\column{0.34\textwidth}
+\textbf{1. 受控执行环境}
 \begin{itemize}
-    \item Heading-aware chunking (1200 chars, overlap 150)
-    \item \textbf{Query expansion}: paraphrases + HyDE
-    \item \textbf{Hybrid retrieval}: BM25 $\parallel$ Embedding
-    \item \textbf{RRF fusion} (rank-only, no score calibration)
-    \item Optional cross-encoder reranker
+    \setlength\itemsep{0.05em}
+    \item \texttt{execute\_python} 在独立 \texttt{multiprocessing.Process} 中运行；cwd 固定为任务 \texttt{context/}
+    \item stdout / stderr 经 Queue 回传；超过 \textbf{30 秒} \texttt{terminate()/kill()}
+    \item \texttt{execute\_context\_sql} 仅允许只读语句
+    \item 文件读取均切片：\texttt{read\_csv} 支持 \texttt{columns\_only}/\texttt{offset}；\texttt{read\_doc/json} 按 \texttt{max\_chars} 分页；\texttt{grep\_doc} 返回命中上下文
 \end{itemize}
 
-\column{0.42\textwidth}
-\textbf{Multi-agent (extreme route):}
-\begin{center}
-\begin{tikzpicture}[
-    node distance=0.4cm and 0.3cm,
-    box/.style={rectangle, draw=ustblue, fill=gray!8, rounded corners=2pt,
-                minimum width=1.8cm, minimum height=0.5cm, align=center, font=\scriptsize},
-    arrow/.style={-{Stealth[length=4pt]}, thick, ustblue!70},
-]
-\node[box, fill=ustblue!15] (planner) {Planner (DAG)};
-\node[box, below left=0.4cm and -0.1cm of planner] (s1) {schema};
-\node[box, below=0.4cm of planner] (s2) {python};
-\node[box, below right=0.4cm and -0.1cm of planner] (s3) {document};
-\node[box, fill=ustgold_1!20, below=0.4cm of s2] (synth) {Synthesizer};
-\draw[arrow] (planner) -- (s1);
-\draw[arrow] (planner) -- (s2);
-\draw[arrow] (planner) -- (s3);
-\draw[arrow] (s1) -- (synth);
-\draw[arrow] (s2) -- (synth);
-\draw[arrow] (s3) -- (synth);
-\end{tikzpicture}
-\end{center}
-\scriptsize
+\column{0.32\textwidth}
+\textbf{2. \texttt{consult\_knowledge}（可选）}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 仅当 \texttt{helper\_model.enabled} 且当前 route 为 React 时注册
+    \item 自动扫描 \texttt{knowledge / rule / glossary / definition / schema\_notes} 命名的文档
+    \item 由更聚焦的 helper 模型解释规则；约束其只能基于给定文档；找不到答案必须返回 \texttt{not\_specified}
+    \item 把"读规则"与"算数据"解耦：主路径仍由工具完成数据计算
+\end{itemize}
+
+\column{0.32\textwidth}
+\textbf{3. RAG（cascade 才激活）}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item 标题感知切片（1200 字符，重叠 150）
+    \item BM25 稀疏；可加 dense embedding，按 \textbf{RRF} 融合
+    \item 查询扩展：改写 + HyDE 假设回答
+    \item 可选 cross-encoder reranker（先取 \texttt{first\_stage\_top\_n}=30，再 rerank 至 top-K=6）
+    \item 渐进增强：组件缺失时退化为 BM25
+\end{itemize}
 \end{columns}
+
+\vspace{0.3em}
+\begin{block}{React 主路径上的文档处理}
+\scriptsize
+React Harness 不进入 RAG 流水线；文档检索由模型通过 \texttt{read\_doc} / \texttt{grep\_doc} / \texttt{head\_doc} 自行完成。RAG 仅当 cascade 进入 \texttt{tool\_first\_mixed} 或 \texttt{extreme} 后激活。
+\end{block}
 
 \end{frame}
 %---------------------------------------------------------
 \begin{frame}[t]
-\frametitle{Multi-Agent Mode --- Roles \& Permissions}
+\frametitle{多 Agent 模式：角色分工与权限隔离}
 
 \vspace{-0.7em}
 \scriptsize
 
 \begin{columns}[T,onlytextwidth]
 
-% ================= LEFT COLUMN =================
+% ================= 左列 =================
 \column{0.49\textwidth}
 
 \textbf{1. Planner}
 \begin{itemize}
     \setlength\itemsep{0.05em}
-    \item \textbf{Job:} decompose the question into a DAG of sub-tasks
-    \item \textbf{Output:} JSON plan with dependencies
-    \item \textbf{Tools:} none; pure reasoning only
-    \item \textbf{Constraint:} cannot call \texttt{answer} or \texttt{report}
+    \item \textbf{职责：}将问题分解为子任务 DAG
+    \item \textbf{输出：}带依赖关系的 JSON plan
+    \item \textbf{工具：}无；纯推理
+    \item \textbf{约束：}不能调用 \texttt{answer} 或 \texttt{report}
 \end{itemize}
 
 \vspace{0.25em}
 
-\textbf{2. Specialists} (5 kinds, parallel execution)
+\textbf{2. Specialist}（5 类，并行执行）
 
 \vspace{0.1em}
 \tiny
 \begin{tabular}{@{}p{0.19\linewidth}p{0.75\linewidth}@{}}
 \toprule
-\textbf{Kind} & \textbf{Allowed tools} \\
+\textbf{类型} & \textbf{允许工具} \\
 \midrule
 Schema &
 \texttt{list\_context, read\_csv, read\_json, read\_doc, inspect\_sqlite\_schema} \\
@@ -544,7 +864,7 @@ Document &
 \texttt{list\_context, read\_doc, read\_json, read\_csv} \\
 
 Generic &
-all tools; full ReAct \\
+全部工具；完整 ReAct \\
 \bottomrule
 \end{tabular}
 
@@ -552,22 +872,22 @@ all tools; full ReAct \\
 \scriptsize
 \begin{itemize}
     \setlength\itemsep{0.05em}
-    \item Terminal tool = \texttt{report}, not \texttt{answer}
-    \item \texttt{read\_doc} capped at 2 calls per specialist
-    \item Max 12 ReAct steps per specialist
+    \item 终止动作 = \texttt{report}，而非 \texttt{answer}
+    \item 同一 specialist 内 \texttt{read\_doc} 至多调用 2 次
+    \item 单 specialist 最多 12 个 ReAct 步
 \end{itemize}
 
-% ================= RIGHT COLUMN =================
+% ================= 右列 =================
 \column{0.49\textwidth}
 
 \textbf{3. Synthesizer}
 \begin{itemize}
     \setlength\itemsep{0.05em}
-    \item \textbf{Job:} merge specialist findings into one final answer
-    \item \textbf{Input:} all \texttt{report} payloads
-    \item Only role allowed to call \texttt{answer}
-    \item Max 6 ReAct steps
-    \item Synthesis failure $\to$ one replan allowed
+    \item \textbf{职责：}合并 specialist 的 finding 为最终答案
+    \item \textbf{输入：}全部 \texttt{report} 内容
+    \item 唯一可调用 \texttt{answer} 的角色
+    \item 最多 6 个 ReAct 步
+    \item 合成失败可触发一次 replan
 \end{itemize}
 
 \vspace{0.25em}
@@ -575,20 +895,20 @@ all tools; full ReAct \\
 \textbf{4. Orchestrator}
 \begin{itemize}
     \setlength\itemsep{0.05em}
-    \item Dispatches sub-tasks via ThreadPool
-    \item Same-layer specialists run \textbf{in parallel}
-    \item Enforces DAG dependencies
-    \item Layer $N$ waits for layer $N-1$
-    \item Iterative refinement: 1 replan max
-    \item Budget cap: \texttt{max\_multiagent\_fallbacks = 1}
+    \item 通过 ThreadPool 派发子任务
+    \item 同层 specialist 可\textbf{并行}
+    \item 强制执行 DAG 依赖关系
+    \item 第 $N$ 层等待第 $N-1$ 层完成
+    \item 迭代 refinement：至多 1 次重新规划
+    \item 预算上限：\texttt{max\_multiagent\_fallbacks = 1}
 \end{itemize}
 
 \vspace{0.25em}
 
-\begin{block}{Key design: permission isolation}
+\begin{block}{关键设计：权限隔离}
 \tiny
-Specialists cannot submit the final answer. They only \texttt{report} findings. 
-The Synthesizer must cross-check all reports before committing the final \texttt{answer}.
+Specialist 不可直接提交答案，只能 \texttt{report} 中间证据。
+Synthesizer 必须交叉核对所有 report，方可最终调用 \texttt{answer}。
 \end{block}
 
 \end{columns}
@@ -596,36 +916,36 @@ The Synthesizer must cross-check all reports before committing the final \texttt
 %---------------------------------------------------------
 %---------------------------------------------------------
 \begin{frame}[fragile]
-\frametitle{Self-Consistency, Budget \& Demo}
+\frametitle{Self-consistency、预算控制与演示}
 
 \begin{columns}[T]
 \column{0.48\textwidth}
-\textbf{Self-consistency --- column-signature voting:}
+\textbf{Self-consistency：列签名投票}
 \begin{itemize}
-    \item N passes at T=0.7 with different seeds
-    \item \texttt{target\_count} = mode of column counts
-    \item Top-\texttt{target\_count} signatures by frequency = winning set
-    \item Pick sample with max coverage, min extras
-    \item \alert{Directly targets} $\text{recall} - \lambda \cdot \text{extra/pred}$
+    \item N 次采样（T=0.7，不同 seed）
+    \item \texttt{target\_count} = 列数的众数
+    \item 取频次前 \texttt{target\_count} 的签名 = 获胜列集合
+    \item 选择最大覆盖、最少冗余的样本
+    \item \alert{直接对齐}评分函数 $\text{recall} - \lambda \cdot \text{extra/pred}$
 \end{itemize}
 
 \vspace{0.5em}
-\textbf{Budget controller (per task):}
+\textbf{预算控制器（任务级）：}
 \begin{itemize}
     \scriptsize
-    \item LLM / tool / time caps
-    \item Local \& reasoner repair caps
-    \item Multi-agent fallback cap
-    \item Limits $=\min$(YAML, TaskCompiler level)
+    \item LLM 调用 / 工具调用 / 时间上限
+    \item 本地修复与 reasoner 修复上限
+    \item 多 Agent 兜底次数上限
+    \item 上限 $=\min$(YAML、TaskCompiler 推荐)
 \end{itemize}
 
 \column{0.48\textwidth}
-\textbf{Streamlit demo:}
+\textbf{Streamlit 演示：}
 \begin{itemize}
-    \item Real-time subprocess log (ProgressLogger)
-    \item \textbf{Reasoning timeline}: schema $\to$ route $\to$ codegen $\to$ guard $\to$ judge
-    \item Final answer table + generated Python
-    \item Full \texttt{trace.json} (collapsible)
+    \item 子进程实时日志（ProgressLogger）
+    \item \textbf{推理时间线}：schema $\to$ 路由 $\to$ codegen $\to$ guard $\to$ judge
+    \item 最终答案表 + 生成的 Python 代码
+    \item 完整 \texttt{trace.json}（可折叠）
 \end{itemize}
 
 \vspace{0.3em}
@@ -635,7 +955,7 @@ uv run streamlit run \
 \end{lstlisting}
 
 \vspace{0.2em}
-Auditable, explainable, reproducible.
+可审计、可解释、可复现。
 \end{columns}
 
 \end{frame}
@@ -643,39 +963,103 @@ Auditable, explainable, reproducible.
 
 %---------------------------------------------------------
 
-\section{Conclusion}
+\section{结论}
+
+%---------------------------------------------------------
+\begin{frame}[t]
+\frametitle{Public split 评测结果与失分分析}
+
+\vspace{-0.3em}
+\footnotesize
+\begin{columns}[T]
+
+\column{0.42\textwidth}
+\textbf{评测概况}
+
+\vspace{0.2em}
+\scriptsize
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{指标} & \textbf{数值} \\
+\midrule
+Records & 49 \\
+Success & 47 / 49 \\
+Failed & 2 \\
+Total score & 35.600 / 49 \\
+Mean score & 0.727 \\
+Mean recall & 0.745 \\
+Score $= 1.0$ & 34 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+\footnotesize
+\textbf{两条失败任务}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \texttt{task\_344}：单题运行超过 600 秒
+    \item \texttt{task\_396}：语义修复后仍未通过静态检查
+\end{itemize}
+
+\column{0.55\textwidth}
+\textbf{部分得分典型}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \texttt{task\_38} = 0.60；\texttt{task\_249} = 0.25；\texttt{task\_379} = 0.75
+    \item 共性：召回了部分正确列，但同时输出了冗余列或遗漏标准答案列
+\end{itemize}
+
+\vspace{0.4em}
+\textbf{四类已知失分原因}
+\begin{itemize}
+    \setlength\itemsep{0.05em}
+    \item \textbf{列投影不够保守}：评分函数对额外列设惩罚；中间调试列未被剔除。
+    \item \textbf{字段语义绑定}：自然语言概念被映射到近似但错误的字段。
+    \item \textbf{语义修复后的静态错误}：重写引入新的列名或语法问题。
+    \item \textbf{单题超时}：复杂路径耗尽 600 秒上限。
+\end{itemize}
+
+\vspace{0.4em}
+\begin{block}{执行轨迹观察}
+\scriptsize
+绝大多数任务由 \texttt{react\_harness} 直接完成；进入 cascade 的任务比例较低，与系统设计定位一致——主路径承担稳定性与协议约束，cascade 路径处理程序化与语义风险较高的失败样例。
+\end{block}
+
+\end{columns}
+\end{frame}
+%---------------------------------------------------------
 
 %---------------------------------------------------------
 \begin{frame}
-\frametitle{Summary \& Future Work}
+\frametitle{总结与未来工作}
 
 \begin{columns}[T]
 \column{0.48\textwidth}
-\textbf{What we built:}
+\textbf{已实现的内容：}
 \begin{itemize}
-    \item Agentic controller with explicit tool actions
-    \item Deterministic task profiling (zero LLM)
-    \item Shape-based routing + failure-type cascade
-    \item 10+ local repair rules (zero LLM)
-    \item \alert{Cheap Semantic Guard} --- non-LLM risk gate
-    \item Analyst-exception recovery + audit trail
-    \item Production-grade RAG (BM25+Emb+RRF)
-    \item Multi-agent DAG with bounded replan
-    \item Column-signature self-consistency
+    \item 显式工具行动的 Agent 控制器
+    \item 确定性任务画像（无 LLM）
+    \item 按 task\_type 路由 + 按 failure\_type cascade
+    \item 9 类本地修复规则（无 LLM）
+    \item \alert{Cheap Semantic Guard} —— 非 LLM 风险闸门
+    \item Analyst 异常恢复 + 完整审计 trace
+    \item 工程化 RAG 流水线（BM25+Embedding+RRF）
+    \item 多 Agent DAG + 受限重规划
+    \item 列签名 self-consistency
 \end{itemize}
 
 \column{0.48\textwidth}
-\textbf{Observed performance (public):}\\
-Easy: $\sim$70 \quad Medium/Hard: $\sim$60
+\textbf{Public split 评测结果：}\\
+49 题平均 0.727，34/49 满分；总分 35.6/49
 
 \vspace{0.4em}
-\textbf{Future work:}
+\textbf{未来工作：}
 \begin{itemize}
-    \item Vision executor for image tasks
-    \item Guard-weight auto-calibration from trace FP/FN
-    \item Per-value majority voting within columns
-    \item Smarter record-text extraction for long prose
-    \item Submit to hidden test after tuning
+    \item 视觉任务专用执行器
+    \item 基于 trace FP/FN 自动校准 guard 权重
+    \item 列内单值多数投票
+    \item 长 record-text 上更稳定的抽取策略
+    \item 调优后提交 hidden test
 \end{itemize}
 \end{columns}
 
@@ -687,11 +1071,11 @@ Easy: $\sim$70 \quad Medium/Hard: $\sim$60
 \frametitle{}
 \vfill
 \begin{center}
-{\Huge\color{ustblue} Thank You}
+{\Huge\color{ustblue} 谢谢}
 
 \vspace{1em}
 
-{\large Questions?}
+{\large 欢迎提问}
 
 \vspace{1.5em}
 
@@ -699,7 +1083,7 @@ Easy: $\sim$70 \quad Medium/Hard: $\sim$60
 
 \vspace{0.8em}
 
-{\small\color{gray} Code: \texttt{github.com/zuelmaruixin/kdd}}
+{\small\color{gray} 代码仓库：\texttt{github.com/zuelmaruixin/kdd}}
 \end{center}
 \vfill
 \end{frame}

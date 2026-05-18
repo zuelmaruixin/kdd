@@ -1,33 +1,33 @@
-\frametitle{Self-Consistency, Budget \& Demo}
+\frametitle{Self-consistency、预算控制与演示}
 
 \begin{columns}[T]
 \column{0.48\textwidth}
-\textbf{Self-consistency --- column-signature voting:}
+\textbf{Self-consistency：列签名投票}
 \begin{itemize}
-    \item N passes at T=0.7 with different seeds
-    \item \texttt{target\_count} = mode of column counts
-    \item Top-\texttt{target\_count} signatures by frequency = winning set
-    \item Pick sample with max coverage, min extras
-    \item \alert{Directly targets} $\text{recall} - \lambda \cdot \text{extra/pred}$
+    \item N 次采样（T=0.7，不同 seed）
+    \item \texttt{target\_count} = 列数的众数
+    \item 取频次前 \texttt{target\_count} 的签名 = 获胜列集合
+    \item 选择最大覆盖、最少冗余的样本
+    \item \alert{直接对齐}评分函数 $\text{recall} - \lambda \cdot \text{extra/pred}$
 \end{itemize}
 
 \vspace{0.5em}
-\textbf{Budget controller (per task):}
+\textbf{预算控制器（任务级）：}
 \begin{itemize}
     \scriptsize
-    \item LLM / tool / time caps
-    \item Local \& reasoner repair caps
-    \item Multi-agent fallback cap
-    \item Limits $=\min$(YAML, TaskCompiler level)
+    \item LLM 调用 / 工具调用 / 时间上限
+    \item 本地修复与 reasoner 修复上限
+    \item 多 Agent 兜底次数上限
+    \item 上限 $=\min$(YAML、TaskCompiler 推荐)
 \end{itemize}
 
 \column{0.48\textwidth}
-\textbf{Streamlit demo:}
+\textbf{Streamlit 演示：}
 \begin{itemize}
-    \item Real-time subprocess log (ProgressLogger)
-    \item \textbf{Reasoning timeline}: schema $\to$ route $\to$ codegen $\to$ guard $\to$ judge
-    \item Final answer table + generated Python
-    \item Full \texttt{trace.json} (collapsible)
+    \item 子进程实时日志（ProgressLogger）
+    \item \textbf{推理时间线}：schema $\to$ 路由 $\to$ codegen $\to$ guard $\to$ judge
+    \item 最终答案表 + 生成的 Python 代码
+    \item 完整 \texttt{trace.json}（可折叠）
 \end{itemize}
 
 \vspace{0.3em}
@@ -37,6 +37,6 @@ uv run streamlit run \
 \end{lstlisting}
 
 \vspace{0.2em}
-Auditable, explainable, reproducible.
+可审计、可解释、可复现。
 \end{columns}
 

@@ -1,6 +1,5 @@
-\babel@toc {english}{}\relax 
-\beamer@sectionintoc {1}{Problem \& Architecture}{3}{0}{1}
-\beamer@sectionintoc {2}{Agent Loop \& Routing}{6}{0}{2}
-\beamer@sectionintoc {3}{Risk Gating (Core Innovation)}{9}{0}{3}
-\beamer@sectionintoc {4}{Supporting Components}{11}{0}{4}
-\beamer@sectionintoc {5}{Conclusion}{14}{0}{5}
+\beamer@sectionintoc {1}{问题与系统架构}{3}{0}{1}
+\beamer@sectionintoc {2}{Agent 主循环与路由}{8}{0}{2}
+\beamer@sectionintoc {3}{风险闸门（核心创新）}{15}{0}{3}
+\beamer@sectionintoc {4}{支撑组件}{17}{0}{4}
+\beamer@sectionintoc {5}{结论}{20}{0}{5}

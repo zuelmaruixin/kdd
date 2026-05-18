@@ -1,821 +1,687 @@
 # DataAgent-Bench 技术报告
 
-## 摘要
-
-本报告说明本项目针对 KDD Cup 2026 DataAgent-Bench public split 构建的
-data-agent 系统。DataAgent-Bench 的任务形式为：给定一个自然语言问题与
-若干上下文文件，系统需要输出一张结构化表格。上下文文件可能包含 CSV、
-SQLite、JSON、Markdown/TXT 规则文档以及结构化程度较弱的自然语言记录。
-与一般开放域问答不同，该任务的答案必须能够由给定数据推导，模型仅凭先验
-直接回答通常无法获得稳定分数。
-
-本系统采用“模型负责规划与生成操作，确定性模块负责约束与验证”的设计思
-路。系统首先对任务上下文进行确定性扫描，得到文件类型、字段、样本值、任
-务类型和预算建议；随后由路由器选择执行路径。默认配置以
-`react_harness` 作为主路径，在主路径无法产生合法答案时，再根据错误类型
-进入 agentic/operator 或 multi-agent 兜底路径。最终答案在写出前经过结构
-校验，并按照列内容签名匹配的评分方式进行本地评估。
-
-public split 的本次记录为：49 条记录均展示并纳入评分，47 条生成有效预测，
-2 条失败；总分为 35.600 / 49，平均分为 0.727，其中 34 个任务得分为 1.0。
-这些结果表明，当前系统能够处理多数公开任务，但在部分列投影、语义修复和
-超时场景上仍存在明确改进空间。
-
 ---
 
-## 1. 任务与评分简述
+## 总体架构
 
-每个任务由 `task.json` 和 `context/` 目录组成。`task.json` 给出问题与难
-度标签，`context/` 提供可使用的数据文件。系统最终只需提交一张二维表格
-`prediction.csv`。
-
-评分按列内容签名匹配：列名和行顺序不参与匹配，单元格值经过数值容差、大
-小写和空白归一化后形成无序多重集签名。若预测列与标准答案列签名相同，则
-该列视为命中。公式为：
-
-```text
-recall  = matched_cols / gold_cols
-penalty = lambda * extra_pred_cols / pred_cols
-score   = max(0, recall - penalty)
-```
-
-其中 `extra_pred_cols` 是未匹配到标准答案的多余列。由此可见，本任务并不
-鼓励“多给一些字段”。系统必须同时做到召回正确列和控制冗余列。
-
----
-
-## 2. 系统设计目标
-
-本项目围绕公开任务中观察到的失败模式进行系统设计。主要失败模式包括：
-
-1. **模型未充分读取数据即作答**。部分任务的自然语言问题看似简单，但实际
-   答案依赖完整表格或规则文档。仅根据文件预览或模型先验作答会造成列内容
-   错误。
-2. **字段语义映射错误**。任务常涉及自然语言概念与真实字段之间的映射。
-   例如问题中的概念可能对应某个字段值，而非字段名本身；若模型把概念词直
-   接当作列名或过滤值，会产生“形状正确但内容错误”的答案。
-3. **工具协议不稳定**。若工具调用依赖模型输出自由文本 JSON，复杂
-   observation、转义字符或括号不匹配都可能导致解析失败。
-4. **错误缺乏可恢复信息**。Python、SQL 或答案格式错误如果只返回原始异常，
-   模型容易重复同一错误，而不是切换到更合适的检视方式。
-5. **程序生成路径存在静态错误**。在 codegen 路径中，模型可能引用不存在
-   的文件、表名或列名；这些问题如果等到运行时才暴露，会消耗更多时间和模
-   型调用。
-6. **预算与超时控制不足**。复杂任务可能在验证、修复或多路径尝试中耗尽时
-   间，需要明确的任务级边界与失败记录。
-
-为应对这些问题，本系统采用以下设计原则：
-
-- **先扫描，再推理**：在任何模型求解前，先用确定性程序扫描上下文文件，
-  形成统一的任务画像。
-- **工具行为显式化**：模型需要通过工具读取数据、执行 SQL 或运行 Python，
-  中间动作被记录到 `trace.json` 中。
-- **本地检查优先**：结构检查、静态检查、风险判断和部分修复尽量由确定性
-  规则完成，只有在必要时才升级为额外模型调用。
-- **路径失败可复盘**：路由选择、失败原因、兜底路径和最终答案均写入结构
-  化 trace，便于定位错误阶段。
-
----
-
-## 3. 总体架构
-
-系统的整体流程如下：
-
-```text
-task.json + context/
-        |
-        v
-TaskCompiler
-  - 扫描文件类型、字段、样本值、行数、规则文档
-  - 推断 task_type、answer_type、operations、ambiguity_flags
-        |
-        v
-Router
-  - 依据任务类型与执行画像选择 route
-  - 主路径为 react_harness
-  - 失败时根据 failure_type 选择兜底路径
-        |
-        v
-React Harness
-  - native tool calling
-  - planner
-  - retry hints
-  - answer guard
-        |
-        +-------------------------------+
-        |                               |
-        v                               v
-Agentic / Operator fallback        Multi-agent fallback
-  - codegen                         - planner
-  - static checker                  - specialists
-  - local repair                    - synthesizer
-  - semantic judge
-        |
-        v
-Answer Validator
-        |
-        v
-prediction.csv + trace.json
-        |
-        v
-Column-match scorer
-```
-
-系统入口位于 `src/data_agent_baseline/cli.py`，批量运行逻辑位于
-`src/data_agent_baseline/run/runner.py`。每个任务会生成一个独立输出目录，
-其中包括 `prediction.csv` 和 `trace.json`。`prediction.csv` 用于评分；
-`trace.json` 用于记录任务画像、路由决策、工具步骤、预算消耗、答案校验
-结果和兜底路径。
+![ChatGPT Image 2026年5月18日 10_18_19](/Users/maruixin/Downloads/ChatGPT Image 2026年5月18日 10_18_19.png)
 
 ### 3.1 上下文进入模型的方式
 
-本系统没有把 `context/` 下的文件整体拼接进 prompt。不同阶段接收的是不同
-粒度的上下文表示：
+系统不会将 `context/` 下的文件整体拼接至 prompt。不同阶段以不同粒度的
+上下文表示进入模型：
 
-| 阶段 | 代码位置 | 送入模型的内容 | 目的 |
-| --- | --- | --- | --- |
-| React 预规划 | `react_planner.py:_context_summary()` | 由 `list_context_tree()` 得到的文件路径、文件类型和大小，最多保留前 25 个文件条目 | 让模型先形成工具调用顺序，而不是提前读取数据内容 |
-| React 主循环 | `prompt.py:build_task_prompt()` 与工具 observation | 初始只包含问题、难度和规则；文件内容必须通过工具逐步读取 | 避免模型在未检视数据时直接作答，并保留可复盘的工具轨迹 |
-| Multi-agent planner | `planner.py:_build_context_overview()` | `render_compact_schema()` 生成的文件清单、schema 和行数，不包含数据行 | 给 planner 足够的结构信息用于拆分任务 |
-| Operator/codegen | `tablellm_direct.py:render_context_for_codegen()` | `context_render.py` 生成的表格样本、JSON 摘要、文档相关章节或 RAG top-K 片段 | 让 codegen 能写出类型和字段匹配的程序，同时控制输入长度 |
+| 阶段                | 代码位置                                           | 送入模型的内容                                               | 目的                                                         |
+| ------------------- | -------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| React 预规划        | `react_planner.py:_context_summary()`              | 由 `list_context_tree()` 得到的文件路径、文件类型与大小（最多前 25 项） | 在不读取文件内容的前提下确定工具调用顺序                     |
+| React 主循环        | `prompt.py:build_task_prompt()` 与工具 observation | 初始仅包含问题与系统约束；文件内容必须通过工具逐步读取       | 防止模型在未检视数据时直接作答，并保留可复盘的工具轨迹       |
+| Multi-agent planner | `planner.py:_build_context_overview()`             | `render_compact_schema()` 生成的文件清单、schema 与行数（不含数据行） | 为 planner 提供拆分子任务所需的结构信息                      |
+| Operator/codegen    | `tablellm_direct.py:render_context_for_codegen()`  | `context_render.py` 生成的表格样本、JSON 摘要、文档相关章节或 RAG top-K 片段 | 让 codegen 能够生成与真实 schema 匹配的程序，同时控制输入长度 |
 
-因此，报告中所说的“预规划”和“上下文渲染”不是把全量文件交给模型。预规划
-阶段只做轻量文件发现；程序生成阶段也只接收按预算筛选后的切片。真正需要
-完整数据时，系统要求模型通过 `execute_python` 或 `execute_context_sql`
-在任务目录中读取原始文件并完成计算。这个设计使 prompt 规模可控，同时让
-最终答案仍基于完整数据执行，而不是基于预览样本推断。
+预规划阶段不读取数据内容；codegen 阶段仅接收按预算筛选后的切片；真正的
+计算必须由模型通过 `execute_python` 或 `execute_context_sql` 在任务上下
+文中完成。这种分层使得 prompt 规模可控，最终答案仍基于完整数据执行。
 
 ---
 
 ## 4. 任务画像与路由机制
 
-### 4.1 确定性任务画像
+### 4.1 任务画像（TaskCompiler）
 
-`src/data_agent_baseline/agents/task_compiler.py` 实现了无 LLM 的任务编译
-层。该层不负责解题，而是生成下游模块共享的事实快照。主要输出字段包括：
+`agents/task_compiler.py` 实现了无 LLM 的任务编译层，输出一个共享的事实
+快照 `CompiledTask`，主要字段如下：
 
-| 字段 | 含义 |
-| --- | --- |
-| `task_type` | 任务类型，如 `table_computation`、`document_qa`、`mixed_context`、`record_text_with_semantic_rule` |
-| `answer_type` | 答案形态，如 scalar、boolean 或 table |
-| `source_capabilities` | 每个上下文文件的 schema、行数、样本值、SQLite 表结构等 |
-| `operations` | 根据问题推断出的候选操作，如 filter、join、aggregate、retrieve、compute |
-| `foreign_key_candidates` | 基于样本值重叠推断出的候选 join 关系 |
-| `ambiguity_flags` | 风险标记，如 large context、record text、semantic rule、unsupported file |
-| `execution_profile` | 对上下文规模、数据形态、可验证性和推荐策略的概括 |
+| 字段                     | 含义                                                         |
+| ------------------------ | ------------------------------------------------------------ |
+| `task_type`              | 任务类型，取值集合为 `table_computation` / `table_with_semantic_rule` / `record_text_with_semantic_rule` / `document_qa` / `mixed_context` / `image_understanding` / `pure_reasoning` |
+| `answer_type`            | 答案形态：`scalar` / `boolean` / `table`                     |
+| `source_capabilities`    | 每个上下文文件的 schema、行数、样本值、低基数字段、SQLite 表结构等。CSV、JSON、SQLite、record_text 各有不同扫描深度 |
+| `operations`             | 候选操作集合，如 `retrieve` / `extract` / `filter` / `join` / `groupby` / `aggregate` / `sort` / `topk` / `compare` / `compute` |
+| `foreign_key_candidates` | 基于样本值 Jaccard 重叠推断的候选 join 关系                  |
+| `ambiguity_flags`        | 风险标记，如 `large_context` / `record_text_context` / `record_extraction_required` / `semantic_rule_context` / `large_document_context` / `large_table_context` / `needs_vision` / `unsupported_file_type` 等 |
+| `execution_profile`      | 由 `context_size` / `source_shape` / `verifiability` / `operation_complexity` / `recommended_strategy` / `semantic_rule_required` 等组成的执行画像 |
 
-该层的关键作用是统一“系统对数据的认知”。例如，prompt、静态检查器和程序
-修复器都应基于同一份 `source_capabilities` 工作。如果模型 prompt 中看到
-的字段和静态检查器使用的字段不一致，就会出现难以归因的系统漂移。因此，
-任务画像被设计为所有下游模块共享的参照系。
+任务画像统一了 prompt、静态检查器与修复器之间对数据的认知，避免不同模块
+基于不同字段集工作而引入隐性漂移。
 
-### 4.2 路由原则
+对于含 record_text 文件的任务，`record_text_classifier.py` 还会进行一次
+轻量分类调用，将问题判定为 `aggregate`（适合先抽取为 CSV 再计算）或
+`read`（阅读理解，应保留原始叙述）。该裁决决定后续是否启用 structured-
+doc synthesis 路径。
 
-`src/data_agent_baseline/agents/router.py` 不直接让模型选择执行路径。路由
-优先依据 `task_type_routing` 和 `execution_profile`，而不是单纯依据
-`difficulty`。难度标签主要用于预算提示；当任务标签缺失时，router 会使用
-文件数量、模态数量、上下文大小、问题长度、聚合词和多跳词等特征估计任务
-难度，并把估计特征写入 trace。
+### 4.2 失败回退（cascade）
 
-默认示例配置 `configs/agentic_router.example.yaml` 中，所有 task type 首
-选 `react_harness`。这是因为主路径具备较稳定的工具调用、答案校验和错误
-恢复机制。agentic/operator 路径被保留为兜底和消融实验路径，而不是在默认
-配置中替代主路径。
+`router.py` 通过 `_failure_type()` 将失败原因归类，并由
+`_next_repair_route()` 选择后继路径。当前配置中的 cascade 顺序为：
 
-### 4.3 按错误类型兜底
+```yaml
+cascade_on_failure: true
+cascade_order: [react_harness, tool_first_mixed, extreme, fallback_multi_agent]
+cascade_max_extra_attempts: 1
+```
 
-系统没有采用简单的 “easy -> medium -> hard -> extreme” 线性升档，而是按
-失败类型选择后继路径。原因是不同错误需要不同处理方式：列名错误需要更强
-的 schema 约束，文档检索失败需要更充分的检索路径，预算耗尽则可能需要更
-综合的 fallback。
+单题至多额外尝试一次回退；后继路径全部为 agentic_operator + RAG 或
+multi_agent。`_failure_type` 与对应后继策略如下：
 
-当前 router 会识别若干 `failure_type`，包括：
+| `failure_type`                                               | 触发条件                                            | 后继策略                                                     |
+| ------------------------------------------------------------ | --------------------------------------------------- | ------------------------------------------------------------ |
+| `unsupported_file_type`                                      | 任务画像携带 `unsupported_file_type` flag           | 优先 `fallback_multi_agent`，否则任意 `multi_agent` / `react` route |
+| `budget_exhausted`                                           | 失败原因含 `budget_exhausted`                       | 同上                                                         |
+| `retrieval_empty` / `doc_context_miss`                       | RAG 无命中或文档定位失败                            | 优先启用 RAG 的 operator / tablellm / react route            |
+| `semantic_consistency_failed`                                | judge 判定失败或 filter 语义错误                    | 优先 `tool_first_mixed`，否则任意 operator 类 route          |
+| `missing_answer` / `syntax_error` / `static_error` / `exec_error` | 程序未生成 answer、语法错误、静态检查失败、执行异常 | 优先 operator 类 route；对小规模、可程序化任务避免越级到 `extreme` |
+| `zero_rows`                                                  | 答案有列但行数为 0                                  | 不再换路（local repair 已处理）                              |
 
-- `budget_exhausted`；
-- `unsupported_file_type`；
-- `retrieval_empty` 或 `doc_context_miss`；
-- `semantic_consistency_failed`；
-- `missing_answer`、`syntax_error`、`static_error`、`exec_error`；
-- `zero_rows`。
+每次回退的尝试与结果均写入 `router_decision.cascade_attempts`，便于事后
+定位问题阶段。
 
-每次尝试及其结果都会进入 `router_decision.cascade_attempts`。这样在复盘
-失败任务时，可以清楚看到初始路径、失败原因、是否触发兜底，以及最终采用
-的路径。
+### 4.4 Cross-model verification
+
+`router.py` 提供 cross-model verification 的完整实现：当
+`agent.cross_model_verify.enabled=true` 时，路由器在主路径产出答案后，
+并行使用一组 verifier endpoint（沿用同一 route 配置但替换模型）独立求解，
+然后对**列签名**取交集——主答案的每一列签名必须被至少 `min_agreement-1`
+个 verifier 也产出，方可保留；若交集为空，则回退到主答案并在 trace 中
+记录 `empty_intersection_keep_primary`。该机制针对"主模型多输出冗余列"
+这一评分风险，但在当前配置中保持关闭，以避免在固定的单题预算内叠加额外
+模型调用。
+
+### 4.5 Reasoner Repair
+
+`_try_reasoner_repair` 在以下条件全部满足时触发：
+
+1. `agent.reasoner_repair.enabled=true`；
+2. 当前 payload 处于失败态（`succeeded=False` 或答案列表为空）；
+3. 当前 route 为 program 类（`agentic_operator` / `operator_executor` /
+   `tablellm_direct`），且失败 payload 中包含一段已生成的程序；
+4. `compiled_task.needs_reasoner=True`，或任务为 `document_qa` 且画像携
+   带 `large_document_context` flag；
+5. `BudgetController.can_reasoner_repair()` 仍有额度。
+
+由于 React Harness 不属于 program 类 route，Reasoner Repair 仅在 cascade
+进入 `tool_first_mixed` 或 `extreme` 之后才会启动。其执行流程为：基于失
+败程序、stderr/stdout 与 capabilities 摘要让独立的 reasoner 模型重写程
+序，立即在任务上下文中执行；若执行成功且产出有效表格，则替换原 payload，
+否则保留原始失败 payload 并将修复信息附加为 `payload["reasoner_repair"]`。
 
 ---
 
 ## 5. 主路径：React Harness
 
-主路径由 `src/data_agent_baseline/agents/react.py` 实现。它沿用 ReAct 的
-“模型思考、选择工具、观察结果、继续行动”基本模式，但围绕工具协议、错误
-提示和答案提交做了约束。
+它基于 ReAct 的"思考—行动—观察"循环，
+在工具协议、上下文管理、知识引导、错误归类、self-verification 与状态可
+观测六个维度上加入了系统性约束。下文按这六个维度分别说明。
 
-### 5.1 Native tool calling
+### 5.1 工具协议层
 
-工具描述由 `src/data_agent_baseline/tools/registry.py` 中的 `ToolSpec`
-统一维护。每个工具同时有两种视图：
+工具描述由 `tools/registry.py` 中的 `ToolSpec` **同源**维护，对外提供两
+种视图：面向 prompt 的人类可读说明（`describe_for_prompt`）与面向
+OpenAI-compatible tools API 的 JSON Schema（`describe_for_tool_api`）。
+同源避免了"prompt 声称的参数"与"API 校验的参数"漂移。
 
-- 面向 prompt 的人类可读说明；
-- 面向 OpenAI-compatible tools API 的 JSON Schema。
+模型经原生 function-call 协议调用工具；
+当服务端返回纯文本而非 tool calls 时，系统保留文本 JSON 解析回退，并附
+带三层确定性容错（按顺序尝试）：
 
-这样可以减少 prompt 声称的工具参数与实际 API schema 不一致的问题。对支
-持 tools API 的模型，服务端可在返回前对工具参数结构做基础校验。若某些
-服务端偶尔返回普通文本而非 tool calls，系统仍保留文本 JSON 解析路径作
-为回退。
+1. `_strip_json_fence`：去除 ```json``` 与裸 ``` 围栏；
+2. `_escape_control_chars_inside_json_strings`：把字符串内裸出的换行、
+   回车、制表符转义为 `\n`、`\r`、`\t`；
+3. `_append_missing_json_closers`：扫描栈式括号，追加被截断的 `}` / `]`。
 
-### 5.2 预规划
+此外，当模型在原生模式一次性返回多个 `tool_call` 时，系统**只采纳第一
+个**，且不将其余 tool_call 写入 step；这一选择是必要的，否则下一轮重建
+messages 时未被回应的 `tool_call_id` 会让 OpenAI-compatible 服务端以
+`400` 拒绝整次请求。
 
-`react_planner.py` 在部分任务开始前生成简短的子任务计划，包括建议读取的
-文件、可能需要的工具和大致计算顺序。该计划仅作为提示，而不是硬性执行约
-束。这样做的原因是，任务执行过程中可能发现真实字段名、数据类型或文件结
-构与问题表述不同；若计划过度刚性，反而会阻止模型根据新证据调整路径。
+### 5.2 上下文管理：工具结果缓存与切片 observation
 
-需要强调的是，React 预规划并不读取文件内容。`make_plan()` 传给模型的是
-问题、难度，以及 `_context_summary()` 生成的截断文件清单：每个条目只有
-相对路径和文件大小。它的作用是决定“先列文件、再读规则文档、再查表格/数
-据库、最后提交答案”这类操作顺序，而不是从文件内容中直接抽取答案。
+为避免模型在同一任务内重复读取同一文件，React 主循环对只读工具维护一
+个 per-task 内存缓存。缓存键由 `(action, sorted_keys(action_input))`
+决定，使语义相同但参数顺序不同的两次调用仍能命中。
+可缓存工具集合：
 
-multi-agent 的 planner 与 React 预规划也不同。它使用
-`render_compact_schema()` 构造 context overview，包含文件清单、schema 和
-行数，但不包含数据行。也就是说，预规划阶段使用的是结构摘要，不是全量数
-据；后续 specialist 或工具调用仍需要继续读取具体切片或执行计算。
+```
+list_context, read_csv, read_json, read_doc, head_doc,
+grep_doc, inspect_sqlite_schema, execute_context_sql, consult_knowledge
+```
 
-### 5.3 Retry hints
+`execute_python` 不缓存以保留副作用语义；`answer` 作为终止动作亦不缓
+存。**缓存命中路径不会走入终止逻辑**（react.py:327-328）：即使先前调用
+是 terminal-eligible 的工具，缓存命中也只生成一个普通 observation，避
+免误触发 `state.answer = result.answer` 的提交分支。
 
-当工具调用失败时，`react_retry_hints.py` 会把错误转换为结构化提示。例
-如：
+工具层本身亦采用切片式 observation：`read_csv` 支持 `columns_only=true`
+仅返回表头与行数、`offset` 分页；`read_doc` / `read_json` 按 `max_chars`
 
-- `KeyError` 会提示先确认真实列名；
-- SQL `no such table` 会提示检查 SQLite schema；
-- 文件路径错误会提示重新枚举 context 下的真实路径；
-- `answer` 行宽不一致会提示统一行宽。
++ `offset` 分页（单次最多 6 KB）；`head_doc` 仅返回前若干行；`grep_doc`
+  返回命中行及其上下文。该约束保证了 observation 长度可控，与 system
+  prompt 中"样本行禁止据答"的策略协同。
 
-同类错误重复出现时，提示会从“修复当前错误”转向“更换策略”。这相当于把
-一部分错误反思能力外化为确定性规则，而不是完全依赖模型自我反省。
+### 5.3 预规划（pre-loop planner）
 
-### 5.4 React Cheap Guard
+`react_planner.py` 在循环开始前进行一次轻量 LLM 调用，输出一段子任务
+sketch（建议读取的文件、可能用到的工具、大致计算顺序）。其设计要点：
 
-`react_answer_guard.py` 是主路径中的第一个 Cheap Guard。它只在模型第一次
-调用 `answer` 时运行，不调用额外 LLM，而是根据已经发生的工具轨迹和候选
-答案做确定性风险评估。其输出复用 `semantic_guard.py` 中的
-`SemanticRisk` / `SemanticRiskAssessment` 数据结构，因此 React 路径与
-Operator 路径的风险记录在 trace 中具有一致形态。
+- **输入受限**：planner 仅看到 `_context_summary()` 生成的截断文件清单
+  （路径与字节数，最多 25 项），不读取文件内容；
+- **prompt 强约束**：planner 系统提示明确规定，若上下文中存在
+  `knowledge.md / *rule* / *glossary*`，第二步必须读取该文档（其内容
+  覆盖先验知识）；最后一步必须为 `answer`；
+- **plan 持续可见**：plan 被注入为一条 user 消息前缀，主循环每轮重构
+  messages 时都会重新放入这条消息（react.py:254-260），避免 plan 随轮
+  数推移被遗忘；
+- **优雅降级**：planner 调用失败、JSON 解析失败、字段缺失等任一情况下，
+  整个循环继续运行，仅在 `state.plan` 中记录失败原因；
+- **`skip_for_easy`** 默认开启：当任务标签为 easy 时跳过 planner，省去
+  一次模型调用。
 
-该 guard 的设计动机是避免两类极端：一方面，完全不检查会让“形状正确但内
-容错误”的答案静默通过；另一方面，无条件 self-verify 会增加成本，也可能
-让模型把已正确答案改错。因此系统采用“有证据才升级”的策略。
+multi-agent fallback 中的 `PlannerAgent` 与 React 预规划不同：它使用
+`render_compact_schema()` 提供文件清单、schema 与行数（不含数据行），
+具体数据仍由 specialist 通过工具调用获取。
 
-当前 React Cheap Guard 主要检查五组信号：
+### 5.4 System Prompt 设计（schema-link first，then code）
 
-| 风险代码 | 触发条件 | 处理含义 |
-| --- | --- | --- |
-| `execution_failed_or_missing_answer` | `answer` 工具没有产生候选表格 | 直接视为高风险 |
-| `empty_answer_rows` / `invalid_answer` | 候选答案为空或未通过结构校验 | 需要复核或进入后续失败处理 |
-| `answer_without_computation` | 在提交前没有成功调用 `execute_python` 或 `execute_context_sql` | 说明模型可能只看了样本预览或凭先验回答 |
-| `knowledge_doc_not_read` | context 中存在 knowledge / rule / glossary 文档，但没有成功读取 | 说明模型可能忽略了任务内定义的领域规则 |
-| `shape_mismatch_*` | 问题暗示 scalar/list，但答案行列形态明显不一致 | 作为 warning 累计风险分 |
+`prompt.py` 中的 `REACT_SYSTEM_PROMPT` 把若干评分对齐与领域约束写入系
+统提示，主要包括：
 
-风险分由各项风险权重相加并截断到 1.0；若存在 error 级风险，或累计分数达
-到阈值，`should_escalate=True`。此时 React Harness 不立即提交第一次
-answer，而是把 `guard_risk_codes` 和 `guard_top_risk` 写入 observation，
-要求模型基于具体风险再提交一次。若未触发风险，则第一次答案直接提交。
+- **Knowledge file 不可议价**：`knowledge.md` 等文档为单一事实源；当其
+  定义与模型先验冲突时，**始终以文档为准**；并要求**语义化**应用规则
+  ——把规则解析为条件/操作后映射到真实列名，而不是照抄变量；
+- **样本行使用约束**：`read_csv` 等预览返回的样本行**仅可**用于推断
+  dtype、字段格式与 join key，**禁止**据此输出最终答案；最终答案必须
+  通过 `execute_python` 或 `execute_context_sql` 在完整数据上计算；
+- **粒度保留**：当问题概念由源中多个字段表达时（如 `first_name` /
+  `last_name`），输出应保留分列，避免合并；与评分函数的列签名匹配规则
+  对齐；
+- **数值与字符串归一化提醒**：与本地评分器一致（数值 $10^{-2}$ 容差、
+  字符串 strip + lower）；
+- **Few-shot 示例**：附 spreadsheet（CSV + SQLite join + top-N）与
+  document（基于 knowledge 的标量答案）两类典型样例；
+- **Native tools API 模式下的输出规则**：当走原生 function-call 时，系
+  统提示移除"必须返回 fenced JSON"的指令，仅要求每轮调用一个 tool 并
+  附简短 rationale，避免模型被旧规则拉回到文本 JSON 模式而丢失原生
+  `tool_call_id`。
 
-这个设计把“是否需要再想一轮”从模型自我判断中拿出来，交给可审计的本地证
-据。它并不判断答案语义一定正确，但能拦截几类代价很低、影响很大的错误：
-未计算即作答、未读规则文档、空答案和答案形状明显不匹配。
+### 5.5 错误归类与 retry hints
 
-### 5.5 预算敏感恢复
+`react_retry_hints.py` 将工具调用错误转换为结构化 `RetryHint`，由 React
+主循环写入 observation 的 `retry_hint` 字段。其结构与机制为：
 
-系统使用 `BudgetController` 记录 LLM 调用、工具调用、修复次数和任务级时
-间。当 self-verify 阶段触发预算异常且已有 draft answer 时，React Harness
-会保留该 draft，并在 trace 中记录预算耗尽原因。这一策略针对的是“答案已
-经形成，但验证阶段消耗超限”的场景，可以避免把已有有效结果直接丢弃。
+- **按工具分组的错误模式集合**：Python 错误 10 类（覆盖
+  `FileNotFoundError` / `ModuleNotFoundError` / `KeyError` /
+  `AttributeError` / 数值转换 / `TypeError` / 语法错误 / 30 秒超时 /
+  CSV 解析 / 编码错误）、SQL 错误 4 类（unknown table / unknown column
+  / 语法错误 / 写操作被拒）、Path 错误 1 类、`answer` 错误 3 类；
+- **错误签名归一化**（`_signature`）：去除 `line N`、绝对路径、引号内
+  内容，使 `no such column: foo` 与 `no such column: bar` 归并为同一签
+  名，从而能统计"同类错误"；
+- **`ErrorHistory` 重复升级**：同签名出现 ≥ 2 次时，提示前置一句
+  "Stop retrying this approach — switch tools or read the data first"，
+  把"重复修复"行为切换为"换策略"；
+- **per-action 分组分派**：`execute_python` 走 Python 模式集，
+  `execute_context_sql` 走 SQL 模式集，`read_*` 与
+  `inspect_sqlite_schema` 走路径模式集，`answer` 走答案结构模式集；
+- **Tool 异常时仍跑 hint**：即便底层 tool 抛异常未返回 result（典型情
+  形为 `answer` 行宽不一致触发结构异常），主循环仍然构造一次 hint 写
+  入 observation（react.py:660-681），让模型下一轮看到具体修正建议；
+- **未匹配时的兜底建议**：未命中任何模式时仍返回一句"Re-read the
+  error message; verify with `inspect_sqlite_schema` / `read_csv` /
+  `list_context` first" 的通用提示。
 
-预算控制不是单一的总时长限制，而是分层记录不同类型的资源消耗。普通模型
-调用和工具调用分别计数；local repair、reasoner repair 和 multi-agent
-fallback 也有独立上限。这样做的原因是，不同阶段的收益和风险不同：一次
-数据检视通常是必要成本，而多轮修复如果持续失败，就容易吞掉整道题的预算。
-因此系统在进入修复或兜底前先检查对应预算，触发上限时写入明确的
-`budget_exhausted:*` 原因，而不是让任务在无效路径中继续运行。
+此外，当模型走 native tool calling 时，工具调用失败仍会保留 action 名
+与 `tool_call_id` 写入 step（react.py:682-691），下一轮重建 messages
+时不会出现 orphan tool message——避免 OpenAI-compatible 服务端因
+`tool_call_id` 不匹配而 400。
+
+### 5.6 React Cheap Answer Guard
+
+`react_answer_guard.py` 是主路径中的低成本风险检查模块。它不调用 LLM，
+而是基于已有工具轨迹与候选答案做确定性评估。原则是：能由静态错误、运行时错
+误或答案结构错误唯一确定的修复，不再请求 LLM 重写；只有当本地无法安全
+判断时才升级到 schema-guided retry 或更上层的修复路径。
+
+guard 与主循环的 `verification_rounds` 协同。当前配置固定
+`verification_rounds=1` 与 `use_answer_guard=true`：所有任务都强制进行
+一轮 self-verification，guard 在第一次 `answer` 调用时同步运行，并将
+其风险代码与最高风险写入 verify observation。
+
+部分guard 检查的风险代码：
+
+| 风险代码                             | 触发条件                                                     | severity / weight |
+| ------------------------------------ | ------------------------------------------------------------ | ----------------- |
+| `execution_failed_or_missing_answer` | answer 调用未产生 AnswerTable                                | error / 1.0       |
+| `empty_answer_rows`                  | 候选答案有列但行数为 0                                       | error / 0.75      |
+| `invalid_answer`                     | `validate_answer_table` 检查失败                             | error / 1.0       |
+| `answer_without_computation`         | 提交前未成功调用 `execute_python` 或 `execute_context_sql`   | error / 0.85      |
+| `knowledge_doc_not_read`             | 上下文存在 `knowledge / rule(s) / definition(s) / glossary / schema_notes` 命名的 md/markdown/txt 文档但未被 `read_doc` 读取 | error / 0.8       |
+| `shape_mismatch_scalar_question`     | 问题语气暗示标量答案但行数 > 1                               | warning / 0.35    |
+| `shape_mismatch_list_question`       | 问题语气暗示列表但答案是 1×1 标量                            | warning / 0.35    |
+
+总分由各项权重相加并截断至 1.0。该机制将"重答时应重点检查什么"以可审
+计的局部证据形式传递给模型，避免在缺乏外部信号时的无差别
+self-correction（参见 Huang et al., ICLR 2024；CRITIC, ICLR 2024）。
+
+下表为常见的错误及修复：
+
+| 顺序 | 修复器                                     | 主要 issue                           | 修复策略                                                     |
+| ---: | ------------------------------------------ | ------------------------------------ | ------------------------------------------------------------ |
+|    1 | `repair_python_syntax`                     | `python_syntax`                      | 去除 Markdown fence 残留并以 `ast.parse` 验证                |
+|    2 | `repair_missing_answer_assignment`         | `missing_answer_assignment`          | 在顶层变量中按优先级选择结果变量并追加 `answer = <var>`      |
+|    3 | `repair_json_records_read_with_pandas`     | `json_records_read_with_pandas`      | 将 `pd.read_json("x.json")` 改为 `json.load` 后构造 DataFrame |
+|    4 | `repair_no_such_table`                     | `no_such_table`                      | 注释掉引用不存在表的 SQL 行                                  |
+|    5 | `repair_no_such_file`                      | `no_such_file`                       | 在已知 context 路径中按后缀与编辑距离替换为最近的真实文件    |
+|    6 | `repair_pandas_keyerror_or_no_such_column` | `no_such_column` / `pandas_keyerror` | 基于 `available_columns` 与 `closest_matches` 做保守列名替换 |
+|    7 | `repair_bad_join_key`                      | `bad_join_key`                       | 仅当静态检查给出唯一 join key 候选且左右键同名时替换         |
+|    8 | `repair_merge_dtype_mismatch`              | `merge_dtype_mismatch`               | 在 merge 前插入左右 key 的 `astype(str)`；ID 字段额外去除 `.0` 后缀 |
+|    9 | `repair_zero_row_common_filters`           | `zero_rows`                          | 规范化 ID 字段字符串、布尔字符串比较等常见零行过滤原因       |
+
+此外，`repair_answer_table()` 在答案层处理结构问题：`ragged_row` 将行宽
+统一至 header 宽度，`empty_column` 删除完全为空的列。每次成功修复通过
+`BudgetController.consume_local_repair` 计数，达到 `max_local_repairs`
+后立即停止循环。Local repair 的关键不在于"尽量多修"，而在于"仅在证据
+充分时修"：列名替换需达到相似度阈值，多候选时不做猜测；join key 修复
+要求唯一候选且左右字段名一致。修复记录写入 `local_repair_log` 或
+`post_schema_retry_local_repair_log`。
+
+### 5.7 Self-verification 闭环
+
+当 `verification_rounds=1` 时，主循环在模型第一次调用 `answer` 时**不
+立即终止**：原本的 terminal observation 被改写为一条非终止 observation，
+其 `content` 携带：
+
+- `status: draft_submitted`；
+- `verification_round` 与 `remaining_rounds`（用于模型自检自己处于哪一
+  轮）；
+- `draft_columns`、`draft_row_count`（让模型直接看到当前候选答案的表
+  形）；
+- `guard_score`、`guard_risk_codes`、`guard_top_risk`（来自 §5.6）；
+- `instructions` 字段：由 `build_verify_instructions` 生成，把每个具体
+  风险代码翻译为对应的行动指令（例如 `knowledge_doc_not_read` 翻译为
+  "Per the project contract, read the knowledge doc and re-answer"），
+  最高风险以 `Most important: ...` 突出显示。
+
+模型在第二次 `answer` 调用时才真正提交。该设计将"是否重检"与"重检什
+么"分离：前者由配置决定（强制 1 轮），后者由 guard 提供具体证据。
+
+为应对 self-verification 阶段的非典型结束情况，主循环还提供两类 draft
+兜底：
+
+- **预算耗尽兜底**（react.py:381-390）：self-verify 阶段抛 `BudgetExceeded`
+  时，若已存在 `pending_answer`，立即将其写入 `state.answer` 并以
+  `budget_exceeded_during_self_verify: …` 作为 failure 原因，避免有效
+  结果被预算超时整体丢弃；
+- **未确认兜底**（react.py:717-725）：循环结束时模型未发出第二次 `answer`，
+  系统以最近 draft 写入 `state.answer` 并在 trace 中标记
+  "Agent did not finish self-verification"。
+
+此外，当模型 API 自身抛异常时，主循环单独记录一条
+`__model_error__` step、把异常字符串作为 `failure_reason` 并优雅终止
+循环（react.py:392-419），避免单次模型调用故障导致整轮挂起。
+
+### 5.8 预算控制与可观测性
+
+`BudgetController`（`budget.py`）维护六个维度的预算：LLM 调用、工具调
+用、运行时间，以及 local repair、reasoner repair、multi-agent
+fallback 三类修复轮次。在进入修复或回退路径前，调用方通过 `can_*` 方
+法预检；触发上限时以明确的 `budget_exhausted:*` 原因终止。当前配置中
+仅 `max_seconds = 600` 为硬上限，其余维度均为不限或大额放行。
+
+主路径同时为外部观察者输出结构化事件：
+
+- 每一步携带 `stream_label` 前缀（如 `react step N`、`react.planner`、
+  `react.budget`），使 `ProgressLogger` 能够在多阶段日志中区分阶段；
+- guard 单独发 `react_answer_guard` 事件，包含 verdict、score、risk
+  codes 与 top risk；
+- `failure_reason` 区分多种结局：`budget_exceeded_during_self_verify`、
+  "did not finish self-verification"、"did not submit an answer within
+  max\_steps" 等，以便 trace 复盘准确归因。
+
+### 5.9 小结
+
+主路径上的优化遵循"低成本约束优先、模型调用克制"的原则：协议层用同源
+schema + 三层 JSON 容错保证形式正确；上下文层用切片 observation 与缓
+存抑制冗余；预规划用受限输入与可选 skip 抑制成本；system prompt 把领
+域约束（knowledge 不可议价、样本行禁用、粒度保留）固化进首条消息；错
+误处理通过签名归一化与重复升级把"反思"外化为确定性规则；self-verify
+在强制一轮的前提下用 guard 提供具体证据；最后由六维预算与多态
+`failure_reason` 保证执行边界与可复盘性。这些优化共同使 React Harness
+在公开评测中作为统一首发路径的稳定性得到保证。
 
 ---
 
 ## 6. 工具层、知识工具与长文档检索
 
-工具层提供对任务上下文的受控访问。核心工具包括：
+工具层提供对任务上下文的受控访问。`tools/registry.py` 默认注册 10 个工
+具；当配置启用 helper 模型且当前 route 为 React 时，第 11 个工具
+`consult_knowledge` 会被额外注册。
 
-- `list_context`：列出 context 下可用文件；
-- `read_csv`、`read_json`、`read_doc`、`head_doc`、`grep_doc`：读取或检
-  索上下文文件；
-- `inspect_sqlite_schema`、`execute_context_sql`：检查并查询 SQLite；
-- `execute_python`：在任务 context 目录中运行 Python；
-- `answer`：提交最终表格；
-- `consult_knowledge`：在 helper model 启用时解释规则文档。
+| 工具                        | 作用                                                         | 终止 |
+| --------------------------- | ------------------------------------------------------------ | ---- |
+| `answer`                    | 提交最终答案表（columns + rows）；唯一的终止动作             | ✓    |
+| `list_context`              | 列出 context 下的可用文件树                                  |      |
+| `read_csv`                  | 分页读取 CSV 预览，支持 `columns_only` 模式                  |      |
+| `read_json`                 | 读取 JSON 预览，按 `max_chars`/`offset` 分页                 |      |
+| `read_doc`                  | 读取 Markdown/TXT 文档片段（单次最多 6 KB）                  |      |
+| `head_doc`                  | 读取文档前若干行                                             |      |
+| `grep_doc`                  | 在文档中执行正则/子串检索，返回命中行及上下文                |      |
+| `inspect_sqlite_schema`     | 列出 SQLite 表结构与少量样本行                               |      |
+| `execute_context_sql`       | 在 SQLite 上执行只读 SQL（带 limit）                         |      |
+| `execute_python`            | 在 context 目录中执行 Python 代码（独立子进程，30 秒硬超时） |      |
+| `consult_knowledge`（可选） | 调用 helper 模型解释 knowledge / rule 文档                   |      |
 
 ### 6.1 受控执行环境
 
-`execute_python` 使用独立 `multiprocessing.Process` 执行代码，工作目录
-固定为当前任务的 `context/`。stdout 与 stderr 被重定向到临时文件，再由
-父进程读取。若代码超过 30 秒未结束，子进程会被终止并返回超时错误。该机
-制不是完整安全沙箱，但对本项目而言具有三个实际作用：隔离死循环，避免执
-行命名空间污染主进程，并在异常退出时保留可读的错误信息。
+`execute_python` 在独立 `multiprocessing.Process` 中执行模型生成的代码
+（见 `tools/python_exec.py`），工作目录固定为当前任务的 `context/`。
+stdout 与 stderr 通过 `multiprocessing.Queue` 由父进程读取。若代码运行
+超过 `EXECUTE_PYTHON_TIMEOUT_SECONDS = 30` 秒，子进程被
+`terminate()`/`kill()` 并返回超时错误。该机制并非完整安全沙箱，但能够
+隔离长时间运行、防止执行命名空间污染主进程，并在异常退出时保留可读的错
+误信息。`execute_context_sql` 仅允许只读语句；文件读取工具均限制单次返
+回内容规模，以控制 observation 长度。
 
-SQLite 查询工具只允许只读语句，避免模型执行写操作破坏上下文数据。文件
-读取工具会限制单次返回内容规模，以减少超长 observation 对后续模型调用
-造成的干扰。
-
-React 主循环中的文件读取也采用切片式 observation，而不是一次返回完整文
-件。`read_csv` 默认只返回有限行数，并支持 `columns_only=true` 只取表头
-和行数；`offset` 可用于分页查看后续行。`read_doc` 与 `read_json` 通过
-`max_chars` 和 `offset` 返回片段，单次字符数有上限；`head_doc` 只返回文
-档开头若干行；`grep_doc` 返回关键词匹配行及其周围上下文。这个工具设计
-与 system prompt 中的约束一致：样本行只能用于判断字段、类型、格式和
-join key，最终结果必须通过 Python 或 SQL 在完整数据上计算。
+文件读取工具采取切片式 observation：`read_csv` 默认仅返回有限行数，并支
+持 `columns_only=true` 仅返回表头与行数；`read_doc` 与 `read_json` 通过
+`max_chars` 与 `offset` 分页，单次字符数有上限；`head_doc` 仅返回前若
+干行；`grep_doc` 返回命中行及其上下文。该设计与系统提示中的约束一致：
+样本行可用于判断字段、类型、格式与 join key，最终结果必须通过 Python
+或 SQL 在完整数据上计算。
 
 ### 6.2 `consult_knowledge` 规则文档工具
 
-部分任务包含 `knowledge.md`、`rules.md`、`glossary.txt` 或类似命名的规
-则文档。主模型如果只读取表格，容易忽略这些文档中定义的阈值、公式或字段
-语义。为此系统提供 `consult_knowledge` 工具，在配置启用时由 React 路径
-调用。
+部分任务包含 `knowledge.md`、`rules.md`、`glossary.txt` 等规则文档。
+`consult_knowledge`（`tools/knowledge.py`）将"规则解释"与"数据计算"解
+耦：仅当 `agent.helper_model.enabled=true` 且当前 route 为 React 时，
+`router.py:_run_one_route` 会安装一个带剩余调用次数的 `HelperRuntime`，
+并将该工具注册至工具集。
 
-该工具的职责不是直接生成答案，而是回答关于规则文档的窄问题。其执行逻辑
-包括：
+执行流程为：
 
-1. 在 context 内解析显式文件列表；若未指定文件，则自动寻找 knowledge、
-   rule、definition、glossary、schema notes 等命名模式的 Markdown/TXT
-   文档。
-2. 对路径做 context 边界检查，避免工具读取任务目录之外的文件。
-3. 将规则文档按字符预算合并为带文件名的片段，连同模型提出的具体问题一
-   起发送给 helper model。
-4. 在系统提示中约束 helper model：只能使用给定文档，不得发明阈值、公式
-   或 cut-off；若文档未说明，应显式返回 `not_specified`。
-5. 将简短解释作为普通 observation 返回给 React 主循环，由主模型再决定
-   如何把规则转化为筛选条件、派生字段或最终答案。
+1. 解析显式 `files` 列表；若未指定，则用正则
+   `(knowledge|rule(s)|definition(s)|glossary|schema_notes)\.(md|markdown|txt)`
+   自动扫描；
+2. 对每条路径执行上下文边界检查；
+3. 将文档按字符预算合并为带文件名的片段，连同问题一起发送给 helper 模型；
+4. 系统提示约束 helper 仅可使用所给文档作答，无法在文档中找到答案时必
+   须返回 `not_specified`；
+5. 将 helper 返回的简短解释作为 observation 喂回 React 主循环，由主模型
+   决定如何将规则转化为筛选条件、派生字段或最终答案。
 
-这个设计把“读规则”和“执行数据计算”分开。规则解释由更聚焦的 helper 调
-用完成，数据操作仍由主路径通过 Python、SQL 或文件读取工具完成。这样既
-降低规则文档被忽略的概率，也避免 helper model 直接越权替系统生成最终表
-格。
+helper 调用受 `HelperRuntime.calls_remaining` 与 `(question, file_names)`
+缓存键约束，避免对同一文档的重复提问。
 
-### 6.3 长文档与 RAG 检索
+### 6.3 长文档检索
 
-对于较长 Markdown、TXT、DOCX 或 JSON 上下文，系统不能把全文无差别塞入
-prompt。`document_retriever.py` 提供面向 Operator 路径的检索组件，其流
-程为：
+对于较长的 Markdown、TXT、DOCX 与 JSON 上下文，`document_retriever.py`
+提供面向 Operator 路径的 RAG 流水线：
 
 ```text
-load document
-        |
-        v
-chunk by heading / JSON path
-        |
-        v
-BM25 sparse retrieval
-        |
-        +-------------------------+
-        | optional dense retrieval |
-        +-------------------------+
-        |
-        v
-rank fusion
-        |
-        v
-optional query expansion / hypothetical answer
-        |
-        v
-optional cross-encoder rerank
-        |
-        v
-top-K rendered context
+load document → chunk by heading / JSON path → BM25 sparse retrieval
+        ↘  optional dense retrieval (embedding model)  ↗
+                    Reciprocal Rank Fusion (rrf_k)
+                                ↓
+        optional query expansion with paraphrases + HyDE
+                                ↓
+                    optional cross-encoder rerank
+                                ↓
+                          top-K rendered context
 ```
 
-文档切分保留标题路径，JSON 切分保留对象路径，因此返回片段不仅有正文，也
-有来源位置。默认稀疏检索采用 BM25，适合实体名、ID、字段名等精确匹配；
-当配置了向量模型时，系统可加入 dense retrieval，并用 Reciprocal Rank
-Fusion 按排名融合稀疏和稠密结果。若启用 query expansion，系统会生成若
-干改写查询和一个假设性答案段落，以提高长文档中同义表述的召回率。若启用
-reranker，则先取较大的候选集合，再由 cross-encoder 对 query 与 chunk
-联合打分，最后保留 top-K。
+文档切分保留标题路径，JSON 切分保留对象路径，因此返回片段同时携带正文
+与位置信息。BM25 适合实体名、ID、字段名等精确匹配；启用稠密检索后，系
+统使用 Reciprocal Rank Fusion 融合稀疏与稠密结果；启用 query expansion
+后，系统额外生成若干改写查询与一段假设性回答（HyDE）以提高同义表述的
+召回率；启用 reranker 后，系统先取较大候选集合（`first_stage_top_n`，
+默认 30）再由 cross-encoder 联合打分得到 top-K（默认 6）。
 
-该检索链路采用渐进增强原则：外部向量模型、query expansion 或 reranker
-不可用时，系统仍退化为 BM25 检索，而不是阻断任务。这样可以让长文档任务
-获得更稳定的证据片段，同时保持默认路径的可运行性。
+该流水线遵循渐进增强原则：当 embedding、query expansion、reranker 任一
+组件不可用时，链路退化至 BM25 检索而非阻断任务。当前配置在
+`tool_first_mixed` 与 `extreme` 两条 cascade route 中启用 BM25 + DashScope
+`text-embedding-v4` 稠密检索（RRF 融合）+ query expansion（含 HyDE），未
+配置 reranker；React 主路径不进入该流水线，文档检索由模型通过 `read_doc`
+/ `grep_doc` / `head_doc` 自行完成。
 
 ---
 
-## 7. Operator 兜底路径
+## 7. 程序化路径（Operator / Codegen / Multi-agent）
 
-在部分任务中，一段完整的 pandas / SQL 程序比多轮 ReAct 更直接。为此，
-系统保留 agentic/operator 兜底路径。当前默认配置并不把它作为所有任务的
-首选路径，而是在主路径失败或消融实验中使用。
+部分任务以一段完整的 pandas/SQL 程序求解更为直接。系统在 React Harness
+之外保留了三类程序化路径，用于 cascade 兜底与消融实验：`OperatorExecutor`
+（`agents/operator_executor.py`）、其上层包装 `AgenticOperatorExecutor`
+（`agents/agentic_operator.py`）以及 multi-agent 编排器
+（`agents/orchestrator.py`）。`OperatorExecutor` 是程序化路径的核心，其
+执行流程包含六个阶段：
 
-### 7.1 程序生成
+```
+Phase 0  record_text query_type 分类（仅当上下文含 record_text）
+Phase 1  SemanticConsistencyPipeline.plan()              — 审题官（无代码）
+Phase 2  初始 codegen（CodegenDirectAgent）
+         或 structured-doc 预抽取（record_text + aggregate）
+Phase 3a RepairCoordinator.local_repair_loop()           — 确定性 local repair
+Phase 3b structured-doc 合成兜底（仅 record_text 失败时）
+Phase 3c schema-guided LLM retry + 二次 local repair
+Phase 3d 恢复 semantic plan（应对 analyst 异常或 cheap-guard 升级）
+Phase 4  SemanticConsistencyPipeline.judge_and_repair()  — 执行官
+```
 
-`tablellm_direct.py` 会构造 codegen prompt，要求模型生成 Python 程序并把
-最终结果赋给变量 `answer`。执行外壳负责把 `answer` 归一化为 DataFrame，
-再写为 CSV。若模型返回的是 Series、dict、list 或标量，外壳也会尝试转换
-为二维表格。
+### 7.1 程序生成（CodegenDirectAgent）
 
-Codegen prompt 中的 `Available context` 由
-`render_context_for_codegen()` 生成，不是原始文件拼接。该函数按任务形态
-选择三种渲染方式：
+`tablellm_direct.py` 构造 codegen prompt，要求模型生成 Python 程序并将
+最终结果赋值给变量 `answer`。执行外壳 `_EXEC_HARNESS` 将 `answer` 归一
+化为 DataFrame、写出 CSV，并打印 `OPERATOR_CODEGEN_RESULT_OK`、shape 与
+`OPERATOR_CODEGEN_DEBUG=<json>`。若模型返回 Series、dict、list 或标量，
+外壳会尝试转换为二维表格。
 
-- 若 route 提供 RAG 参数，则调用 `render_with_rag()`：表格文件保留 schema
-  和少量代表性样本，文档和 JSON 进入检索流程，只把 top-K 片段送入 prompt；
-- 若提供问题文本但未启用 RAG，则调用 `render_focused()`：表格保留 schema
-  和样本行，文档按问题关键词选择相关章节；
-- 否则调用 `render_with_samples()`：主要面向表格任务，提供 schema 与少
-  量分散样本行。
+prompt 中的 `Available context` 由 `render_context_for_codegen()` 生成，
+按任务形态选择三种渲染方式：当 route 提供 RAG 参数时调用
+`render_with_rag()`；当提供问题文本但未启用 RAG 时调用 `render_focused()`；
+否则调用 `render_with_samples()`。`context_render.py` 对不同文件类型采
+取不同切片策略（CSV：列名/行数/head-spread-tail；SQLite：表结构/列类型
+/行数/样本；JSON：top-level keys/记录数/样本；Markdown/TXT：按标题切分
+后选择相关 section；超过预算的文件仅保留 stub）。渲染结果同时写入
+`context_manifest`，记录每个文件的实际可见切片，以便事后归因。
 
-`context_render.py` 对不同文件类型有不同切片策略。CSV 会展示列名、行数
-和 head/spread/tail 样本；SQLite 会展示表结构、列类型、行数和少量样本；
-JSON 会展示 top-level keys、record 数量和有限 record 示例；Markdown/TXT
-会按标题切分并选择相关 section；超出预算的文件只保留一行 stub。渲染结
-果同时写入 `context_manifest`，记录每个文件的路径、类型、大小、行数、章
-节数、检索结果和是否截断，便于解释模型当时实际看到了哪些切片。
-
-因此，Operator 路径的设计不是让模型直接“看完所有文件后写答案”，而是让
-模型基于结构摘要和代表性切片写出可执行程序；程序运行时再从 `context/`
-读取完整文件。这个分离可以减少 prompt 中的无关内容，也能避免模型把样本
-行误当成完整数据。
-
-同时，prompt 要求模型维护 `debug_steps`，记录：
-
-- 实际读取到的字段；
-- 使用过的字段；
-- 过滤条件；
-- join keys；
-- 中间行数；
-- 使用的规则文档内容；
-- 与语义计划不一致时的 override 原因。
-
-这些信息不是面向评分的答案，而是面向系统审计的中间证据。语义检查模块可
-以根据 `debug_steps` 判断程序是否真的执行了它声称的字段映射和过滤逻辑。
+prompt 进一步要求模型维护 `debug_steps` 字段，记录读取到的字段、使用过
+的字段、过滤条件、join keys、中间行数、引用过的规则文档以及与语义计划
+不一致时的 override 原因。该字段不参与评分，但供 cheap semantic guard
+与 semantic judge 消费。
 
 ### 7.2 Schema grounding
 
-`schema_grounding.py` 负责在自然语言概念和真实字段之间建立候选关系。它
-综合字段名相似度、低基数字段样本、字段类型和 cardinality 等信号，向模型
-提示可能相关的列。该模块只给出候选，不直接替模型做最终绑定。这样可以避
-免在候选不唯一时，把一次不确定判断固化为系统性错误。
+`schema_grounding.py` 综合字段名相似度（Levenshtein）、低基数字段样本、
+字段类型与 cardinality，向模型提示自然语言概念到字段的候选映射。该模块
+仅给出候选，不强制做最终绑定，从而避免在候选不唯一时将不确定判断固化为
+系统性错误。
 
-### 7.3 静态检查
+### 7.3 静态检查（StaticChecker）
 
-`static_checker.py` 在程序运行前进行 AST 层面的检查。它会追踪 DataFrame
-变量与数据源之间的关系，并检查以下问题：
+`static_checker.py` 在程序运行前进行 AST 层检查，通过追踪 DataFrame 变
+量与数据源之间的来源关系输出结构化 `StaticIssue`。当前覆盖的 issue code
+包括 `python_syntax`、`missing_answer_assignment`、`no_such_file` /
+`no_such_table` / `no_such_column`、`pandas_keyerror`、`bad_join_key`、
+`merge_dtype_mismatch` 与 `json_records_read_with_pandas`，以及由 stderr
+归并而来的 `exec_error` 信号。静态检查的目标是在执行前发现确定性错误，
+并将错误转换为可由 local repair 机械修复的形式。
 
-- 打开的文件路径是否存在于任务 context；
-- SQLite 查询中的表名是否存在；
-- DataFrame 下标访问、groupby、sort、drop_duplicates 等使用的列是否存
-  在；
-- merge 的 `on`、`left_on`、`right_on` 是否是对应 DataFrame 的真实列；
-- object-wrapped JSON 是否被 `pd.read_json` 误读为嵌套对象列；
-- 程序是否缺少最终 `answer` 赋值。
+### 7.5 Schema-guided LLM Retry
 
-静态检查的目标是在执行前发现确定性错误，并把错误转换为结构化
-`StaticIssue`，供后续修复器使用。
+当 local repair 未能恢复但仍存在结构化证据时，
+`RepairCoordinator.schema_retry()` 将 `static_checker` 的全部 issue、
+真实 schema、`semantic_plan`（如有）以及上一次失败的 stderr/stdout 组装
+为 `schema_diagnostics`，由 LLM 重新生成程序。重写完成后再触发一次
+`local_repair_loop`，构成"LLM 重写 → 确定性微调"的串联。
 
-### 7.4 Local Repair
+### 7.6 Cheap Semantic Guard 与语义一致性
 
-`local_repair.py` 是 Operator 路径中最重要的确定性修复层。它的基本原则
-是：能由静态错误、运行时错误或答案结构错误唯一确定的修复，不再请求模型
-重写；只有当本地修复无法安全判断时，才进入 schema-guided LLM retry 或其
-他兜底路径。
+Operator 路径中的 cheap guard 位于 `semantic_guard.py:assess_cheap_semantic_risk`，
+由 `operator_executor.py:_cheap_semantic_assessment` 在需要时调用。其
+作用是判断"看似成功"的程序结果是否足够低风险以直接通过，从而决定是否
+调用更昂贵的 semantic judge。输入包括 `CodegenRunResult` 的成功状态、
+答案与执行输出，`debug_steps` 中记录的 schema inspection、used columns、
+filters、join keys、intermediate counts、knowledge rules used，以及
+`CompiledTask` 的真实 schema、任务类型、操作集合与执行画像；同时参考
+local repair 与 schema retry 的历史以及 schema grounding 的候选映射。
 
-外层调度位于 `repair_coordinator.py:local_repair_loop()`。该循环在三种情
-况下触发：
+升级条件与 React 一致：任意 error 级风险，或累计权重达到阈值。若 cheap
+guard 判定需要升级，`OperatorExecutor` 先尝试以 `sc_pipeline.plan(task,
+force=True)` 强制生成 semantic plan；若 analyst 仍未产出 plan，则构造
+低置信度的 `_fallback_semantic_plan`，将 cheap guard 发现的风险写入
+`uncertainties` 与 `consistency_checks`，并设置 `_force_semantic_consistency=True`，
+确保 judge 不会被静默跳过。
 
-1. 程序执行成功但答案为零行时，构造 `zero_rows` issue，尝试修复常见的
-   dtype 或过滤条件漂移；
-2. 程序执行成功但答案未通过 `answer_validator` 时，调用
-   `repair_answer_table()` 修复可局部处理的表格结构问题；
-3. 程序执行失败时，合并 `static_checker.check_program()` 和
-   `issues_from_exec_error()` 的结果，再交给 `try_program_repair()`。
+随后 `semantic_consistency.py:judge_and_repair` 进入：先做
+`_preflight_judge_failure` 的确定性前置检查（`execution_failed` /
+`zero_rows` / `invalid_answer` / `runtime_exception` /
+`schema_inspection_missing` 等）；调用 `judge_consistency` 得到 verdict
+与 confidence；若 verdict 为 pass 且 confidence ≥ 0.55，则接受当前结果；
+否则 `run_semantic_repair` 重写程序、跑静态检查、重新执行，再回到 judge，
+最多 `max_repairs` 轮。
 
-`try_program_repair()` 中 fixer 的顺序是固定的，按“越安全越靠前”的原则排
-列。当前顺序如下：
+### 7.7 Record-text 处理
 
-| 顺序 | 修复器 | 主要触发问题 | 修复策略 |
-| ---: | --- | --- | --- |
-| 1 | `repair_python_syntax` | `python_syntax` | 去除泄漏到程序中的 Markdown fence，并用 `ast.parse` 验证 |
-| 2 | `repair_missing_answer_assignment` | `missing_answer_assignment` | 从顶层变量中按优先级选择结果变量，追加 `answer = <var>` |
-| 3 | `repair_json_records_read_with_pandas` | `json_records_read_with_pandas` | 将 `pd.read_json("x.json")` 改为 `json.load` 后读取 object-wrapped records |
-| 4 | `repair_no_such_table` | `no_such_table` | 注释掉引用不存在表的 SQL 行，并把问题交给后续重写路径 |
-| 5 | `repair_no_such_file` | `no_such_file` | 在已知 context 路径中按后缀和编辑距离替换最接近的文件名 |
-| 6 | `repair_pandas_keyerror_or_no_such_column` | `no_such_column` / `pandas_keyerror` | 使用静态检查器提供的 `available_columns` 和 `closest_matches` 做保守列名替换 |
-| 7 | `repair_bad_join_key` | `bad_join_key` | 仅当静态检查给出唯一 join key 候选且左右键同名时替换 |
-| 8 | `repair_merge_dtype_mismatch` | `merge_dtype_mismatch` | 在 merge 前插入左右 key 的 `astype(str)`；ID 字段额外去除 `.0` 后缀 |
-| 9 | `repair_zero_row_common_filters` | `zero_rows` | 规范化 ID 字段字符串、布尔字符串比较等常见零行过滤原因 |
+对于结构化程度较弱的自然语言记录，`structured_doc_executor.py` 提供一条
+基于 LLM 的抽取路径：将原始 record 文本按字符预算切片，由模型针对每个
+切片输出符合统一 schema 的 JSON 记录。schema 字段由 `_guess_schema` 基
+于文件结构提示推断，切片由 `_select_relevant_chunks` 按问题语义与已知
+schema 字段进行筛选，以控制 LLM 调用成本。抽取得到的记录写入合成 CSV，
+并以 `SourceCapability` 形式追加到 `compiled_task.source_capabilities`，
+随后再次调用 `CodegenDirectAgent` 让 codegen 将其作为普通表格使用。
 
-此外，`repair_answer_table()` 不改程序，而是直接修复答案 dict。它只处理
-两类结构问题：`ragged_row` 会将行补齐或截断到 header 宽度；
-`empty_column` 会删除整列为空的列。这类修复发生在答案层，独立于程序层
-fixer。
+入口由 `OperatorExecutor` 控制：当任务画像为
+`record_text_with_semantic_rule` 或携带 `record_extraction_required`
+flag、且 record-text 分类器未将问题判定为 `read` 时，先抽取再 codegen
+（Phase 2）；当初始 codegen 失败、且分类器未判定为 `read` 时，再抽取一
+次作为兜底（Phase 3b）。这种"文本理解 → 表格计算"的分阶段处理便于将
+错误归因于抽取或计算之一。
 
-Local Repair 的关键不是“尽量多修”，而是“只在证据充分时修”。例如列名替
-换要求相似度达到阈值；若静态检查器给出多个 `closest_matches`，本地修复
-不会猜测。join key 修复也只接受唯一候选且左右字段名一致的情况。对于
-`link_to_*` 这类语义相近但方向不同的字段，修复器会主动放弃，避免把概率
-错误固化为确定性错误。
+### 7.8 Multi-agent fallback
 
-该层的输出会写入 `local_repair_log` 或
-`post_schema_retry_local_repair_log`，包括修复轮次、issue、采取的 action、
-重新执行是否成功以及后续失败原因。后面的 Cheap Semantic Guard 会把“是否
-经历过 local repair / post-schema repair”也作为风险信号，因为深层修复路
-径本身说明初始程序的语义可靠性较低。
-
-### 7.5 Cheap Semantic Guard 与语义一致性
-
-Operator 路径中的 Cheap Guard 位于 `semantic_guard.py`，由
-`operator_executor.py` 在需要时调用。它与 React Cheap Guard 的定位一致：
-不直接替代 LLM judge，而是在不调用 LLM 的情况下判断一个“看似成功”的程序
-结果是否足够低风险，可以直接通过，或是否应升级到 Semantic Analyst /
-Judge 流程。
-
-Cheap Semantic Guard 的输入包括：
-
-- `CodegenRunResult` 的成功状态、答案和执行输出；
-- `debug_steps` 中记录的 schema inspection、used columns、filters、
-  join keys、intermediate counts、knowledge rules used；
-- `CompiledTask` 中的真实 schema、任务类型、操作集合和执行画像；
-- Local Repair 与 schema retry 的历史；
-- `schema_grounding.py` 给出的概念到字段候选。
-
-它主要检查以下风险：
-
-| 风险类型 | 典型代码 | 含义 |
-| --- | --- | --- |
-| 执行或结构失败 | `execution_failed_or_missing_answer`、`invalid_answer` | 程序没有可靠地产生表格 |
-| 修复路径可疑 | `suspicious_fallback:*` | 答案依赖 schema retry 或较深 local repair |
-| trace 缺失 | `trace_missing:schema_inspection`、`trace_missing:used_columns`、`trace_missing:filter_conditions`、`trace_missing:join_keys` | 程序没有留下足够证据证明其读取、过滤或连接正确 |
-| trace 与 schema 冲突 | `trace_unknown_used_columns` | `debug_steps` 声称使用的字段不在真实 schema 中 |
-| 中间结果异常 | `suspicious_trace:zero_intermediate_count` | 中间行数出现 0，提示过滤或 join 可能错误 |
-| 概念无法可靠落地 | `grounding_unmapped`、`grounding_low_confidence`、`grounding_ambiguous` | 风险概念在 schema 中没有明确候选或候选竞争 |
-| 字段覆盖不一致 | `field_coverage_mismatch` | 问题中的风险概念有候选字段，但程序 trace 没有使用这些字段 |
-| 公式使用不匹配 | `knowledge_formula_without_question_trigger` | 程序使用了规则公式，但问题并未明确要求该派生指标 |
-
-若 Cheap Semantic Guard 判断需要升级，`operator_executor.py` 会先尝试强制
-生成 semantic plan；如果语义分析器仍未产出 plan，则构造一个低置信度的
-fallback plan，把 cheap guard 发现的风险写入 `uncertainties` 和
-`consistency_checks`，确保后续 judge 不会被静默跳过。随后
-`semantic_consistency.py` 执行 judge 与必要的 semantic repair。
-
-因此，Operator 路径实际有两层 Cheap Guard：React 主路径的
-`react_answer_guard.py` 守住答案提交边界，Operator 路径的
-`semantic_guard.py` 守住“程序执行成功但语义可能不对”的边界。二者都遵循
-同一原则：低风险样例快速通过，高风险样例带着明确证据进入更重的验证流程。
-
-### 7.6 Record-text 处理
-
-对于结构化程度较弱的自然语言记录，`structured_doc_executor.py` 先尝试抽
-取结构化 records，再交给标准表格计算流程。该设计把文本理解和表格计算分
-开：前者负责从段落中恢复字段，后者负责筛选、聚合和输出。分阶段处理可以
-提高可复盘性，也便于定位错误来自抽取还是计算。
-
-### 7.7 Reasoner Repair
-
-`reasoner_repair.py` 是比 Local Repair 更重的一层修复，但它仍不是“重新解
-题”路径。它只接收失败程序、失败原因、结构校验结果、上下文摘要、stdout
-和 stderr，要求 repair model 输出一个新的 Python 程序，并且必须把最终结
-果赋给 `answer`。
-
-Router 对 Reasoner Repair 设置了较严格的触发条件：
-
-- 只有 agentic/operator/tablellm 这类程序路径失败时才考虑；
-- 失败 payload 中必须存在上一轮程序；
-- 任务画像需要显示 `needs_reasoner=True`，或任务是带有大文档上下文的
-  `document_qa`；
-- 对应的 reasoner repair 预算尚未耗尽。
-
-修复程序生成后会立即在任务 context 中执行，并重新读取输出表格。若执行失
-败、没有产生结果表，或预算不足，系统不会把该轮修复视为成功。成功时，修
-复结果会作为新的 payload 返回，同时保留原始失败 payload，方便比较修复前
-后的程序和答案。
-
-这一设计与 Local Repair 形成分层关系：Local Repair 处理证据充分、可机
-械改写的问题；Reasoner Repair 处理需要模型综合失败证据进行局部重写的程
-序问题。二者都避免从空白 prompt 重新生成完整方案，以降低修复阶段引入新
-错误的概率。
-
-### 7.8 Multi-agent 兜底
-
-系统还保留 multi-agent fallback。其结构为 planner、specialists 和
-synthesizer：planner 将问题拆成若干可执行子目标，specialists 分别进行
-数据读取、检索或计算，synthesizer 再把中间结果合并为最终表格。默认配置
-下它不是主路径，因为 public 任务中多数样例可以由更稳定的 React Harness
-完成；multi-agent 更适合作为预算允许时的复杂失败兜底。
-
-multi-agent fallback 也受 `BudgetController` 约束。Router 只在相应失败
-类型和预算条件满足时进入该路径，并把尝试记录写入
-`cascade_attempts`。因此它在报告中的定位不是“更强的万能模型”，而是一个
-可审计的后备执行组织方式。
+`agents/orchestrator.py` 中的 multi-agent 编排由 planner、specialist 与
+synthesizer 构成。`PlannerAgent` 输出 JSON plan：
+`{rationale, subtasks: [{id, specialist, instruction, depends_on,
+expected_output}]}`，可指定五类 specialist（schema / sql / python /
+document / generic）。`SpecialistAgent` 拥有受限工具子集与专属系统提示，
+终止动作为 `report`（产出 Finding，可附小规模证据表），不可调用
+`answer`；同一 specialist 内 `read_doc` 调用次数被限制为 2。
+`SynthesizerAgent` 拥有完整工具集，是唯一可调用 `answer` 的 agent，最
+多 6 步。子任务按 DAG 拓扑分层执行，同层多节点可由 `ThreadPoolExecutor`
+并行（受 `max_specialist_workers` 约束）。当 `enable_iterative_refinement
+=true` 时，若 synthesizer 未能产出答案，会以 `_RefinementTask` 将失败上
+下文回灌至 planner 再跑一轮。multi-agent fallback 同样受
+`BudgetController.can_multiagent_fallback` 约束，仅在 `cascade_attempts`
+满足条件时被启用。
 
 ---
 
 ## 8. 输出验证与评分对齐
 
-`answer_validator.py` 在写出 `prediction.csv` 前执行结构检查，覆盖：
+`answer_validator` 在写出 `prediction.csv` 前对答案进行结构检查，覆
+盖：缺失答案、零列、零行、ragged rows（行宽与 header 不一致）、整列为
+空（fully-null column）以及 mixed-type column 警告。每一次路由 pass 之
+后均通过 `_stamp_validation` 将检查结果写回 payload；已被判定为非法的
+答案会被强制将 `succeeded` 降为 `False`，从而触发 cascade。验证模块本身
+不判断语义正确性，仅保证输出至少可被评分。
 
-- 缺失答案；
-- 零列；
-- 零行；
-- ragged rows；
-- 整列为空；
-- mixed-type column warning。
-
-验证失败的答案会被标记为失败，使 router 有机会进入兜底路径。该模块不判
-断语义正确性，只保证输出至少是可评分的二维表格。
-
-`column_match.py` 实现本地列匹配评分。由于官方评价对列名不敏感，但对多
-余列有惩罚，系统在 prompt、answer guard、operator codegen 和最终评分中
-都围绕“只输出问题要求的列”建立约束。self-consistency 与 optional
-cross-model verification 也以列签名为单位，而非以整张表的字符串表示为
-单位。
+`column_match` 实现本地列匹配评分。由于评分函数对列名不敏感但对多余
+列有惩罚，prompt、answer guard、operator codegen 与最终评分均围绕"只输
+出问题要求的列"建立约束；self-consistency 与 cross-model verification
+也以列签名为单位，而非整张表的字符串表示。
 
 ### 8.1 Self-consistency 列签名投票
 
-当配置多样本运行时，系统不会简单选择最长答案或最后一个成功答案，而是按
-官方评分的列匹配逻辑做 self-consistency 聚合。每个成功样本先被转置为若
-干列，再对每列计算内容签名。签名计算继承本地评分器的归一化规则，包括数
-值容差、大小写归一化和空白归一化。
+当 `self_consistency.num_samples > 1` 时，系统按官方评分的列匹配逻辑做
+self-consistency 聚合（`router.py:_vote_self_consistency` 与
+`run/self_consistency.py`）。每个成功样本被转置为列；每列计算
+`column_signature`，归一化规则与本地评分器一致。聚合时，每个样本对同一
+列签名最多投一票；以样本列数的众数作为目标列数；满足 `min_votes` 的签
+名按票数排序，保留至目标列数。最终表格不是任意拼接，而是优先选择一个
+真实样本：该样本最大化覆盖获胜签名，并尽量少包含额外列。若该样本完全
+覆盖获胜签名，则将其投影到获胜列集合；否则保留其原列集合。聚合策略支
+持 `column_vote`（默认）与 `first_success`。
 
-聚合时，每个样本对同一列签名最多投一票；系统统计所有成功样本的签名票数，
-并以样本列数的众数作为目标列数。满足 `min_votes` 的签名按票数排序，保
-留到目标列数为止。最终表格不是重新拼接任意列，而是优先选择一个真实样本：
-该样本需要最大覆盖获胜签名，并尽量少包含额外列。若该样本包含所有获胜签
-名，系统再把它投影到获胜列集合。
+主路径 React Harness 在当前配置中使用 `num_samples=1`，仅 cascade 中的
+`fallback_multi_agent` 启用 `num_samples=3` 并触发列签名投票。
 
-这种设计与评分函数保持一致：投票对象是“列内容”而不是“自然语言列名”。
-它可以减少单次采样中偶然多出调试列或遗漏某列造成的波动，也避免把来自不
-同样本的行对齐关系随意混合。
+### 8.2 语义一致性审计
 
-### 8.2 Cross-model verification
+Operator 路径的语义一致性输出不仅给出 pass/fail，还在
+`router.py:_build_semantic_consistency_audit` 中扫描 `result.manifest`
+汇总 plan、judge、repair 的运行情况。审计字段包括 `plan_ran`、`judge_ran`、
+`judge_attempts`、`judge_final_verdict`、`judge_repaired_code`、
+`plan_source`、`plan_cache_hit`，以及若干升级标志
+（`analyst_exception_retry_succeeded`、`analyst_exception_fallback_used`、
+`lazy_escalation_plan_built`、`fallback_plan_from_cheap_guard`）。
 
-cross-model verification 用于在成本允许时检查主模型答案是否得到其他模型
-支持。Router 会复制主 route 的执行设置，只替换 verifier 的模型或端点，
-从而让 verifier 在相同工具、相同路由类型和相同约束下独立求解。
+`final_gate` 是审计中最直接的字段，取值如下：
 
-验证阶段同样以列签名为单位。主答案中的每一列会与 verifier 结果的列签名
-集合比较；只有获得至少 `min_agreement` 个模型支持的主答案列才被保留。
-如果交集为空，系统保留主答案并在 trace 中记录
-`empty_intersection_keep_primary`，避免因 verifier 全部失败而把已有答案
-删空。如果交集非空且小于主答案列集合，则用交集投影替换主答案，并重新执
-行结构校验。
+- `plan+judge`：semantic plan 与 judge 均按主路径运行；
+- `escalated+judge`：初始 plan 失败或被 cheap guard 升级后，判定仍进入
+  judge；
+- `cheap_guard_only`：cheap guard 已发现风险但后续 plan 未能建立；
+- `bypassed`：判定为低风险，未进入语义一致性验证。
 
-该机制主要针对“主模型输出了正确列之外的额外列”这一评分风险。由于官方
-评价惩罚多余列，模型间一致的列更可能是稳定答案；但系统也保留空交集回退，
-避免验证器不稳定时造成过度删除。
-
-### 8.3 语义一致性审计
-
-Operator 路径中的 semantic consistency 不只输出 pass/fail，还会在
-`semantic_consistency_audit` 中记录 plan、judge 和 repair 是否真正运行。
-审计字段包括 `plan_ran`、`judge_ran`、`judge_attempts`、
-`judge_final_verdict`、`judge_repaired_code` 和 `final_gate`。
-
-`final_gate` 是复盘时最直接的字段：`plan+judge` 表示语义计划和 judge 均
-正常运行；`escalated+judge` 表示初始计划失败或被 Cheap Guard 升级后，
-系统仍进入了 judge；`cheap_guard_only` 表示 Cheap Guard 发现风险但后续
-语义计划未能建立；`bypassed` 表示系统认为风险较低，没有进入重验证。这
-些字段使我们能区分“未发现风险所以跳过”和“应该验证但验证链路失败”两种
-完全不同的情况。
+该审计仅在 Operator 类 route 上有意义；React 路径以
+`react_answer_guard` 事件作为对应的低成本审计。
 
 ---
 
 ## 9. Public 评测结果与分析
 
-本次 public 记录如下：
+public split 的本次评测结果如下：
 
-| 指标 | 数值 |
-| --- | ---: |
-| Records | 49 |
-| Shown | 49 |
-| Success | 47 / 49 |
-| Failed | 2 |
+| 指标        |        数值 |
+| ----------- | ----------: |
+| Records     |          49 |
+| Shown       |          49 |
+| Success     |     47 / 49 |
+| Failed      |           2 |
 | Total score | 35.600 / 49 |
-| Mean score | 0.727 |
-| Scored | 49 / 49 |
-| Score = 1.0 | 34 |
+| Mean score  |       0.727 |
+| Mean recall |       0.745 |
+| Score = 1.0 |          34 |
 
-本地评分文件为：
+本地评分文件位于 `artifacts/runs/batch-20260516-204243/score_summary.json`。
+49 个任务均生成 `trace.json`，47 个任务生成 `prediction.csv`。两条未生
+成预测的任务为：
 
-```text
-artifacts/runs/batch-20260516-204243/score_summary.json
-```
-
-其中 `total_score=35.6`，`mean_score=0.726531`，`mean_recall=0.744898`。
-49 个任务都生成了 `trace.json`，其中 47 个任务生成了 `prediction.csv`。
-两条未生成预测的任务分别对应：
-
-- `task_344`：任务级运行超过 600 秒；
+- `task_344`：单题运行超过 600 秒；
 - `task_396`：语义修复后仍未通过静态检查。
 
-满分任务数量为 34。其余任务中，一部分为 0 分，一部分获得部分分。例如
-`task_38` 得分 0.60，`task_249` 得分 0.25，`task_379` 得分 0.75。这类
-部分分说明系统在部分任务中找到了部分正确列，但输出了额外列或遗漏了标准
-答案列。结合评分公式，这类错误应优先从“最终列投影”和“字段语义绑定”两
-个环节排查。
+部分得分的任务（如 `task_38` 0.60、`task_249` 0.25、`task_379` 0.75）
+显示系统在这些任务中召回了部分正确列，但同时输出了额外列或遗漏了部分
+标准答案列。结合评分函数，这类失分应优先从最终列投影与字段语义绑定两
+个环节排查。从执行轨迹看，绝大多数任务由 React Harness 直接完成；进入
+cascade 的任务比例较低，与系统的设计定位一致——主路径承担稳定性与协议
+约束，cascade 路径处理程序化与语义风险较高的失败样例。
 
-从运行轨迹看，多数任务由 `react_harness` 完成，少量任务进入 agentic 路
-径。默认配置下 operator/multi-agent 并非主要得分来源，而是用于失败后的
-可控补救。该结果与系统设计定位一致：主路径先保证协议稳定和答案结构，兜
-底路径再处理程序化或语义风险较高的失败样例。
 
----
-
-## 10. 主要优化点
-
-### 10.1 工具协议稳定化
-
-系统将工具协议从自由文本动作描述转为 OpenAI-compatible native tool
-calling，并由统一 `ToolSpec` 维护工具名称、说明和参数 schema。这样可以
-减少由格式错误造成的无效步骤。对于服务端未返回工具调用的情况，系统仍保
-留文本解析回退，从而提高端点兼容性。
-
-### 10.2 确定性风险检查
-
-系统在多个边界设置了非 LLM 检查：
-
-- React answer guard 检查答案提交前的证据充分性；
-- Answer validator 检查最终表格结构；
-- Static checker 检查 codegen 程序中不存在的路径、表名和列名；
-- Semantic guard 检查程序结果与任务语义之间的显著不一致。
-
-这些检查的共同特点是低成本、可解释、可写入 trace。它们并不保证语义完全
-正确，但能减少明显错误静默进入最终提交。
-
-### 10.3 分层修复
-
-当程序或答案出现错误时，系统优先使用本地确定性修复。只有当候选不明确或
-本地规则无法处理时，才进入 schema-guided LLM retry、semantic repair 或
-更重的 fallback。这样可以避免每个错误都触发完整重写，也降低“修复一个错
-误又引入另一个错误”的概率。
-
-### 10.4 可复盘 trace
-
-每个任务的 `trace.json` 不只是日志，而是结构化复盘材料。推荐排查顺序为：
-
-```text
-compiled_task.task_type / execution_profile
-        |
-        v
-router_decision.route_name / cascade_attempts
-        |
-        v
-steps / tool observations / retry hints
-        |
-        v
-answer_validation
-        |
-        v
-operator program / static issues / local repair log
-        |
-        v
-semantic_consistency_audit
-        |
-        v
-score_summary / per-task score
-```
-
-这一结构使失败案例可以定位到任务画像、路由选择、工具执行、程序生成、修
-复或最终列投影中的具体阶段。
 
 ---
 
 ## 11. 局限性与后续工作
 
-当前系统在 public split 上取得了 0.727 的平均分，但仍有若干局限。
+当前系统在 public split 上取得 0.727 的平均分，仍存在若干局限。
 
-首先，列投影仍不够保守。评分函数对额外列有明确惩罚，部分任务虽然召回了
-正确列，但同时输出了冗余列，导致得分低于 1.0。后续应加强最终 projection
-阶段，使系统更明确地区分“中间调试字段”和“最终答案字段”。
+首先，最终列投影不够保守。评分函数对额外列设置惩罚，部分任务召回了正
+确列但输出了冗余列，导致得分低于 1.0。后续工作应在最终 projection 阶段
+更清晰地区分"中间调试字段"与"最终答案字段"。
 
-其次，字段语义绑定仍是主要风险来源。即使真实字段已被扫描，模型仍可能把
-问题概念映射到近似但错误的字段。后续可加强 schema grounding 与 answer
-guard 的联动，在答案提交前检查关键概念是否真正落到被使用字段上。
+其次，字段语义绑定仍是主要风险来源。即使真实字段已被扫描，模型仍可能
+将问题概念映射到近似但错误的字段。后续可加强 schema grounding 与
+answer guard 的联动，在答案提交前显式检查关键概念是否落到被使用字段
+之上。
 
-第三，语义修复后的静态错误仍可能发生。当前修复流程在部分任务中能够恢复
+第三，语义修复后的静态错误仍可能出现。当前修复链路在部分任务中能恢复
 失败程序，但也可能在重写后引入新的列名或语法问题。后续可对 semantic
-repair 输出强制再执行静态检查和短路策略，避免长时间停留在无效修复循环。
+repair 输出强制再执行静态检查，并设置短路策略以避免长时间停留在无效修
+复循环。
 
-第四，超时控制仍有优化空间。`task_344` 的失败说明单任务 600 秒上限仍可
-被复杂路径耗尽。后续应在路由层更早识别低收益路径，并在多次错误同质化时
-提前停止。
+第四，单题超时控制仍有优化空间。`task_344` 的失败说明 600 秒上限仍可
+能被复杂路径耗尽。后续应在路由层更早识别低收益路径，并在重复同类错误
+时提前终止。
 
-第五，对于视觉任务或强领域推理任务，目前系统主要依赖模型本身能力和兜底
-路径，尚未实现专门的视觉执行器或领域知识模块。
-
-这些限制说明当前系统仍是一个以工程稳健性为重点的 data-agent baseline，
-而不是对所有任务类型都完全优化的最终系统。
+第五，对于视觉任务与强领域推理任务，本系统主要依赖模型自身能力与
+cascade 路径，尚未实现专门的视觉执行器或领域知识模块。
 
 ---
 
-## 12. 结论
-
-本项目构建了一个以 React Harness 为主、以 agentic/operator 路径为兜底的
-DataAgent-Bench 系统。系统的主要特点是：先用确定性任务画像统一上下文认
-知，再让模型通过工具和程序完成数据操作，最后用结构检查、静态检查和语义
-检查控制明显错误。public split 上的结果为 35.600 / 49，平均分 0.727，
-说明该方法能够覆盖多数公开任务，但在最终列投影、字段语义绑定、复杂修复
-和超时控制方面仍有改进空间。
